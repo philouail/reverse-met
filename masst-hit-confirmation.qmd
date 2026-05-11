@@ -1,0 +1,312 @@
+---
+title: "MASST Hit Confirmation — RuSirius"
+subtitle: "Per-dataset SIRIUS annotation of curated MASST hits (MassIVE)"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+This document takes the curated MASST hit table produced by
+`reverse-metabolomics-workflow.qmd` (DIA datasets and datasets without
+metadata already removed) and runs SIRIUS annotation for every remaining
+MassIVE dataset.
+
+For each dataset two SIRIUS projects are created:
+
+```
+sirius_projects/
+  <dataset_id>/
+    parent/
+    metabolite/
+results/
+  <dataset_id>/
+    parent_results.csv
+    metabolite_results.csv
+```
+
+Results are written to disk for manual review. The classification
+helper at the end of this document (`eval: false`) can be run
+interactively after inspecting the raw tables.
+
+# Version check
+
+```{r versions}
+source("check-versions.R")
+```
+
+# Setup
+
+```{r setup}
+library(Spectra)
+library(MsBackendMassIVE)
+library(MetaboCoreUtils)
+library(RuSirius)
+library(dplyr)
+```
+
+# Compound targets
+
+```{r compound-spec}
+compound_spec <- data.frame(
+  role    = c("parent",       "metabolite"),
+  name    = c("omeprazole",   "5-hydroxyomeprazole"),
+  formula = c("C17H19N3O3S",  "C17H19N3O4S"),
+  ikey1   = c("SUBDBMMJDZJVOS", "YMBXIQCHYXGHAG")
+)
+```
+
+# Load curated hits
+
+`hits_curated.csv` is written by `reverse-metabolomics-workflow.qmd`
+after the DIA and no-metadata filters have been applied.
+
+```{r load-hits}
+hits_curated <- read.csv("hits_curated.csv", check.names = FALSE)
+```
+
+# Filter to MassIVE datasets
+
+```{r filter-massive}
+hits_massive <- hits_curated[
+  startsWith(hits_curated$ATTRIBUTE_DatasetAccession, "MSV"), ]
+
+massive_datasets <- unique(hits_massive$ATTRIBUTE_DatasetAccession)
+cat(length(massive_datasets), "MassIVE datasets to process\n")
+```
+
+# Helper functions
+
+```{r helpers}
+ADDUCT_CANDIDATES <- c("[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+",
+                       "[M-H]-", "[M+Cl]-")
+PPM     <- 20
+RT_TOL  <- 3   # seconds around hit RT
+
+infer_adduct <- function(obs_mz, formula, ppm = PPM,
+                         candidates = ADDUCT_CANDIDATES) {
+  if (is.na(obs_mz) || is.na(formula)) return(NA_character_)
+  mass     <- calculateMass(formula)
+  theo     <- vapply(candidates, function(a) mass2mz(mass, adduct = a)[[1]],
+                     numeric(1))
+  diff_ppm <- abs(obs_mz - theo) / theo * 1e6
+  best     <- which.min(diff_ppm)
+  if (diff_ppm[best] > ppm) NA_character_ else candidates[best]
+}
+
+# Returns a list of Spectra slices (one per MASST hit) for one role.
+# Each slice contains the top MS1 scan + all MS2 scans within the RT/mz window.
+slice_role <- function(hits_ds, sp, sp_file, sp_scan, role) {
+  role_formula <- compound_spec$formula[compound_spec$role == role]
+  h <- hits_ds[hits_ds$role == role & !is.na(hits_ds$rt), ]
+  if (!nrow(h)) return(list())
+
+  lapply(seq_len(nrow(h)), function(i) {
+    hi     <- h[i, ]
+    mz_rng <- hi$Precursor_MZ * c(1 - PPM * 1e-6, 1 + PPM * 1e-6)
+    rt_rng <- hi$rt + c(-RT_TOL, RT_TOL)
+
+    sp_f <- filterRt(sp[sp_file == hi$file], rt_rng)
+    ms1  <- filterMsLevel(sp_f, 1L)
+    ms2  <- filterPrecursorMzRange(filterMsLevel(sp_f, 2L), mz_rng)
+
+    int_at_mz <- vapply(
+      peaksData(ms1),
+      function(pm) {
+        keep <- pm[, "mz"] >= mz_rng[1] & pm[, "mz"] <= mz_rng[2]
+        if (any(keep)) max(pm[keep, "intensity"]) else 0
+      },
+      numeric(1)
+    )
+    ms1_top <- if (length(ms1) && max(int_at_mz) > 0) {
+      ms1[which.max(int_at_mz)]
+    } else {
+      ms1[integer(0)]
+    }
+
+    out          <- c(ms1_top, ms2)
+    out$adduct   <- rep(hi$adduct_inferred, length(out))
+    out$group_idx <- i
+    out
+  })
+}
+
+run_sirius_role <- function(sp_slices, adduct_list, project_path) {
+  sp_cat <- concatenateSpectra(sp_slices)
+  srs <- Sirius(
+    projectId = project_path,
+    username  = "plouail@eurac.edu",
+    password  = Sys.getenv("SIRIUS_PASSWORD")
+  )
+  srs <- import(
+    sirius                 = srs,
+    spectra                = sp_cat,
+    adduct                 = adduct_list,
+    ms_column_name         = "group_idx",
+    deleteExistingFeatures = TRUE
+  )
+  run(
+    srs,
+    formulaIdParams          = formulaIdParam(),
+    structureDbSearchParams  = structureDbSearchParam(structureSearchDbs = "ALL"),
+    predictParams            = predictParam(),
+    wait                     = TRUE
+  )
+  res <- results(srs, result.type = "structureDb", return.type = "data.frame")
+  shutdown(srs)
+  res
+}
+```
+
+# Per-dataset SIRIUS annotation
+
+```{r per-dataset-loop}
+role_formula <- setNames(compound_spec$formula, compound_spec$role)
+
+for (ds in massive_datasets) {
+  message("\n--- Processing ", ds, " ---")
+  hits_ds <- hits_massive[hits_massive$ATTRIBUTE_DatasetAccession == ds, ]
+
+  # Infer adducts from precursor m/z
+  hits_ds$adduct_inferred <- mapply(
+    infer_adduct,
+    hits_ds$Precursor_MZ,
+    role_formula[hits_ds$role],
+    USE.NAMES = FALSE
+  )
+
+  # Output directories
+  dir_par <- file.path("sirius_projects", ds, "parent")
+  dir_met <- file.path("sirius_projects", ds, "metabolite")
+  dir_res <- file.path("results", ds)
+  dir.create(dir_par, recursive = TRUE, showWarnings = FALSE)
+  dir.create(dir_met, recursive = TRUE, showWarnings = FALSE)
+  dir.create(dir_res, recursive = TRUE, showWarnings = FALSE)
+
+  # Download MASST-hit files for this dataset
+  wanted <- unique(basename(hits_ds$file_path))
+  massive_sync_data_files(ds, fileName = wanted)
+
+  sp       <- Spectra(backendInitialize(MsBackendMassIVE(), massiveId = ds,
+                                        offline = TRUE))
+  sp_file  <- basename(dataOrigin(sp))
+  sp_scan  <- acquisitionNum(sp)
+
+  hits_ds$file    <- basename(hits_ds$file_path)
+  hit_idx         <- match(
+    paste(hits_ds$file, hits_ds$scan_id, sep = "::"),
+    paste(sp_file,      sp_scan,          sep = "::")
+  )
+  hits_ds$rt <- rtime(sp)[hit_idx]
+
+  # Slice spectra per role
+  sp_par <- slice_role(hits_ds, sp, sp_file, sp_scan, "parent")
+  sp_met <- slice_role(hits_ds, sp, sp_file, sp_scan, "metabolite")
+
+  if (!length(sp_par)) {
+    message("  No parent spectra — skipping parent SIRIUS run")
+  } else {
+    adduct_list_par <- lapply(sp_par, function(s) s$adduct[1])
+    res_par <- run_sirius_role(sp_par, adduct_list_par, dir_par)
+    write.csv(res_par, file.path(dir_res, "parent_results.csv"), row.names = FALSE)
+    message("  Parent done: ", nrow(res_par), " rows written")
+  }
+
+  if (!length(sp_met)) {
+    message("  No metabolite spectra — skipping metabolite SIRIUS run")
+  } else {
+    adduct_list_met <- lapply(sp_met, function(s) s$adduct[1])
+    res_met <- run_sirius_role(sp_met, adduct_list_met, dir_met)
+    write.csv(res_met, file.path(dir_res, "metabolite_results.csv"), row.names = FALSE)
+    message("  Metabolite done: ", nrow(res_met), " rows written")
+  }
+}
+
+message("All datasets processed.")
+```
+
+# Evaluate SIRIUS matches
+
+The classifier below is moved here from `reverse-metabolomics-workflow.qmd`
+and kept `eval: false` for manual review after inspecting the result tables.
+Load the CSVs for a dataset, then call `classify_sirius_feature()` on each
+feature group.
+
+```{r classify-sirius, eval=false}
+classify_sirius_feature <- function(
+  df_feature,
+  target_formula,
+  target_ikey_prefix,
+  norm_score_min = 0.5,
+  tanimoto_min   = 0.6
+) {
+  top_formula_rows <- df_feature[df_feature$rank.x == 1, ]
+  formula_match    <- any(top_formula_rows$molecularFormula == target_formula)
+  norm_score       <- unique(top_formula_rows$siriusScoreNormalized)
+
+  if (!formula_match) {
+    any_rank <- df_feature[df_feature$molecularFormula == target_formula, ]
+    if (nrow(any_rank) == 0 ||
+        max(any_rank$siriusScoreNormalized, na.rm = TRUE) < 0.05) {
+      return(data.frame(tier = "D", reason = "target formula not plausible"))
+    }
+    return(data.frame(tier = "C", reason = "target formula low-ranked"))
+  }
+
+  if (norm_score < norm_score_min) {
+    return(data.frame(tier = "C",
+                      reason = "formula match but low normalized score"))
+  }
+
+  structure_rows <- top_formula_rows[
+    !is.na(top_formula_rows$inchiKey) & top_formula_rows$rank.y == 1, ]
+  if (nrow(structure_rows) == 0) {
+    return(data.frame(tier = "B", reason = "no CSI structure returned"))
+  }
+
+  ikey_match <- startsWith(structure_rows$inchiKey, target_ikey_prefix)
+  tani       <- structure_rows$tanimotoSimilarity
+
+  if (ikey_match && tani >= tanimoto_min) {
+    return(data.frame(tier = "A",
+                      reason = sprintf("top CSI hit is target (Tanimoto %.2f)", tani)))
+  }
+  if (ikey_match) {
+    return(data.frame(tier = "B",
+                      reason = sprintf("top CSI is target but Tanimoto low (%.2f)", tani)))
+  }
+  data.frame(tier = "B",
+             reason = "formula matches but top structure is not target")
+}
+
+# Example: load results for one dataset and classify
+ds      <- "MSV000085256"
+res_par <- read.csv(file.path("results", ds, "parent_results.csv"))
+res_met <- read.csv(file.path("results", ds, "metabolite_results.csv"))
+
+tier_par <- lapply(
+  split(res_par, res_par$sirius_fts),
+  classify_sirius_feature,
+  target_formula     = compound_spec$formula[compound_spec$role == "parent"],
+  target_ikey_prefix = compound_spec$ikey1[compound_spec$role == "parent"]
+)
+tier_met <- lapply(
+  split(res_met, res_met$sirius_fts),
+  classify_sirius_feature,
+  target_formula     = compound_spec$formula[compound_spec$role == "metabolite"],
+  target_ikey_prefix = compound_spec$ikey1[compound_spec$role == "metabolite"]
+)
+
+tier_par
+tier_met
+```

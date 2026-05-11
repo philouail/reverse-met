@@ -1,0 +1,542 @@
+---
+title: "Reverse Metabolomics — Part 1: Dataset Selection & Single-Dataset Prototype"
+subtitle: "Omeprazole / 5-hydroxyomeprazole · CYP2C19 ratio analysis"
+author: "Your Name"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+execute:
+  eval: false
+  warning: false
+  message: false
+---
+
+# Overview
+
+This document covers the first half of the pipeline: loading the two
+MASST exports, selecting datasets with both compounds, tiering them by
+study-design suitability, picking one prototype, and running the full
+single-dataset analysis (EIC extraction, peak detection, and
+parent/metabolite ratio statistics).
+
+Part 2 (`all-datasets-analysis.qmd`) scales the same analysis to all
+Tier-B datasets.
+
+```{mermaid}
+%%| label: fig-part1
+%%| fig-cap: "Part 1 pipeline — from search results to single-dataset ratio statistics."
+flowchart LR
+  A["Search results\n2 compound files"] --> B["Shared datasets\n26 found"]
+  B --> C["Summary table\npick prototype manually"]
+  C --> D["Access raw spectra\nno full download"]
+  D --> E["Verify compound\nidentity"]
+  E --> F["Extract signal\nboth compounds"]
+  F --> G["Detect peaks · join samples\nparent / metabolite ratio"]
+```
+
+## why Omeprazol
+Omeprazole is widely used for CYP2C19 phenotyping. When administered as a
+ racemic mixture, (R-S)-omeprazole undergoes stereoselective metabolism and
+ is primarily metabolized to (R)-5-hydroxyomeprazole via CYP2C19/CYP3A and
+ (S)-5-hydroxyomeprazole via CYP2C19. Cytochrome P450 2C19 (CYP2C19) enzyme is estimated to metabolize approximately 15% of all marketed drugs, among which proton pump inhibitors, antiplatelet agents, antidepressants, beta-blockers, benzodiazepines and many other compounds
+https://onlinelibrary.wiley.com/doi/full/10.1111/bcpt.14095
+
+could also add a second probe pair (e.g., dextromethorphan/dextrorphan for CYP2D6. to show that it can be applied ot others.
+
+title such as: Quantitative post-MASST reverse metabolomics enables pharmacoepidemiology of CYP2C19 activity across public repositories
+
+# Setup
+
+```{r setup}
+library(Spectra)
+library(MsBackendMassIVE)
+library(xcms)
+library(dplyr)
+library(ggplot2)
+
+# remotes::install_github("<your-org>/RuSirius")   # in review at JOSS
+library(RuSirius)
+```
+
+# Compound pair
+
+| role | compound | formula | monoisotopic mass | InChIKey block 1 |
+|---|---|---|---|---|
+| parent | omeprazole | C17H19N3O3S | 345.1147 | SUBDBMMJDZJVOS |
+| metabolite | 5-hydroxyomeprazole | C17H19N3O4S | 361.1096 | YMBXIQCHYXGHAG |
+
+The parent/5-OH ratio is a classical CYP2C19 phenotyping readout.
+Both compounds are queried in positive and negative mode; downstream
+code picks the adduct with the most hits per dataset and collapses
+adducts so each compound is a single feature per sample.
+
+```{r compound-spec}
+compound_spec <- data.frame(
+  role    = c("parent",       "metabolite"),
+  name    = c("omeprazole",   "5-hydroxyomeprazole"),
+  formula = c("C17H19N3O3S",  "C17H19N3O4S"),
+  mz_pos  = c(346.1220,       362.1169)   # [M+H]+, are these rigth
+)
+```
+
+# MASST exports
+
+Two StructureMASST queries on GNPS2 with identical settings
+(cosine ≥ 0.7, matched peaks ≥ 3, analog search off, both polarities).
+
+| compound | GNPS2 session |
+|---|---|
+| omeprazole | `2399487d18d6` |
+| 5-hydroxyomeprazole | `4c9e1b910599` |
+
+```{r load-hits}
+read_masst <- function(path, role) {
+  x <- read.csv(path, check.names = FALSE)
+  x[x == "missing value"] <- NA
+  parts        <- strsplit(x$USI, ":", fixed = TRUE)
+  x$file_path  <- vapply(parts, `[`, character(1), 3)
+  x$scan_str   <- vapply(parts, \(p) p[length(p)], character(1))  # keep as character
+  x$role       <- role
+  x
+}
+
+all_hits <- rbind(
+  read_masst("Omeoprazole.csv",          "parent"),
+  read_masst("5-hydroxyomeprazole.csv",  "metabolite")
+)
+```
+
+## Remove corrupted USIs
+
+Some USIs carry the scan number `4294967295` — the maximum value of a
+32-bit unsigned integer. This value is written by certain mzML converters when
+the scan index is missing or could not be resolved. We remove them as they
+cannot give us the position of the spectrum of interest in the raw file.
+
+```{r filter-corrupt-usi}
+INVALID_SCAN_STR <- "4294967295"
+
+n_corrupt <- sum(all_hits$scan_str == INVALID_SCAN_STR, na.rm = TRUE)
+cat("Corrupted USIs removed:", n_corrupt,
+    "(", round(100 * n_corrupt / nrow(all_hits), 1), "% of all hits)\n")
+
+all_hits           <- all_hits[all_hits$scan_str != INVALID_SCAN_STR, ]
+all_hits$scan_id   <- as.integer(all_hits$scan_str)   # now safe to convert
+all_hits$scan_str  <- NULL                             # drop the staging column
+```
+
+## Infer adduct from observed precursor m/z
+
+MASST reports an `Adduct` column, but it's inherited from whichever library
+spectrum matched and does not always reflect how *our* compound ionised in
+the query data. We know the target formula per role, so for each hit we
+compute the theoretical m/z of a set of common adducts and pick the one
+closest to the observed `Precursor_MZ` within a ppm tolerance. This
+ground-truthed adduct is what we feed to SIRIUS later.
+
+```{r infer-adduct}
+library(MetaboCoreUtils)
+
+ADDUCT_CANDIDATES <- c(
+  "[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+",
+  "[M-H]-", "[M+Cl]-"
+)
+
+infer_adduct <- function(obs_mz, formula, ppm = 20,
+                         candidates = ADDUCT_CANDIDATES) {
+  if (is.na(obs_mz) || is.na(formula)) return(NA_character_)
+  mass <- calculateMass(formula)
+  theo <- vapply(candidates, function(a) mass2mz(mass, adduct = a)[[1]],
+                 numeric(1))
+  diff_ppm <- abs(obs_mz - theo) / theo * 1e6
+  best <- which.min(diff_ppm)
+  if (diff_ppm[best] > ppm) NA_character_ else candidates[best]
+}
+
+role_formula <- setNames(compound_spec$formula, compound_spec$role)
+
+all_hits$adduct_inferred <- mapply(
+  infer_adduct,
+  all_hits$Precursor_MZ,
+  role_formula[all_hits$role],
+  USE.NAMES = FALSE
+)
+
+# Coverage and adduct breakdown per role
+table(role   = all_hits$role,
+      adduct = all_hits$adduct_inferred,
+      useNA  = "ifany")
+```
+
+# Dataset selection
+
+## D_both — datasets where both compounds appear
+
+```{r d-both}
+D_parent     <- unique(all_hits$ATTRIBUTE_DatasetAccession[all_hits$role == "parent"])
+D_metabolite <- unique(all_hits$ATTRIBUTE_DatasetAccession[all_hits$role == "metabolite"])
+D_both       <- intersect(D_parent, D_metabolite)
+
+cat("parent:", length(D_parent), "| metabolite:", length(D_metabolite),
+    "| both:", length(D_both), "\n")
+```
+
+Pre-computed: 53 parent datasets, 30 metabolite datasets, **26 in both**
+(26/30 metabolite datasets also contain the parent — high co-occurrence).
+
+## Summary table for prototype selection
+
+For each overlapping dataset, compute the number of hits per compound,
+the number of unique files (a proxy for sample count), and how
+completely the key Pan-ReDU metadata fields are filled. Sort by file
+count ascending so small, manageable datasets appear first.
+
+```{r dataset-summary, eval = FALSE}
+dataset_overlap <- all_hits |>
+  filter(ATTRIBUTE_DatasetAccession %in% D_both)
+write.csv(dataset_overlap, "overlap_dataset.xlsx", row.names = FALSE)
+```
+
+After that do some metadata work. add columns, do not remove any data.
+
+## remove datasets without metadata
+
+```{r}
+## there's a column for this
+dataset_overlap <- readxl::read_xlsx("overlap_dataset.xlsx")
+```
+
+
+## remove DIA/ SWATH Datasets.
+
+```{r}
+## from manual curation.
+dataset_overlap <- dataset_overlap[dataset_overlap$`DIA/SWATH` == FALSE, ]
+```
+
+## Write curated hits
+
+The curated table is read by `masst-hit-confirmation.qmd` for SIRIUS
+annotation.
+
+```{r write-curated}
+hits_curated <- dataset_overlap[dataset_overlap$extra_metadata == TRUE, ]
+write.csv(hits_curated, "hits_curated.csv", row.names = TRUE)
+
+unique(hits_curated$ATTRIBUTE_DatasetAccession) |> length()
+```
+
+We end up with 13 datasets for now. Let's see after pooling of metadata and
+hity confirmation.
+
+# Metadata coverage map
+
+Build a *(dataset × variable)* feasibility matrix from the per-dataset
+files in `dataset_metadata/`, restricted to the curated datasets. For
+each canonical biological/clinical variable (sex, age, health status,
+body site, country, …), the cell holds either
+`"source_column (coverage%)"` or `FALSE` if the variable is absent.
+This is the feasibility view for downstream meta-analysis.
+
+The folder mixes three formats:
+
+* MassIVE (`MSV*.tsv|.txt|.csv`) — flat PanReDU-style table.
+* MetaboLights (`s_MTBLS*.txt`) — flat ISA-Tab; column headers wrap
+  the variable name in `Characteristics[...]` / `Factor Value[...]`.
+* Metabolomics Workbench (`ST*_AN*.txt`) — multi-section mwTab; per-sample
+  factors live on `SUBJECT_SAMPLE_FACTORS` lines as `Key:Value | Key:Value`.
+  Multiple AN files per study are collapsed to one row.
+
+Assay-only files (`a_MTBLS*.txt`) are not needed — technical metadata
+is already in the MASST hit table.
+
+```{r metadata-helpers}
+# Parse one metadata file → list(format, source_columns = data.frame(name, coverage_pct))
+parse_metadata <- function(path) {
+  fn <- basename(path)
+
+  if (startsWith(fn, "MSV")) {
+    sep <- if (grepl("\\.csv$", fn)) "," else "\t"
+    df  <- read.table(path, header = TRUE, sep = sep, quote = "\"",
+                      check.names = FALSE, comment.char = "",
+                      fill = TRUE, stringsAsFactors = FALSE)
+    cov <- vapply(df, function(x) {
+      v <- as.character(x)
+      mean(!is.na(v) & nzchar(v) & !v %in% c("not specified", "not applicable", "NA")) * 100
+    }, numeric(1))
+    return(list(format = "MassIVE",
+                cols = data.frame(name = names(cov), coverage_pct = round(cov, 1),
+                                  row.names = NULL)))
+  }
+
+  if (startsWith(fn, "s_MTBLS")) {
+    df <- read.table(path, header = TRUE, sep = "\t", quote = "\"",
+                     check.names = FALSE, comment.char = "",
+                     fill = TRUE, stringsAsFactors = FALSE)
+    keep <- !names(df) %in% c("Term Source REF", "Term Accession Number",
+                              "Protocol REF", "Unit")
+    df <- df[, keep, drop = FALSE]
+    cov <- vapply(df, function(x) {
+      v <- as.character(x)
+      mean(!is.na(v) & nzchar(v)) * 100
+    }, numeric(1))
+    return(list(format = "MetaboLights",
+                cols = data.frame(name = names(cov), coverage_pct = round(cov, 1),
+                                  row.names = NULL)))
+  }
+
+  if (startsWith(fn, "ST")) {
+    lines <- readLines(path, warn = FALSE)
+    fac_lines <- grep("^SUBJECT_SAMPLE_FACTORS\\s", lines, value = TRUE)
+    if (!length(fac_lines)) {
+      return(list(format = "MetabolomicsWorkbench",
+                  cols = data.frame(name = character(0), coverage_pct = numeric(0))))
+    }
+    factors_field <- vapply(strsplit(fac_lines, "\t"), function(p) {
+      if (length(p) >= 4) p[4] else NA_character_
+    }, character(1))
+    pairs    <- unlist(strsplit(factors_field, "\\s*\\|\\s*"))
+    keys     <- sub(":.*$", "", pairs)
+    values   <- sub("^[^:]*:\\s*", "", pairs)
+    keep     <- nzchar(keys) & !is.na(keys)
+    keys     <- trimws(keys[keep]); values <- trimws(values[keep])
+    n_samples <- length(fac_lines)
+    cov <- tapply(values, keys, function(v) {
+      mean(nzchar(v) & !v %in% c("-", "NA", "not specified")) * 100
+    }) * (table(keys) / n_samples)
+    cov <- pmin(cov, 100)
+    return(list(format = "MetabolomicsWorkbench",
+                cols = data.frame(name = names(cov),
+                                  coverage_pct = round(as.numeric(cov), 1),
+                                  row.names = NULL)))
+  }
+
+  list(format = NA_character_,
+       cols   = data.frame(name = character(0), coverage_pct = numeric(0)))
+}
+
+CANONICAL_PATTERNS <- list(
+  # BiologicalSex, sex, ATTRIBUTE_sex (MSV); Gender (MWB ST002044)
+  sex           = "sex|gender",
+  # AgeInYears, age, age_at_* (MSV); LifeStage (PanReDU)
+  age           = "^age|life.?stage",
+  # HealthStatus, DOIDCommonName (PanReDU); Factor Value[Cohort] (MTBLS11656);
+  # Comment[Patient status] (MTBLS1866); ATTRIBUTE_status (MSV092757);
+  # Phenotype (MWB ST002722)
+  health_status = "healthstatus|\\bhealth\\b|disease|diagnos|condition|cohort|patient.?status|doid|phenotype|attribute_status",
+  # UBERONBodyPartName (PanReDU); Characteristics[Organism part] (MTBLS);
+  # SampleType, SampleTypeSub1 (PanReDU) — biological matrix / anatomical site
+  body_site     = "uberon|organism.?part|sampletype",
+  country       = "country|geograph",
+  ethnicity     = "ethnic|race|ancestry",
+  bmi           = "\\bbmi\\b",
+  weight        = "\\bweight\\b",
+  height        = "\\bheight\\b",
+  treatment     = "treatment|intervention|factor.?value\\[treatment\\]|factor.?value\\[cohort\\]"
+)
+
+map_canonical <- function(col_name) {
+  nm <- tolower(col_name)
+  for (canon in names(CANONICAL_PATTERNS)) {
+    if (grepl(CANONICAL_PATTERNS[[canon]], nm, perl = TRUE)) return(canon)
+  }
+  NA_character_
+}
+
+# MSV000085256_metadata.tsv → MSV000085256
+# s_MTBLS11656.txt          → MTBLS11656
+# ST001715_AN002792.txt     → ST001715
+dataset_id_from_file <- function(fn) {
+  fn <- basename(fn)
+  if (startsWith(fn, "MSV"))     return(sub("_.*$", "", fn))
+  if (startsWith(fn, "s_MTBLS")) return(sub("^s_", "", sub("\\.txt$", "", fn)))
+  if (startsWith(fn, "ST"))      return(sub("_.*$", "", fn))
+  tools::file_path_sans_ext(fn)
+}
+```
+
+```{r metadata-inventory}
+curated_ids <- unique(hits_curated$ATTRIBUTE_DatasetAccession)
+
+meta_files <- list.files("dataset_metadata", full.names = TRUE)
+meta_files <- meta_files[!startsWith(basename(meta_files), "a_MTBLS")]
+meta_files <- meta_files[vapply(meta_files,
+                                function(f) dataset_id_from_file(f) %in% curated_ids,
+                                logical(1))]
+
+inventory <- do.call(rbind, lapply(meta_files, function(f) {
+  parsed <- parse_metadata(f)
+  if (!nrow(parsed$cols)) return(NULL)
+  data.frame(
+    dataset_id    = dataset_id_from_file(f),
+    source_file   = basename(f),
+    format        = parsed$format,
+    source_column = parsed$cols$name,
+    coverage_pct  = parsed$cols$coverage_pct,
+    canonical     = vapply(parsed$cols$name, map_canonical, character(1)),
+    row.names     = NULL,
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Collapse multiple files per dataset (e.g. ST*_AN* analyses) — pick the
+# best-covered source column per (dataset, canonical) pair.
+inv_canon <- inventory[!is.na(inventory$canonical), ]
+inv_best  <- inv_canon |>
+  group_by(dataset_id, canonical) |>
+  slice_max(coverage_pct, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(cell = sprintf("%s (%.0f%%)", source_column, coverage_pct))
+
+write.csv(inventory, "metadata_inventory.csv", row.names = FALSE)
+```
+
+```{r metadata-coverage-wide}
+canonical_vars <- names(CANONICAL_PATTERNS)
+
+coverage_wide <- inv_best |>
+  select(dataset_id, canonical, cell) |>
+  tidyr::pivot_wider(names_from = canonical, values_from = cell) |>
+  tidyr::complete(dataset_id = curated_ids)
+
+for (v in canonical_vars) {
+  if (!v %in% names(coverage_wide)) coverage_wide[[v]] <- NA_character_
+}
+coverage_wide <- coverage_wide[, c("dataset_id", canonical_vars)]
+for (v in canonical_vars) {
+  coverage_wide[[v]][is.na(coverage_wide[[v]])] <- "FALSE"
+}
+
+write.csv(coverage_wide, "metadata_coverage.csv", row.names = FALSE)
+coverage_wide
+```
+
+# MASST hits confirmation
+
+SIRIUS confirmation is done in `masst-hit-confirmation.qmd`.
+Results per dataset are written to `results/<dataset_id>/`.
+
+
+# Single-dataset prototype
+
+## Stage 2: download remaining files for quantification
+
+Once both gates have cleared, fetch the rest of the dataset — every
+file needed for EIC peak detection — minus anything that looks like a
+blank or QC. This is the only point where the full per-dataset
+bandwidth cost is paid, and only for datasets that already passed
+SIRIUS confirmation and the metadata check.
+
+The MASST-hit files were synced in stage 1 and remain in the cache, so
+this call only downloads the *new* files. Re-initialising the backend
+picks up everything currently cached for the dataset.
+
+```{r stage2-download}
+all_files   <- massive_list_files(dataset_proto)
+quant_files <- basename(all_files)
+quant_files <- quant_files[!grepl("BLANK|blank", quant_files)]
+
+massive_sync_data_files(dataset_proto, fileName = quant_files)
+
+sp_full <- Spectra(backendInitialize(
+  MsBackendMassIVE(), massiveId = dataset_proto, offline = TRUE
+))
+cat(length(unique(dataOrigin(sp_full))), "files (stage 2)\n")
+```
+
+## EIC extraction and peak detection
+
+Both compounds are extracted in a single MS1 read pass over the full
+sample set fetched in stage 2.
+
+```{r eic-peaks}
+mz_win <- function(hits_sub, ppm = 10) {
+  mz <- median(hits_sub$Precursor_MZ, na.rm = TRUE)
+  mz * c(1 - ppm * 1e-6, 1 + ppm * 1e-6)
+}
+
+rt_win <- function(conf, tol = 9) {
+  c(min(conf$rt_confirmed) - tol, max(conf$rt_confirmed) + tol)
+}
+
+sp_ms1 <- filterMsLevel(sp_full, 1L)
+
+# below use C
+peaks_par <- extract_peaks(conf_par)
+peaks_met <- extract_peaks(conf_met)
+```
+
+## Sample table
+
+```{r sample-table}
+make_tier <- function(peaks, conf) {
+  data.frame(file = basename(files)) |>
+    left_join(peaks |> select(file, area = into), by = "file") |>
+    mutate(tier = case_when(
+      file %in% conf$confirmed_files & !is.na(area) ~ "Tier1",
+      !is.na(area)                                   ~ "Tier2",
+      TRUE                                            ~ "Tier3"
+    ))
+}
+
+meta <- hits_proto |>
+  distinct(file = basename(file_path), HealthStatus, UBERONBodyPartName, Country)
+
+sample_tbl <- make_tier(peaks_par, conf_par) |>
+  rename(parent_area = area, parent_tier = tier) |>
+  full_join(
+    make_tier(peaks_met, conf_met) |> rename(metab_area = area, metab_tier = tier),
+    by = "file"
+  ) |>
+  left_join(meta, by = "file") |>
+  mutate(log2_ratio = log2(parent_area / metab_area))
+
+count(sample_tbl, parent_tier, metab_tier)
+```
+
+## Statistics
+
+```{r stats}
+# Detection rates — Fisher's exact per compound
+fisher.test(table(sample_tbl$HealthStatus, !is.na(sample_tbl$parent_area)))
+fisher.test(table(sample_tbl$HealthStatus, !is.na(sample_tbl$metab_area)))
+
+# Ratio — Wilcoxon on samples where both are detected
+both <- sample_tbl[!is.na(sample_tbl$log2_ratio), ]
+wilcox.test(log2_ratio ~ HealthStatus, data = both)
+```
+
+## Plots
+
+```{r plots}
+ggplot(both, aes(HealthStatus, log2_ratio)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(colour = parent_tier), width = 0.1, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey40") +
+  labs(y = "log2(omeprazole / 5-OH-omeprazole)",
+       title = dataset_proto, colour = "parent tier") +
+  theme_bw()
+
+ggplot(sample_tbl, aes(parent_area, metab_area, colour = HealthStatus)) +
+  geom_point(alpha = 0.75) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "omeprazole area", y = "5-OH-omeprazole area") +
+  theme_bw()
+```
+
+# Sanity check
+
+Does the result match the pharmacology literature? For this compound
+pair, CYP2C19-extensive metabolisers show a lower parent/5-OH ratio
+than poor metabolisers. If the prototype dataset is not CYP2C19-
+stratified or PPI-intervention designed, re-select `dataset_proto`.
+
+# References {.unnumbered}
+
+::: {#refs}
+:::

@@ -1,0 +1,14 @@
+dataset_id,sex,age,health_status,body_site,country,ethnicity,bmi,weight,height,treatment
+MSV000085256,BiologicalSex (98%),LifeStage (100%),HealthStatus (100%),SampleType (100%),Country (0%),FALSE,FALSE,FALSE,FALSE,FALSE
+MSV000088255,BiologicalSex (100%),AgeInYears (100%),HealthStatus (100%),SampleType (100%),Country (100%),FALSE,FALSE,FALSE,FALSE,FALSE
+MSV000092754,sex (100%),age_at_earliest_visit (100%),p_diagnosis_at_earliest_visit (100%),FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
+MSV000092757,sex (100%),age_at_earliest_visit (100%),p_diagnosis_at_earliest_visit (100%),FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
+MSV000094097,BiologicalSex (54%),AgeInYears (54%),HealthStatus (66%),SampleType (100%),Country (100%),FALSE,FALSE,FALSE,FALSE,FALSE
+MSV000095143,BiologicalSex (54%),AgeInYears (54%),HealthStatus (66%),SampleType (100%),Country (100%),FALSE,FALSE,FALSE,FALSE,FALSE
+MTBLS11656,FALSE,FALSE,Factor Value[Cohort] (93%),Characteristics[Organism part] (100%),FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
+MTBLS1866,FALSE,FALSE,Comment[Patient status] (100%),Characteristics[Organism part] (100%),FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
+MTBLS2746,FALSE,FALSE,FALSE,Characteristics[Organism part] (100%),FALSE,FALSE,FALSE,FALSE,FALSE,Factor Value[Treatment] (54%)
+ST001715,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
+ST002044,Gender (65%),FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
+ST002238,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
+ST002722,FALSE,FALSE,Phenotype (100%),FALSE,FALSE,FALSE,FALSE,FALSE,FALSE,FALSE
