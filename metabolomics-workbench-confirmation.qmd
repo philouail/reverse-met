@@ -434,3 +434,16 @@ features |>
   theme_bw() +
   theme(legend.position = "bottom")
 ```
+
+# Write confirmed hits
+
+Hits whose SIRIUS confidence is `strict` or `standard` are kept as
+Metabolomics Workbench-confirmed hits.
+
+```{r write-confirmed}
+hits_confirmed_mwb <- features |>
+  filter(confidence %in% c("strict", "standard"))
+
+write.csv(hits_confirmed_mwb, "hits-confirmed-metabolomics-workbench.csv",
+          row.names = FALSE)
+```
