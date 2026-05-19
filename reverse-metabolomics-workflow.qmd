@@ -68,7 +68,7 @@ library(RuSirius)
 | role | compound | formula | monoisotopic mass | InChIKey block 1 |
 |---|---|---|---|---|
 | parent | omeprazole | C17H19N3O3S | 345.1147 | SUBDBMMJDZJVOS |
-| metabolite | 5-hydroxyomeprazole | C17H19N3O4S | 361.1096 | YMBXIQCHYXGHAG |
+| metabolite | 5-hydroxyomeprazole | C17H19N3O4S | 361.1096 | CMZHQFXXAAIBKE |
 
 The parent/5-OH ratio is a classical CYP2C19 phenotyping readout.
 Both compounds are queried in positive and negative mode; downstream
@@ -420,6 +420,8 @@ coverage_wide
 
 SIRIUS confirmation is done in `masst-hit-confirmation.qmd`.
 Results per dataset are written to `results/<dataset_id>/`.
+
+Load back and se ehow many dataset we are left with. 
 
 
 # Single-dataset prototype
