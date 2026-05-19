@@ -193,10 +193,14 @@ for (ds in mtbls_datasets) {
   dir.create(dir_res, recursive = TRUE, showWarnings = FALSE)
 
   # --- MetaboLights-specific file access ---
-  # MsBackendMetaboLights streams files directly from the MetaboLights FTP.
-  # Pass the study ID; the backend resolves available mzML/mzXML files.
+  # Download only the files referenced by hits for this dataset, then load
+  # offline. assayName = "" matches all assays; narrow if needed.
+  wanted <- unique(basename(hits_ds$file_path))
+  mtbls_sync_data_files(mtblsId = ds, fileName = wanted)
+
   sp      <- Spectra(backendInitialize(MsBackendMetaboLights(),
-                                       mtblsStudyId = ds))
+                                       mtblsId  = ds,
+                                       offline  = TRUE))
   sp_file <- basename(dataOrigin(sp))
   sp_scan <- acquisitionNum(sp)
 

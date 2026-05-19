@@ -19,13 +19,13 @@ execute:
 
 Identical pipeline to `masst-hit-confirmation.qmd`, but restricted to
 Metabolomics Workbench datasets (`ST*` accessions) and using
-`MsBackendMWB` for raw file access.
+`MsBackendMetabolomicsWorkbench` for raw file access.
 
 # Setup
 
 ```{r setup}
 library(Spectra)
-library(MsBackendMWB)
+library(MsBackendMetabolomicsWorkbench)
 library(MetaboCoreUtils)
 library(RuSirius)
 library(dplyr)
@@ -193,9 +193,14 @@ for (ds in mwb_datasets) {
   dir.create(dir_res, recursive = TRUE, showWarnings = FALSE)
 
   # --- Metabolomics Workbench-specific file access ---
-  # MsBackendMWB streams files directly from the Metabolomics Workbench.
-  # Pass the study ID; the backend resolves available mzML/mzXML files.
-  sp      <- Spectra(backendInitialize(MsBackendMWB(), studyId = ds))
+  # Download only the files referenced by hits for this dataset, then load
+  # offline. Set ftp_zip = TRUE if the study distributes files as zip archives.
+  wanted <- unique(basename(hits_ds$file_path))
+  mwb_sync_data_files(mwbId = ds, fileName = wanted)
+
+  sp      <- Spectra(backendInitialize(MsBackendMetabolomicsWorkbench(),
+                                       mwbId   = ds,
+                                       offline = TRUE))
   sp_file <- basename(dataOrigin(sp))
   sp_scan <- acquisitionNum(sp)
 
