@@ -1,0 +1,7 @@
+"role","xcms_fts","rt","mz","adduct_inferred","file"
+"parent",1,262.38,346.12427857,"[M+H]+","CIR18.mzXML"
+"parent",2,326.779,346.12317219,"[M+H]+","CIR55_hilic_pos.mzXML"
+"parent",3,243.282,346.12197873,"[M+H]+","CIR59.mzXML"
+"parent",4,326.524,346.12316603,"[M+H]+","CIR60.mzXML"
+"metabolite",1,339.855,362.11726968,"[M+H]+","CIR59.mzXML"
+"metabolite",2,337.435,362.11495224,"[M+H]+","CIR60.mzXML"

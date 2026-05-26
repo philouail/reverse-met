@@ -63,7 +63,7 @@ compound_spec <- data.frame(
   role    = c("parent",       "metabolite"),
   name    = c("omeprazole",   "5-hydroxyomeprazole"),
   formula = c("C17H19N3O3S",  "C17H19N3O4S"),
-  ikey1   = c("SUBDBMMJDZJVOS", "CMZHQFXXAAIBKE")  
+  ikey1   = c("SUBDBMMJDZJVOS", "CMZHQFXXAAIBKE")
 )
 ```
 
@@ -221,20 +221,26 @@ run_sirius_role <- function(sp_slices, adduct_list, project_path, study_id) {
 
 ```{r per-dataset-loop}
 role_formula <- setNames(compound_spec$formula, compound_spec$role)
+hits_rt_list <- list()
 
 for (ds in massive_datasets) {
   message("\n--- Processing ", ds, " ---")
   hits_ds <- hits_massive[hits_massive$ATTRIBUTE_DatasetAccession == ds, ]
 
-  # Skip datasets already analyzed: every role present in hits_ds has its
-  # results CSV on disk.
-  dir_res <- file.path("results", ds)
+  dir_res       <- file.path("results", ds)
   roles_present <- unique(hits_ds$role)
-  expected_csv <- file.path(dir_res, paste0(roles_present, "_results.csv"))
-  if (length(expected_csv) && all(file.exists(expected_csv))) {
-    message("  Already analyzed — skipping download and SIRIUS run")
+  expected_csv  <- file.path(dir_res, paste0(roles_present, "_results.csv"))
+  sirius_done   <- length(expected_csv) && all(file.exists(expected_csv))
+  rt_path       <- file.path(dir_res, "hits_rt.csv")
+  rt_done       <- file.exists(rt_path) &&
+                   all(c("mz", "adduct_inferred", "file") %in%
+                       names(read.csv(rt_path, nrows = 1, check.names = FALSE)))
+
+  if (sirius_done && rt_done) {
+    message("  Already analyzed — skipping")
     next
   }
+  if (sirius_done) message("  SIRIUS results found — rerunning RT mapping only")
 
   # Infer adducts from precursor m/z
   hits_ds$adduct_inferred <- mapply(
@@ -265,7 +271,7 @@ for (ds in massive_datasets) {
   wanted <- unique(basename(hits_ds$file_path))
   massive_sync_data_files(ds, fileName = wanted)
   sp       <- Spectra(backendInitialize(MsBackendMassIVE(), massiveId = ds,
-                                        offline = TRUE)) ## true because we don't want to download more files. 
+                                        offline = TRUE)) ## true because we don't want to download more files.
   sp_file  <- basename(dataOrigin(sp))
   sp_scan  <- acquisitionNum(sp)
 
@@ -275,13 +281,13 @@ for (ds in massive_datasets) {
     paste(sp_file,      sp_scan,          sep = "::")
   )
   hits_ds$rt <- rtime(sp)[hit_idx]
+  hits_ds$mz <- precursorMz(sp)[hit_idx]   # observed precursor m/z
 
   # Verify that the matched scan's precursorMz agrees with the MASST hit.
   # Some files are re-uploaded with different scan numbering after indexing,
   # making acquisitionNum unreliable. Fall back to mz-based search when needed.
-  obs_pmz  <- precursorMz(sp)[hit_idx]
-  ppm_err  <- abs(obs_pmz - hits_ds$Precursor_MZ) / hits_ds$Precursor_MZ * 1e6
-  mismatch <- is.na(hit_idx) | is.na(obs_pmz) | (!is.na(ppm_err) & ppm_err > PPM)
+  ppm_err  <- abs(hits_ds$mz - hits_ds$Precursor_MZ) / hits_ds$Precursor_MZ * 1e6
+  mismatch <- is.na(hit_idx) | is.na(hits_ds$mz) | (!is.na(ppm_err) & ppm_err > PPM)
   hits_ds$scan_verified <- ifelse(mismatch, "mismatch", "ok")
 
   if (any(mismatch)) {
@@ -297,11 +303,13 @@ for (ds in massive_datasets) {
                      abs(pmz_j - hi_j$Precursor_MZ) / hi_j$Precursor_MZ * 1e6 < PPM)
       if (length(cands) == 1) {
         hits_ds$rt[j]            <- rtime(sp_j)[cands]
+        hits_ds$mz[j]            <- pmz_j[cands]
         hits_ds$scan_verified[j] <- "mz_fallback"
         message("    row ", j, ": mz fallback OK (rt=",
                 round(rtime(sp_j)[cands], 1), "s)")
       } else if (length(cands) == 0) {
         hits_ds$rt[j]            <- NA_real_
+        hits_ds$mz[j]            <- NA_real_
         hits_ds$scan_verified[j] <- "mz_not_found"
         message("    row ", j, ": no scan with matching mz — skipping")
       } else {
@@ -310,6 +318,7 @@ for (ds in massive_datasets) {
         drop_rows <- c(drop_rows, j)
         exp <- hits_ds[rep(j, length(cands)), ]
         exp$rt            <- rtime(sp_j)[cands]
+        exp$mz            <- pmz_j[cands]
         exp$scan_verified <- "mz_expanded"
         extra_rows[[length(extra_rows) + 1]] <- exp
         message("    row ", j, ": ", length(cands),
@@ -321,33 +330,47 @@ for (ds in massive_datasets) {
                        do.call(rbind, extra_rows))
   }
 
-  # Slice spectra per role
-  sp_par <- slice_role(hits_ds, sp, sp_file, sp_scan, "parent")
-  sp_met <- slice_role(hits_ds, sp, sp_file, sp_scan, "metabolite")
+  # Collect feature mapping: xcms_fts = row position within role group.
+  # Base R used — hits_ds may have NA/empty column names from the CSV.
+  # Written to disk so re-runs (loop skipped) can load it back.
+  rt_valid <- hits_ds[!is.na(hits_ds$rt),
+                      c("role", "rt", "mz", "adduct_inferred", "file")]
+  rt_valid$xcms_fts <- ave(seq_len(nrow(rt_valid)), rt_valid$role,
+                           FUN = seq_along)
+  hits_rt_list[[ds]] <- rt_valid[, c("role", "xcms_fts", "rt", "mz",
+                                     "adduct_inferred", "file")]
+  write.csv(hits_rt_list[[ds]], file.path(dir_res, "hits_rt.csv"),
+            row.names = FALSE)
 
-  if (!length(sp_par)) {
-    message("  No parent spectra — skipping parent SIRIUS run")
-  } else {
-    adduct_list_par <- lapply(sp_par, function(s) s$adduct[1])
-    res_par <- run_sirius_role(sp_par, adduct_list_par, dir_par, study_id = "parent")
-    write.csv(res_par, file.path(dir_res, "parent_results.csv"), row.names = FALSE)
-    message("  Parent done: ", nrow(res_par), " rows written")
-  }
+  if (!sirius_done) {
+    # Slice spectra per role
+    sp_par <- slice_role(hits_ds, sp, sp_file, sp_scan, "parent")
+    sp_met <- slice_role(hits_ds, sp, sp_file, sp_scan, "metabolite")
 
-  if (!length(sp_met)) {
-    message("  No metabolite spectra — skipping metabolite SIRIUS run")
-  } else {
-    adduct_list_met <- lapply(sp_met, function(s) s$adduct[1])
-    res_met <- run_sirius_role(sp_met, adduct_list_met, dir_met,study_id = "metabolite")
-    write.csv(res_met, file.path(dir_res, "metabolite_results.csv"), row.names = FALSE)
-    message("  Metabolite done: ", nrow(res_met), " rows written")
+    if (!length(sp_par)) {
+      message("  No parent spectra — skipping parent SIRIUS run")
+    } else {
+      adduct_list_par <- lapply(sp_par, function(s) s$adduct[1])
+      res_par <- run_sirius_role(sp_par, adduct_list_par, dir_par, study_id = "parent")
+      write.csv(res_par, file.path(dir_res, "parent_results.csv"), row.names = FALSE)
+      message("  Parent done: ", nrow(res_par), " rows written")
+    }
+
+    if (!length(sp_met)) {
+      message("  No metabolite spectra — skipping metabolite SIRIUS run")
+    } else {
+      adduct_list_met <- lapply(sp_met, function(s) s$adduct[1])
+      res_met <- run_sirius_role(sp_met, adduct_list_met, dir_met, study_id = "metabolite")
+      write.csv(res_met, file.path(dir_res, "metabolite_results.csv"), row.names = FALSE)
+      message("  Metabolite done: ", nrow(res_met), " rows written")
+    }
   }
 }
 
 message("All datasets processed.")
 ```
 
-this mistmatch i have between reported scan and [precursor mz is somethign we could probably discuss in a paper too.. 
+this mistmatch i have between reported scan and [precursor mz is somethign we could probably discuss in a paper too..
 
 # Evaluate SIRIUS matches
 
@@ -530,10 +553,67 @@ features |>
 
 I'm not very happy to get rid of one dataset. but i could be because of the matching spectrum quality ? i do not know why the cosine match is so good but SIrius cannotanntoate it.. i could feed it the formula butthis would be biased.
 
+# RT summary
+
+## Join retention times
+
+```{r rt-join}
+if (length(hits_rt_list) == 0) {
+  hits_rt_list <- lapply(
+    setNames(massive_datasets, massive_datasets),
+    function(ds) {
+      p <- file.path("results", ds, "hits_rt.csv")
+      if (file.exists(p)) read.csv(p, check.names = FALSE) else NULL
+    }
+  )
+  hits_rt_list <- Filter(Negate(is.null), hits_rt_list)
+}
+
+rt_tbl   <- bind_rows(hits_rt_list, .id = "dataset_id")
+features <- features |>
+  left_join(rt_tbl, by = c("dataset_id", "role", "xcms_fts"))
+```
+
+## RT range per dataset and role
+
+```{r rt-summary-table}
+rt_summary <- features |>
+  filter(!is.na(rt)) |>
+  group_by(dataset_id, role, confidence) |>
+  summarise(
+    n         = n(),
+    rt_min    = round(min(rt), 1),
+    rt_median = round(median(rt), 1),
+    rt_max    = round(max(rt), 1),
+    rt_range  = round(max(rt) - min(rt), 1),
+    .groups   = "drop"
+  )
+rt_summary
+```
+
+## RT distribution across datasets
+
+```{r rt-plot, fig.width=9, fig.height=4}
+features |>
+  filter(!is.na(rt)) |>
+  ggplot(aes(x = dataset_id, y = rt,
+             colour = confidence, shape = role)) +
+  geom_jitter(size = 3, width = 0.15, alpha = 0.85) +
+  facet_wrap(~role) +
+  scale_colour_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  labs(x = NULL, y = "Retention time (s)",
+       colour = "Confidence", shape = "Role",
+       title = "RT of confirmed features across MassIVE datasets (s)") +
+  theme_bw() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+```
+
 # Write confirmed hits
 
 Hits whose SIRIUS confidence is `strict` or `standard` are kept as
-MassIVE-confirmed hits.
+MassIVE-confirmed hits. The `rt` column (seconds) is included for
+downstream RT-window alignment.
 
 ```{r write-confirmed}
 hits_confirmed_massive <- features |>
