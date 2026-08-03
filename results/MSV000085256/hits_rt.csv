@@ -1,7 +1,0 @@
-"role","xcms_fts","rt","mz","adduct_inferred","file"
-"parent",1,193.369,368.104026896424,"[M+Na]+","424_Plasma.mzML"
-"parent",2,192.287,346.122094642158,"[M+H]+","356_Plasma_20191118035138.mzML"
-"parent",3,189.12,346.122084643113,"[M+H]+","410_Plasma.mzML"
-"parent",4,190.262,368.103464461755,"[M+Na]+","511_Plasma.mzML"
-"metabolite",1,176.267,362.116945492033,"[M+H]+","424_Plasma.mzML"
-"metabolite",2,173.285,362.116662681884,"[M+H]+","511_Plasma.mzML"

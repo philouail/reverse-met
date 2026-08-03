@@ -1,0 +1,6 @@
+dataset_id,role,ms2_rt,apex_rt,note
+MSV000088255,metabolite,337,270,DDA fired 67 s late on the tail; true 5-OH apex confirmed manually
+MSV000088255,metabolite,310,270,DDA fired late; manual apex
+MSV000088255,metabolite,306,270,DDA fired late; manual apex
+MSV000088255,metabolite,293,268,DDA fired late; manual apex
+ST002722_AN004413,parent,327,261,HILIC tail fire; auto-snap landed on a tail bump; true apex manual

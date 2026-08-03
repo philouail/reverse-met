@@ -1,0 +1,557 @@
+---
+title: "Metabolomics Workbench Hit Confirmation: RuSirius"
+subtitle: "Per-dataset SIRIUS annotation of curated MASST hits (Metabolomics Workbench)"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+Identical pipeline to `masst-hit-confirmation.qmd`, but restricted to
+Metabolomics Workbench datasets (`ST*` accessions) and using
+`MsBackendMetabolomicsWorkbench` for raw file access.
+
+# Setup
+
+```{r}
+#| include: false
+# This notebook lives in confirmation/ — run it from the repo root so
+# source("R/...") and read("artifacts/...") paths resolve.
+knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r setup}
+library(Spectra)
+library(MsBackendMetabolomicsWorkbench)
+library(MetaboCoreUtils)
+library(RuSirius)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+# Compound targets
+
+```{r compound-spec}
+compound_spec <- data.frame(
+  role    = c("parent",         "metabolite"),
+  name    = c("omeprazole",     "5-hydroxyomeprazole"),
+  formula = c("C17H19N3O3S",    "C17H19N3O4S"),
+  ikey1   = c("SUBDBMMJDZJVOS", "CMZHQFXXAAIBKE")
+)
+```
+
+# Load curated hits
+
+```{r load-hits}
+hits_curated <- read.csv("artifacts/hits_curated.csv", check.names = FALSE)
+```
+
+# Filter to Metabolomics Workbench datasets
+
+```{r filter-mwb}
+hits_mwb <- hits_curated[
+  startsWith(hits_curated$ATTRIBUTE_DatasetAccession, "ST"), ]
+
+mwb_datasets <- unique(hits_mwb$ATTRIBUTE_DatasetAccession)
+cat(length(mwb_datasets), "Metabolomics Workbench datasets to process\n")
+```
+
+# Helper functions
+
+```{r helpers}
+ADDUCT_CANDIDATES <- c(
+  "[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+",
+  "[M-H]-", "[M+Cl]-"
+)
+PPM    <- 20
+RT_TOL <- 3   # seconds around hit RT
+
+# Cap the number of hits per role sent to SIRIUS. The confirmed features are
+# used downstream (05, derive_extraction_config) only to compute the per-
+# (dataset, role) MEDIAN m/z + RT that anchors the MS1 extraction window; a
+# few dozen high-cosine confirmations give a robust median, while every hit's
+# RT + provenance stays in artifacts/hits_curated.csv. Set to Inf to confirm
+# every hit.
+CAP_PER_ROLE <- 50
+
+infer_adduct <- function(obs_mz, formula,
+                         ppm        = PPM,
+                         candidates = ADDUCT_CANDIDATES) {
+  if (is.na(obs_mz) || is.na(formula)) return(NA_character_)
+  mass     <- calculateMass(formula)
+  theo     <- vapply(candidates,
+                     function(a) mass2mz(mass, adduct = a)[[1]], numeric(1))
+  diff_ppm <- abs(obs_mz - theo) / theo * 1e6
+  best     <- which.min(diff_ppm)
+  if (diff_ppm[best] > ppm) NA_character_ else candidates[best]
+}
+
+slice_role <- function(hits_ds, sp, sp_file, role) {
+  h <- hits_ds[hits_ds$role == role & !is.na(hits_ds$rt), ]
+  if (!nrow(h)) return(list())
+
+  lapply(seq_len(nrow(h)), function(i) {
+    hi     <- h[i, ]
+    mz_rng <- hi$Precursor_MZ * c(1 - PPM * 1e-6, 1 + PPM * 1e-6)
+    rt_rng <- hi$rt + c(-RT_TOL, RT_TOL)
+
+    sp_f <- filterRt(sp[sp_file == hi$file], rt_rng)
+    ms1  <- filterMsLevel(sp_f, 1L)
+    ms2  <- filterPrecursorMzRange(filterMsLevel(sp_f, 2L), mz_rng)
+
+    int_at_mz <- vapply(peaksData(ms1), function(pm) {
+      keep <- pm[, "mz"] >= mz_rng[1] & pm[, "mz"] <= mz_rng[2]
+      if (any(keep)) max(pm[keep, "intensity"]) else 0
+    }, numeric(1))
+
+    ms1_top <- if (length(ms1) && max(int_at_mz) > 0) {
+      ms1[which.max(int_at_mz)]
+    } else {
+      ms1[integer(0)]
+    }
+
+    out           <- c(ms1_top, ms2)
+    out$adduct    <- rep(hi$adduct_inferred, length(out))
+    out$group_idx <- rep(i, length(out))
+    out
+  })
+}
+
+run_sirius_role <- function(sp_slices, adduct_list, project_path, study_id) {
+  srs <- Sirius(
+    projectId = study_id,
+    username  = Sys.getenv("SIRIUS_USERNAME"),
+    path      = paste0(getwd(), "/", project_path),
+    password  = Sys.getenv("SIRIUS_PASSWORD")
+  )
+
+  pol   <- ifelse(endsWith(trimws(unlist(adduct_list)), "+"), "pos", "neg")
+  first <- TRUE
+  for (p in unique(pol)) {
+    idx  <- which(pol == p)
+    sp_p <- concatenateSpectra(sp_slices[idx])
+    srs  <- import(
+      sirius                 = srs,
+      spectra                = sp_p,
+      adduct                 = adduct_list[idx],
+      ms_column_name         = "group_idx",
+      deleteExistingFeatures = first
+    )
+    first <- FALSE
+  }
+
+  run(
+    srs,
+    formulaIdParams         = formulaIdParam(),
+    structureDbSearchParams = structureDbSearchParam(structureSearchDbs = "ALL"),
+    predictParams           = predictParam(),
+    wait                    = TRUE
+  )
+  res <- results(srs,
+                 result.type  = "structureDb",
+                 return.type  = "data.frame",
+                 topFormula   = 15,
+                 topStructure = 15)
+  shutdown(srs)
+  res
+}
+```
+
+# Per-dataset SIRIUS annotation
+
+```{r per-dataset-loop}
+role_formula <- setNames(compound_spec$formula, compound_spec$role)
+hits_rt_list <- list()
+
+for (ds in mwb_datasets) {
+  message("\n--- Processing ", ds, " ---")
+  hits_ds <- hits_mwb[hits_mwb$ATTRIBUTE_DatasetAccession == ds, ]
+
+  dir_res       <- file.path("results", ds)
+  roles_present <- unique(hits_ds$role)
+  expected_csv  <- file.path(dir_res, paste0(roles_present, "_results.csv"))
+  sirius_done   <- length(expected_csv) && all(file.exists(expected_csv))
+  rt_path       <- file.path(dir_res, "hits_rt.csv")
+  rt_done       <- file.exists(rt_path) &&
+                   all(c("mz", "adduct_inferred", "source_file", "assay") %in%
+                       names(read.csv(rt_path, nrows = 1, check.names = FALSE)))
+
+  if (sirius_done && rt_done) {
+    message("  Already analyzed, skipping")
+    next
+  }
+  if (sirius_done) message("  SIRIUS results found, rerunning RT mapping only")
+
+  hits_ds$adduct_inferred <- mapply(infer_adduct,
+                                    hits_ds$Precursor_MZ,
+                                    role_formula[hits_ds$role],
+                                    USE.NAMES = FALSE)
+  hits_ds$scan_verified <- NA_character_
+  na_adduct <- is.na(hits_ds$adduct_inferred)
+  if (any(na_adduct)) {
+    hits_ds$scan_verified[na_adduct] <- "no_adduct_match"
+    message("  ", sum(na_adduct), " hit(s) dropped: no adduct match within ",
+            PPM, " ppm")
+    hits_ds <- hits_ds[!na_adduct, ]
+  }
+
+  # Cap to the top-CAP_PER_ROLE highest-cosine hits per role before SIRIUS.
+  # Only the confirmed features' median m/z + RT are used downstream, so a
+  # capped high-cosine subset is sufficient; this also limits how many raw
+  # files are synced + loaded below.
+  if (nrow(hits_ds) && is.finite(CAP_PER_ROLE)) {
+    hits_ds <- do.call(rbind, lapply(split(hits_ds, hits_ds$role), function(d) {
+      if (nrow(d) <= CAP_PER_ROLE) d else d[order(-d$Cosine)[seq_len(CAP_PER_ROLE)], ]
+    }))
+    n_by_role <- table(hits_ds$role)
+    message("  Capped to ", paste(sprintf("%s=%d", names(n_by_role), n_by_role),
+            collapse = ", "), " hit(s) for SIRIUS (top cosine)")
+  }
+
+  dir_par <- file.path("sirius_projects", ds, "parent")
+  dir_met <- file.path("sirius_projects", ds, "metabolite")
+  dir_res <- file.path("results", ds)
+  dir.create(dir_par, recursive = TRUE, showWarnings = FALSE)
+  dir.create(dir_met, recursive = TRUE, showWarnings = FALSE)
+  dir.create(dir_res, recursive = TRUE, showWarnings = FALSE)
+
+  wanted <- unique(basename(hits_ds$file_path))
+  mwb_sync_data_files(mwbId = ds, fileName = wanted)
+
+  sp      <- Spectra(backendInitialize(MsBackendMetabolomicsWorkbench(),
+                                       mwbId   = ds,
+                                       offline = TRUE))
+  sp_file <- basename(dataOrigin(sp))
+  # Cache filenames are prefixed by the MsBackend (<deposit/zip>_<name>)
+  # to avoid cross-dataset basename collisions; reconcile them back to the
+  # bare names in `wanted` so the (file, scan) match, the mz-fallback, and
+  # slice_role() below key on the same names hits_ds$file uses.
+  .u   <- unique(sp_file)
+  .map <- setNames(vapply(.u, function(f) {
+    hit <- wanted[f == wanted | endsWith(f, paste0("_", wanted))]
+    if (length(hit)) hit[which.max(nchar(hit))] else f
+  }, character(1)), .u)
+  sp_file <- unname(.map[sp_file])
+  sp_scan <- acquisitionNum(sp)
+
+  hits_ds$file <- basename(hits_ds$file_path)
+  hit_idx      <- match(
+    paste(hits_ds$file, hits_ds$scan_id, sep = "::"),
+    paste(sp_file,      sp_scan,          sep = "::")
+  )
+  hits_ds$rt <- rtime(sp)[hit_idx]
+  hits_ds$mz <- precursorMz(sp)[hit_idx]
+  # Provenance: the ACTUAL cached file (study/zip-prefixed) each rt was read
+  # from, so cross-deposit leakage shows a wrong prefix instead of hiding
+  # behind the bare hit filename.
+  hits_ds$origin <- basename(dataOrigin(sp))[hit_idx]
+
+  ppm_err  <- abs(hits_ds$mz - hits_ds$Precursor_MZ) / hits_ds$Precursor_MZ * 1e6
+  mismatch <- is.na(hit_idx) | is.na(hits_ds$mz) |
+              (!is.na(ppm_err) & ppm_err > PPM)
+  hits_ds$scan_verified <- ifelse(mismatch, "mismatch", "ok")
+
+  if (any(mismatch)) {
+    message("  ", sum(mismatch), " hit(s) with scan_id/precursorMz mismatch")
+
+    for (j in which(mismatch)) {
+      hi_j   <- hits_ds[j, ]
+      sp_j   <- sp[sp_file == hi_j$file]
+      pmz_j  <- precursorMz(sp_j)
+      pint_j <- precursorIntensity(sp_j)
+      cands  <- which(!is.na(pmz_j) &
+                      abs(pmz_j - hi_j$Precursor_MZ) /
+                        hi_j$Precursor_MZ * 1e6 < PPM)
+
+      if (!length(cands)) {
+        hits_ds$rt[j]            <- NA_real_
+        hits_ds$mz[j]            <- NA_real_
+        hits_ds$scan_verified[j] <- "mz_not_found"
+        message("    row ", j, ": no matching mz, skipping")
+      } else {
+        best <- cands[which.max(pint_j[cands])]
+        hits_ds$rt[j]            <- rtime(sp_j)[best]
+        hits_ds$mz[j]            <- pmz_j[best]
+        hits_ds$origin[j]        <- basename(dataOrigin(sp_j))[best]
+        hits_ds$scan_verified[j] <- if (length(cands) == 1) "mz_fallback"
+                                    else                    "mz_fallback_apex"
+        message("    row ", j, ": ", length(cands),
+                " cand(s), picked apex at rt = ",
+                round(rtime(sp_j)[best], 1), "s")
+      }
+    }
+  }
+
+  rt_valid <- hits_ds[!is.na(hits_ds$rt),
+                      c("role", "rt", "mz", "adduct_inferred", "origin", "assay")]
+  # source_file carries the study/zip prefix of the file the rt came from
+  # (provenance) so cross-deposit leakage is visible at a glance.
+  names(rt_valid)[names(rt_valid) == "origin"] <- "source_file"
+  rt_valid$xcms_fts <- ave(seq_len(nrow(rt_valid)), rt_valid$role,
+                           FUN = seq_along)
+  hits_rt_list[[ds]] <- rt_valid[, c("role", "xcms_fts", "rt", "mz",
+                                     "adduct_inferred", "source_file", "assay")]
+  write.csv(hits_rt_list[[ds]], file.path(dir_res, "hits_rt.csv"),
+            row.names = FALSE)
+
+  if (!sirius_done) {
+    sp_par <- slice_role(hits_ds, sp, sp_file, "parent")
+    sp_met <- slice_role(hits_ds, sp, sp_file, "metabolite")
+
+    if (!length(sp_par)) {
+      message("  No parent spectra, skipping parent SIRIUS run")
+    } else {
+      adduct_list_par <- lapply(sp_par, function(s) s$adduct[1])
+      res_par <- run_sirius_role(sp_par, adduct_list_par,
+                                 dir_par, study_id = "parent")
+      write.csv(res_par, file.path(dir_res, "parent_results.csv"),
+                row.names = FALSE)
+      message("  Parent done: ", nrow(res_par), " rows")
+    }
+
+    if (!length(sp_met)) {
+      message("  No metabolite spectra, skipping metabolite SIRIUS run")
+    } else {
+      adduct_list_met <- lapply(sp_met, function(s) s$adduct[1])
+      res_met <- run_sirius_role(sp_met, adduct_list_met,
+                                 dir_met, study_id = "metabolite")
+      write.csv(res_met, file.path(dir_res, "metabolite_results.csv"),
+                row.names = FALSE)
+      message("  Metabolite done: ", nrow(res_met), " rows")
+    }
+  }
+}
+
+message("All Metabolomics Workbench datasets processed.")
+```
+
+# Evaluate SIRIUS matches
+
+## Helper functions
+
+```{r resolve-helpers}
+CONFIDENCE_LEVELS  <- c("strict", "standard", "liberal", "not_confirmed")
+CONFIDENCE_COLOURS <- c(
+  strict        = "#1A7837",
+  standard      = "#74C476",
+  liberal       = "#FEC44F",
+  not_confirmed = "#D7191C"
+)
+
+resolve_features <- function(res, target_formula, target_ikey_prefix) {
+  target_rows <- res |>
+    filter(molecularFormula == target_formula,
+           !is.na(inchiKey),
+           startsWith(inchiKey, target_ikey_prefix)) |>
+    group_by(xcms_fts) |>
+    slice_min(rank.y, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    transmute(
+      xcms_fts,
+      formula_rank   = rank.x,
+      formula_score  = round(siriusScoreNormalized, 3),
+      structure_rank = rank.y,
+      tanimoto       = round(tanimotoSimilarity, 3),
+      csi_score      = round(csiScore, 1),
+      adduct,
+      structure_name = structureName,
+      target_present = TRUE
+    )
+
+  res |>
+    distinct(xcms_fts) |>
+    left_join(target_rows, by = "xcms_fts") |>
+    mutate(
+      target_present = !is.na(formula_rank),
+      confidence = case_when(
+        formula_rank == 1  & structure_rank == 1  ~ "strict",
+        formula_rank <= 3  & structure_rank <= 5  ~ "standard",
+        formula_rank <= 15 & structure_rank <= 15 ~ "liberal",
+        TRUE                                       ~ "not_confirmed"
+      ),
+      confidence = factor(confidence, levels = CONFIDENCE_LEVELS)
+    ) |>
+    arrange(confidence, formula_rank, structure_rank)
+}
+
+resolve_all <- function(results_dir = "results", compound_spec) {
+  datasets <- list.dirs(results_dir, recursive = FALSE, full.names = FALSE)
+  datasets <- datasets[startsWith(datasets, "ST")]
+  all_rows <- list()
+
+  for (ds in datasets) {
+    for (i in seq_len(nrow(compound_spec))) {
+      role     <- compound_spec$role[i]
+      csv_path <- file.path(results_dir, ds, paste0(role, "_results.csv"))
+      if (!file.exists(csv_path)) next
+      res <- read.csv(csv_path, check.names = FALSE)
+      if (!nrow(res)) next
+
+      resolve_features(res,
+                       target_formula     = compound_spec$formula[i],
+                       target_ikey_prefix = compound_spec$ikey1[i]) |>
+        mutate(dataset_id = ds, role = role, .before = xcms_fts) ->
+        all_rows[[paste(ds, role, sep = "::")]]
+    }
+  }
+
+  features <- bind_rows(all_rows)
+  summary_tbl <- features |>
+    group_by(dataset_id, role) |>
+    summarise(n_total          = n(),
+              n_target_present = sum(target_present, na.rm = TRUE),
+              n_strict         = sum(confidence == "strict",   na.rm = TRUE),
+              n_standard       = sum(confidence == "standard", na.rm = TRUE),
+              n_liberal        = sum(confidence == "liberal",  na.rm = TRUE),
+              .groups = "drop")
+
+  list(features = features, summary = summary_tbl)
+}
+```
+
+## Run evaluation
+
+```{r resolve-run}
+resolved    <- resolve_all(results_dir = "results", compound_spec = compound_spec)
+features    <- resolved$features
+summary_tbl <- resolved$summary
+summary_tbl
+```
+
+## Plots
+
+### Confidence levels per dataset and role
+
+```{r plot-confidence, fig.width=9, fig.height=4}
+features |>
+  count(dataset_id, role, confidence) |>
+  ggplot(aes(x = dataset_id, y = n, fill = confidence)) +
+  geom_col() +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5),
+            size = 3, colour = "white", fontface = "bold") +
+  facet_wrap(~role) +
+  scale_fill_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  labs(x = NULL, y = "Number of features", fill = "Confidence",
+       title = "SIRIUS confirmation confidence: Metabolomics Workbench") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+```
+
+### Formula and structure rank
+
+```{r plot-ranks, fig.width=6, fig.height=5}
+features |>
+  filter(target_present) |>
+  ggplot(aes(x = formula_rank, y = structure_rank,
+             colour = confidence, shape = role)) +
+  annotate("rect", xmin = 0.5, xmax = 1.5,  ymin = 0.5, ymax = 1.5,
+           fill = "#1A7837", alpha = 0.08) +
+  annotate("rect", xmin = 0.5, xmax = 3.5,  ymin = 0.5, ymax = 5.5,
+           fill = "#74C476", alpha = 0.06) +
+  annotate("rect", xmin = 0.5, xmax = 15.5, ymin = 0.5, ymax = 15.5,
+           fill = "#FEC44F", alpha = 0.04) +
+  geom_jitter(size = 3, width = 0.2, height = 0.2, alpha = 0.9) +
+  scale_colour_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  scale_x_continuous(breaks = c(1, 3, 5, 10, 15)) +
+  scale_y_continuous(breaks = c(1, 5, 10, 15)) +
+  labs(x = "Formula rank", y = "Structure rank",
+       colour = "Confidence", shape = "Role",
+       title = "Rank of target: Metabolomics Workbench") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+### Score scatter
+
+```{r plot-scores, fig.width=7, fig.height=4}
+features |>
+  filter(target_present) |>
+  ggplot(aes(x = tanimoto, y = formula_score,
+             colour = confidence, shape = role)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  labs(x = "Tanimoto similarity", y = "Normalised formula score",
+       colour = "Confidence", shape = "Role",
+       title = "Score distribution: Metabolomics Workbench") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+# RT summary
+
+## Join retention times
+
+```{r rt-join}
+# Load hits_rt.csv from disk for any deposit the loop above skipped.
+# Prevents partial-render NA-fills in the left_join below.
+missing <- setdiff(mwb_datasets, names(hits_rt_list))
+for (ds in missing) {
+  p <- file.path("results", ds, "hits_rt.csv")
+  if (file.exists(p)) hits_rt_list[[ds]] <- read.csv(p, check.names = FALSE)
+}
+
+rt_tbl   <- bind_rows(hits_rt_list, .id = "dataset_id")
+features <- features |>
+  left_join(rt_tbl, by = c("dataset_id", "role", "xcms_fts"))
+```
+
+## RT range per dataset and role
+
+```{r rt-summary-table}
+rt_summary <- features |>
+  filter(!is.na(rt)) |>
+  group_by(dataset_id, role, confidence) |>
+  summarise(
+    n         = n(),
+    rt_min    = round(min(rt), 1),
+    rt_median = round(median(rt), 1),
+    rt_max    = round(max(rt), 1),
+    rt_range  = round(max(rt) - min(rt), 1),
+    .groups   = "drop"
+  )
+rt_summary
+```
+
+## RT distribution across datasets
+
+```{r rt-plot, fig.width=9, fig.height=4}
+features |>
+  filter(!is.na(rt)) |>
+  ggplot(aes(x = dataset_id, y = rt,
+             colour = confidence, shape = role)) +
+  geom_jitter(size = 3, width = 0.15, alpha = 0.85) +
+  facet_wrap(~role) +
+  scale_colour_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  labs(x = NULL, y = "Retention time (s)",
+       colour = "Confidence", shape = "Role",
+       title = "RT of confirmed features across Metabolomics Workbench datasets (s)") +
+  theme_bw() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+```
+
+# Write confirmed hits
+
+Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept
+as Metabolomics Workbench-confirmed; the `confidence` and `rt` (seconds)
+columns are preserved for downstream stratification and RT-window alignment.
+
+```{r write-confirmed}
+hits_confirmed_mwb <- features |>
+  filter(confidence %in% c("strict", "standard", "liberal"))
+
+write.csv(hits_confirmed_mwb, "artifacts/hits-confirmed-metabolomics-workbench.csv",
+          row.names = FALSE)
+```

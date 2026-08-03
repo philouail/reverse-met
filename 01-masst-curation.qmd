@@ -1,0 +1,751 @@
+---
+title: "01 - MASST curation"
+subtitle: "Compound pair · MASST exports · dataset selection"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+params:
+  run_confirmations: false
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+First step of the pipeline: load the StructureMASST hit set for omeprazole
+and its CYP2C19 metabolite (5-hydroxyomeprazole), keep datasets where both
+compounds appear, and curate that intersection down to the (dataset, assay)
+combinations suitable for a parent/metabolite ratio analysis.
+
+A *dataset* means **one assay of one deposit**; every downstream step joins
+on `dataset_id`, which encodes the deposit + assay pair.
+
+The search:
+
+- **Query spectra** are the GNPS reference-library MS/MS spectra of omeprazole
+  and 5-hydroxyomeprazole, in both polarities. The discovery chunk below
+  resolves each compound to its library spectra by InChIKey first block.
+- **Search space** is every public MS/MS spectrum indexed by StructureMASST
+  across MassIVE, MetaboLights and Metabolomics Workbench.
+- **Match threshold** is cosine ≥ 0.7 and ≥ 3 matched peaks, analog search off.
+
+Hits are read from **FASSTrecords** (a DOI-versioned SQLite of repository-scale
+MASST annotations, DOI 10.5281/zenodo.18199544), so the discovery step is
+scripted and pinned rather than a one-off web query.
+
+**Reads:**
+
+- `StructureMASST_output/fasstrecords_hits.csv` (written by the discovery chunk
+  below from FASSTrecords; committed, so normally read as-is)
+
+**Writes:**
+
+- `artifacts/hits_curated.csv` - MASST hits restricted to curated keeps,
+  with `dataset_id`, `deposit_id`, `assay` and `adduct_inferred` columns
+  populated. Read by the three SIRIUS confirmation notebooks.
+- `artifacts/dataset_metadata_table.csv` - one row per kept (deposit,
+  assay) with repository, chromatography, paper-derived constants and
+  the col_/const_ mappings consumed by `load_metadata()`.
+
+```{r setup}
+source("R/_setup.R")
+source("R/masst.R")
+source("R/metadata.R")
+source("check-versions.R")
+```
+
+# Compound pair
+
+The omeprazole / 5-hydroxyomeprazole pair is a CYP2C19 phenotyping readout:
+CYP2C19 hydroxylates omeprazole at the 5-position, so the parent/5-OH ratio
+reflects CYP2C19 metaboliser status.
+
+Both compounds were queried in both polarities; downstream code picks the
+adduct with the most confirmed hits per dataset and collapses adducts to one
+feature per compound per sample.
+
+```{r compound-spec}
+compound_spec
+```
+
+# MASST hits (FASSTrecords)
+
+**Provenance and reproduction.** FASSTrecords is a repository-scale snapshot of
+public MASST annotations (a ~1.2-billion-row SQLite of every GNPS/MASST spectrum
+match), archived on Zenodo at **DOI 10.5281/zenodo.18199544**
+(sha256 `95a11bbe…`). We downloaded that archive and extracted the hit set on
+**2026-07-10**. To reproduce, download the Zenodo archive to the `FASST_DB` path in
+the discovery chunk below and delete `StructureMASST_output/fasstrecords_hits.csv`;
+the chunk then resolves each compound to its GNPS library spectra by InChIKey first
+block (omeprazole `SUBDBMMJDZJVOS`, 5-OH `CMZHQFXXAAIBKE`), pulls every `masst_table`
+match at cosine ≥ 0.7 and ≥ 3 matched peaks, joins the per-file ReDU fields, and
+writes `StructureMASST_output/fasstrecords_hits.csv`.
+
+Because the archive is immutable (DOI + checksum), this discovery step is fully
+pinned. The chunk **skips itself** when the ~1.2B-row DB is absent or the CSV
+already exists, so a fresh clone — and every normal re-render — uses the committed
+output unchanged. Each row of the hit table carries:
+
+- `ATTRIBUTE_DatasetAccession`, `file_path`, `scan_id`, `role` (parent /
+  metabolite) — where the hit is;
+- `Precursor_MZ` and the inferred `Adduct` — what was matched;
+- the per-file ReDU fields the hard stops key on: `ChromatographyAndPhase`,
+  `IonizationSourceAndPolarity`, `NCBITaxonomy`, `SampleType`.
+
+```{r discovery-fasstrecords}
+# Resolve the probe pair to its GNPS library spectra and pull every StructureMASST match
+# from the FASSTrecords DB. That ~1.2B-row SQLite (Zenodo DOI 10.5281/zenodo.18199544,
+# immutable) is NOT in the repo, so this runs ONLY where the DB is present AND the output is
+# missing; otherwise the committed CSV is used unchanged. Delete the CSV to force a rebuild.
+FASST_DB  <- "D:/FASSTrecords/db/masst_records.sqlite"
+FASST_OUT <- "StructureMASST_output/fasstrecords_hits.csv"
+if (file.exists(FASST_DB) && !file.exists(FASST_OUT)) {
+  suppressPackageStartupMessages(library(RSQLite))
+  IKEY <- c(parent = "SUBDBMMJDZJVOS", metabolite = "CMZHQFXXAAIBKE")  # omeprazole / 5-OH
+  COSINE_MIN <- 0.7; PEAKS_MIN <- 3
+  INVALID_SCAN <- 4294967295                                            # 32-bit uint sentinel
+  con <- dbConnect(SQLite(), FASST_DB)
+  unq <- function(x) trimws(gsub('"', '', x))          # strip stray quotes in Dataset/mri
+  inl <- function(v) paste(v, collapse = ",")          # integer IN-list
+  lib_ids <- lapply(IKEY, function(k) dbGetQuery(con, sprintf(
+    "SELECT spectrum_id_int, spectrum_id, Adduct, Precursor_MZ
+       FROM library_table WHERE InChIKey_smiles_firstBlock = '%s'", k)))
+  get_role <- function(role) {
+    lib <- lib_ids[[role]]; if (!nrow(lib)) return(NULL)
+    h <- dbGetQuery(con, sprintf(
+      "SELECT m.cosine AS Cosine, m.matching_peaks AS matching_peaks, m.scan_id AS scan_id,
+              m.spectrum_id_int AS spectrum_id_int, m.mri_id_int AS mri_id_int,
+              d.Dataset AS ATTRIBUTE_DatasetAccession, mr.mri AS mri
+         FROM masst_table m
+         JOIN dataset_table d ON m.dataset_id_int = d.dataset_id_int
+         JOIN mri_table    mr ON m.mri_id_int     = mr.mri_id_int
+        WHERE m.spectrum_id_int IN (%s) AND m.cosine >= %f AND m.matching_peaks >= %d",
+      inl(lib$spectrum_id_int), COSINE_MIN, PEAKS_MIN))
+    if (!nrow(h)) return(NULL)
+    h <- dplyr::left_join(h, lib[, c("spectrum_id_int","spectrum_id","Adduct","Precursor_MZ")],
+                          by = "spectrum_id_int")
+    h$ATTRIBUTE_DatasetAccession <- unq(h$ATTRIBUTE_DatasetAccession); h$mri <- unq(h$mri)
+    h$role <- role; h$inchikey_first_block <- IKEY[[role]]
+    h$USI <- paste0(h$mri, ":scan:", h$scan_id)          # resolvable spectrum reference
+    h$file_path <- sub("^mzspec:[^:]*:", "", h$mri)       # repo-relative path; basename used downstream
+    h$`Matching Peaks` <- h$matching_peaks; h$lib_spectrum <- h$spectrum_id
+    h }
+  hits <- dplyr::bind_rows(get_role("parent"), get_role("metabolite"))
+  hits <- hits[hits$scan_id != INVALID_SCAN | is.na(hits$scan_id), ]   # drop 32-bit sentinel scans
+  mids <- unique(hits$mri_id_int); chunks <- split(mids, ceiling(seq_along(mids) / 5000))
+  redu <- dplyr::bind_rows(lapply(chunks, function(ch) dbGetQuery(con, sprintf(
+    "SELECT mri_id_int, ChromatographyAndPhase, IonizationSourceAndPolarity, NCBITaxonomy, SampleType
+       FROM redu_table WHERE mri_id_int IN (%s)", inl(ch)))))
+  cln <- function(v) { v[is.na(v) | v %in% c("missing value","not applicable","")] <- NA; v }
+  for (cc in c("ChromatographyAndPhase","IonizationSourceAndPolarity","NCBITaxonomy","SampleType"))
+    redu[[cc]] <- cln(redu[[cc]])
+  redu <- redu[!duplicated(redu$mri_id_int), ]
+  hits <- dplyr::left_join(hits, redu, by = "mri_id_int")
+  dbDisconnect(con)
+  dir.create("StructureMASST_output", showWarnings = FALSE)
+  keep <- c("ATTRIBUTE_DatasetAccession","USI","file_path","scan_id","role","Cosine","Matching Peaks",
+            "Adduct","Precursor_MZ","inchikey_first_block","lib_spectrum","ChromatographyAndPhase",
+            "IonizationSourceAndPolarity","NCBITaxonomy","SampleType")
+  write.csv(hits[, keep], FASST_OUT, row.names = FALSE)
+  message("FASSTrecords discovery: wrote ", nrow(hits), " hits -> ", FASST_OUT)
+} else {
+  message("FASSTrecords discovery: using committed ", FASST_OUT,
+          if (!file.exists(FASST_DB)) " (DB not present)" else " (already built)")
+}
+```
+
+```{r load-hits}
+all_hits <- read.csv("StructureMASST_output/fasstrecords_hits.csv",
+                     check.names = FALSE, stringsAsFactors = FALSE)
+# Normalise ReDU / MIxS placeholders ("missing value", …) to NA.
+for (j in seq_along(all_hits))
+  if (is.character(all_hits[[j]])) all_hits[[j]][is_missing_val(all_hits[[j]])] <- NA
+all_hits$scan_id <- as.integer(all_hits$scan_id)
+```
+
+```{r load-hits-summary}
+#| echo: false
+cat("Total MASST hits loaded:", nrow(all_hits), "\n")
+cat("  parent    :", sum(all_hits$role == "parent"), "\n")
+cat("  metabolite:", sum(all_hits$role == "metabolite"), "\n")
+```
+
+## Remove corrupted USIs
+
+The scan number `4294967295` (max 32-bit unsigned int) is written by some
+mzML converters when the scan index is unresolved; such hits can't locate a
+spectrum, so we drop them.
+
+```{r filter-corrupt-usi}
+INVALID_SCAN <- 4294967295   # 32-bit uint sentinel; > .Machine$integer.max, so keep numeric
+n_corrupt <- sum(all_hits$scan_id == INVALID_SCAN, na.rm = TRUE)
+all_hits  <- all_hits[is.na(all_hits$scan_id) | all_hits$scan_id != INVALID_SCAN, ]
+```
+
+```{r filter-corrupt-usi-summary}
+#| echo: false
+cat("Corrupted USIs removed:", n_corrupt,
+    "(", round(100 * n_corrupt / (nrow(all_hits) + n_corrupt), 1),
+    "% of all hits)\n")
+```
+
+# Dataset selection
+
+## D_both: datasets where both compounds appear
+
+We restrict to the intersection of datasets containing at least one MASST
+hit for each compound. Datasets with only one compound cannot provide a
+parent/metabolite ratio and are out of scope.
+
+```{r d-both}
+D_parent     <- unique(all_hits$ATTRIBUTE_DatasetAccession[all_hits$role == "parent"])
+D_metabolite <- unique(all_hits$ATTRIBUTE_DatasetAccession[all_hits$role == "metabolite"])
+D_both       <- intersect(D_parent, D_metabolite)
+```
+
+```{r d-both-summary}
+#| echo: false
+cat("parent datasets:", length(D_parent),
+    "| metabolite datasets:", length(D_metabolite),
+    "| intersection:", length(D_both), "\n")
+```
+
+## Hard-stop exclusions
+
+Reusable safety filter, derived from columns in the MASST export itself (no
+network calls). A dataset is dropped only if **all** its hits fail the rule — one
+LC hit in a mixed GC/LC deposit keeps it.
+
+On *this* corpus these rules remove **nothing**, and that is expected: a
+FASSTrecords hit set is already restricted to the GNPS ecosystem
+(`MSV`/`MTBLS`/`ST`) and to LC/ESI acquisition. The rules earn their place when
+the pipeline is pointed at a different, less pre-filtered query. Non-human
+deposits whose taxonomy is missing from the export are caught in the manual
+exclusions below instead.
+
+| rule | source column | reason |
+|---|---|---|
+| repository prefix | `ATTRIBUTE_DatasetAccession` | The pipeline only supports direct raw-file download from MetaboLights (`MTBLS*`), Metabolomics Workbench (`ST*`) and MassIVE (`MSV*`). |
+| GC-only chromatography | `ChromatographyAndPhase` | The pipeline targets LC-MS for omeprazole; GC ionisation profiles and retention behaviour are incompatible. |
+| imaging MS (MALDI / DESI / SIMS) | `IonizationSourceAndPolarity` | No LC dimension, no per-file retention time to match against. |
+| non-human taxa | `NCBITaxonomy` | Optional. The ratio analysis is a CYP2C19 phenotyping readout in humans. Flip `drop_non_human <- FALSE` to disable. |
+
+```{r hard-stops}
+#| code-fold: true
+drop_non_human <- TRUE
+
+hits_by_ds <- split(all_hits, all_hits$ATTRIBUTE_DatasetAccession)
+
+all_match <- function(d, col, pattern) {
+  v <- hits_by_ds[[d]][[col]]
+  v <- v[!is.na(v) & v != "missing value"]
+  length(v) > 0 && all(grepl(pattern, v, perl = TRUE, ignore.case = TRUE))
+}
+
+fail_prefix  <- D_both[!grepl("^(MSV|MTBLS|ST)[0-9]", D_both)]
+fail_gc      <- D_both[vapply(D_both, all_match, logical(1),
+                              "ChromatographyAndPhase", "gas chromatography|^GC")]
+fail_imaging <- D_both[vapply(D_both, all_match, logical(1),
+                              "IonizationSourceAndPolarity",
+                              "MALDI|DESI|SIMS|imaging")]
+fail_taxa    <- if (drop_non_human) {
+  bad <- vapply(D_both, function(d) {
+    tx <- hits_by_ds[[d]]$NCBITaxonomy
+    tx <- tx[!is.na(tx) & tx != "missing value"]
+    length(tx) > 0 && !any(grepl("Homo sapiens|\\b9606\\b", tx))
+  }, logical(1))
+  D_both[bad]
+} else character(0)
+
+hard_stops <- list(
+  repo_prefix = fail_prefix,
+  gc_only     = fail_gc,
+  imaging_ms  = fail_imaging,
+  non_human   = fail_taxa
+)
+D_both <- setdiff(D_both, unlist(hard_stops, use.names = FALSE))
+```
+
+```{r hard-stops-summary}
+#| echo: false
+cat("Hard-stop exclusions:\n")
+for (nm in names(hard_stops)) {
+  n <- length(hard_stops[[nm]])
+  cat(sprintf("  %-12s: %2d", nm, n))
+  if (n) cat("  ->  ", paste(hard_stops[[nm]], collapse = ", "), sep = "")
+  cat("\n")
+}
+cat("\nSurviving:", length(D_both), "datasets\n")
+```
+
+## Other manual exclusions
+
+Datasets that survive the hard stops but still have to go for repository- or
+study-specific reasons. The `reason` vocabulary:
+
+| reason | what it means |
+|---|---|
+| `no_or_limited_metadata` | no usable biological metadata anywhere (deposit + Pan-ReDU + publication), or only a single value for every stratifier |
+| `access_restricted` | demographics gated behind a controlled-access portal (e.g. NCRAD); only body_site / country recoverable |
+| `dia` | DIA acquisition; single-scan MASST matching is unreliable |
+| `in_vitro` | cell culture or reference-library deposit; MASST hits are spike artefacts, not biological exposure |
+| `non_human` | non-human taxon. Caught here rather than by the taxonomy hard stop because `redu_table` carries no `NCBITaxonomy` for these deposits, so the hard stop cannot fire |
+| `reference_material` | QA/QC reference-material suite (e.g. NIST RM), not a phenotyped study cohort |
+
+```{r other-exclusions}
+other_exclusions <- tibble::tribble(
+  ~dataset_id,    ~reason,                  ~notes,
+  "MSV000085870", "no_or_limited_metadata", "DDA acquisition confirmed but no Pan-ReDU or deposit metadata",
+  "MSV000093072", "no_or_limited_metadata", "",
+  "MSV000095726", "no_or_limited_metadata", "",
+  "MSV000096359", "no_or_limited_metadata", "",
+  "MSV000096884", "no_or_limited_metadata", "",
+  "MSV000097110", "no_or_limited_metadata", "",
+  "MSV000094515", "no_or_limited_metadata", "stool / Alzheimer's (U19 ADRC NCRAD); demographics NCRAD-controlled",
+  "ST002238",     "no_or_limited_metadata", "no metadata file or linked publication found",
+  "MSV000094395", "no_or_limited_metadata", "only DOIDCommonName=Alzheimer's, no other strata in MASST or Pan-ReDU",
+  "MSV000095143", "no_or_limited_metadata", "submitter TSV documents 264 files with rich metadata but those filenames don't exist on MassIVE; the 1077 actually-hosted files (Pan-ReDU naming, used by MASST + SIRIUS) have all canonical fields as 'missing value' in every source. Deposit cannot be stratified.",
+  "MSV000097935", "access_restricted",      "demographics access-restricted ('Partial Public' MassIVE deposit, Rancho Bernardo Study policy)",
+  "MTBLS417",     "dia",                    "DIA; duplicate of a DIA MassIVE deposit, poor metadata",
+  "MTBLS2746",    "in_vitro",               "drug-treatment cell culture; MASST hits are spike artefacts",
+  "ST001715",     "in_vitro",               "in vitro xenobiotic reference library",
+  "MSV000082382", "non_human",              "Pseudomonas / Bacillus on melon plants",
+  "MSV000086015", "non_human",              "San Diego Zoo rhinoceros serum (Diceros / Ceratotherium)",
+  "MSV000087018", "reference_material",     "NIST RM 8231 frozen-plasma reference-material QA/QC suite, not a study cohort",
+  "MSV000090544", "reference_material",     "GNPS Matrix-tubes extraction-method validation on high-biomass fecal+saliva (DOI 10.25345/C5QJ7831B); plate/well layout, no per-sample metadata, not a dosed cohort; omeprazole is incidental",
+  "MSV000083065", "no_or_limited_metadata", "NOBEL twin plasma cohort; no Pan-ReDU, no accessible per-sample strata",
+  "MSV000083593", "no_or_limited_metadata", "S. aureus infection plasma; no accessible per-sample metadata",
+  "MSV000083955", "no_or_limited_metadata", "cerebral cavernous malformation plasma; no per-sample metadata",
+  "MSV000084716", "no_or_limited_metadata", "Undiagnosed Disease Network; paper (PMID 33883556) confirms no medication/CYP data, part GC-MS, not in Pan-ReDU",
+  "MSV000085508", "no_or_limited_metadata", "UDN, same cohort as MSV000084716 (duplicate), no metadata",
+  "MSV000086270", "no_or_limited_metadata", "U19 ADNI-Go 1000-plasma cohort; no accessible per-sample strata",
+  "MSV000088645", "no_or_limited_metadata", "U19 T1000 serum; no accessible per-sample strata",
+  "MSV000090580", "no_or_limited_metadata", "osteoarthritis plasma (Guma); no accessible per-sample metadata",
+  "MSV000092926", "no_or_limited_metadata", "plasma cohort (Knight ADC); no accessible per-sample metadata",
+  "MSV000093037", "no_or_limited_metadata", "unidentified deposit: no title/summary/keywords/ReDU",
+  "MSV000095383", "no_or_limited_metadata", "U19 Wisconsin serum (Alzheimer's); no accessible per-sample strata"
+)
+
+D_both <- setdiff(D_both, other_exclusions$dataset_id)
+```
+
+```{r other-exclusions-summary}
+#| echo: false
+cat("Other manual exclusions:", nrow(other_exclusions), "datasets\n")
+print(table(other_exclusions$reason))
+cat("\nSurviving after manual exclusions:", length(D_both), "datasets\n")
+```
+
+## Auto-derived dataset metadata
+
+For each surviving deposit we harvest **technical** metadata (per-assay:
+chromatography, ionisation, instrument) and **biological** metadata
+(per-deposit: which native columns hold subject_id, sex, age). Sources and
+cache locations are repository-specific:
+
+- **MetaboLights (`MTBLS*`)**: technical via
+  `mtbls_assay_data()` (the assay `a_*.txt`
+  files); biological via `mtbls_sample_data()` (the `s_*.txt` sample
+  file). Both auto-cached from EBI FTP at render time and stored as
+  `dataset_metadata/{a_,s_}*.txt`.
+- **Metabolomics Workbench (`ST*`)**: technical via
+  `mwb_metadata()$MS_run`; biological
+  via `mwb_metadata()$sample_annotation`. Both auto-cached from the
+  Workbench API into `dataset_metadata/{ds}_AN*.txt`.
+- **MassIVE (`MSV*`)**: technical from the submitter deposit TSV/CSV
+  (`dataset_metadata/{ds}_metadata.*`) first, with Pan-ReDU
+  (`fetch_panredu_metadata()` from `redu.gnps2.org`, cached as
+  `dataset_metadata/{ds}_panredu.tsv`) as per-field fallback.
+  Biological metadata comes from the same two sources, in the same
+  order.
+
+ReDU / MIxS missing-value placeholders (`"missing value"`,
+`"not applicable"`, …) are normalised to NA everywhere via the shared
+`is_missing_val()` helper in `R/metadata.R`.
+
+```{r auto-assess}
+#| code-fold: true
+tech_raw <- fetch_assay_metadata(D_both)
+coverage <- tibble::as_tibble(
+  dplyr::bind_rows(lapply(D_both, harvest_metadata_coverage))
+)
+write.csv(tech_raw, "artifacts/assay_metadata.csv", row.names = FALSE)
+```
+
+```{r auto-assess-display}
+#| echo: false
+coverage[, c("dataset_id", "n_samples", "n_canonical_mapped",
+             grep("^col_", names(coverage), value = TRUE))]
+```
+
+## Per-assay refinement (MTBLS / ST)
+
+MetaboLights and Workbench deposits often package several assays under one
+accession (MTBLS1866: LC-MS pos, LC-MS neg, GCxGC-MS pos; ST002044: four
+HILIC/RP analyses). Since the ratio needs **both** compounds in the same
+assay, we treat each `(deposit, assay)` pair as a separate entity and keep
+only entities with at least one parent AND one metabolite hit. A deposit
+whose every assay fails is appended to `other_exclusions` with reason
+`no_assay_with_both_roles`.
+
+MassIVE deposits have no assay concept and stay at deposit granularity.
+
+```{r assay-assignment}
+mtbls_st_keeps <- D_both[grepl("^(MTBLS|ST)", D_both)]
+assay_lookups  <- setNames(lapply(mtbls_st_keeps, assay_lookup_for),
+                           mtbls_st_keeps)
+
+all_hits$assay <- mapply(function(ds, fp) {
+  if (startsWith(ds, "MSV")) return(NA_character_)
+  file_to_assay(basename(fp), assay_lookups[[ds]])
+}, all_hits$ATTRIBUTE_DatasetAccession, all_hits$file_path,
+USE.NAMES = FALSE)
+
+all_hits$deposit_id <- all_hits$ATTRIBUTE_DatasetAccession
+all_hits$dataset_id <- make_dataset_id(all_hits$deposit_id, all_hits$assay)
+
+# MASST hits whose file basename doesn't resolve to any known assay
+mtbls_st_hits <- all_hits$deposit_id %in% mtbls_st_keeps
+unresolved    <- mtbls_st_hits & is.na(all_hits$assay)
+all_hits$dataset_id[unresolved] <- paste0(all_hits$deposit_id[unresolved],
+                                          "_unmatched")
+```
+
+```{r entity-coverage}
+entity_coverage <- all_hits[all_hits$deposit_id %in% D_both, ] |>
+  dplyr::group_by(dataset_id, deposit_id, assay) |>
+  dplyr::summarise(has_parent = any(role == "parent"),
+                   has_metab  = any(role == "metabolite"),
+                   n_hits     = dplyr::n(),
+                   .groups    = "drop") |>
+  dplyr::mutate(keep = has_parent & has_metab &
+                       !grepl("_unmatched$", dataset_id))
+
+datasets_with_kept_entity <- unique(
+  entity_coverage$deposit_id[entity_coverage$keep])
+deposits_lost <- setdiff(D_both, datasets_with_kept_entity)
+
+if (length(deposits_lost)) {
+  new_excl <- tibble::tibble(
+    dataset_id = deposits_lost,
+    reason     = "no_assay_with_both_roles",
+    notes      = "parent + metabolite MASST hits land in different assays of the same deposit")
+  other_exclusions <- dplyr::bind_rows(other_exclusions, new_excl)
+  D_both <- setdiff(D_both, deposits_lost)
+}
+
+entities_kept <- entity_coverage$dataset_id[entity_coverage$keep]
+all_hits      <- all_hits[all_hits$dataset_id %in% entities_kept, ]
+```
+
+```{r entity-coverage-summary}
+#| echo: false
+if (length(deposits_lost)) {
+  cat("Deposits dropped (no assay carries both parent + metabolite):\n  ",
+      paste(deposits_lost, collapse = "\n  "), "\n", sep = "")
+}
+cat("Surviving entities:", length(entities_kept),
+    " | surviving deposits:", length(datasets_with_kept_entity), "\n")
+entity_coverage
+```
+
+## Paper-derived constants
+
+Dataset-wide values from the linked publication or deposit description
+(country of recruitment, body site, chromatography). Not an exclusion
+mechanism; provenance lives in the inline code-comment citation. `constants`
+is keyed by deposit_id and broadcast to every kept assay; `custom_col_map`
+overrides the auto-mapping where native column names miss the
+`DRAFT_CANDIDATES` heuristic.
+
+**Location semantics.** `location_type` marks whether `country` is a
+*study site* (where the study ran, population origin unverified) or a
+*participant origin* (the population itself is the subject). Only
+**MSV000082433** (Venezuelan Amerindian communities) is participant-origin;
+every other `country` is a study site and must be read as a recruitment
+covariate, **not** participant ethnicity.
+
+```{r manual-annotations}
+constants <- list(
+  # --- study-site cohorts: `country` = recruitment location, NOT participant origin ---
+  MTBLS1866    = list(country = "Italy",          location_type = "study_site"),   # Barberis et al. 2020
+  MTBLS11656   = list(country = "China", body_site = "blood plasma",
+                      location_type = "study_site"),                                # Xinxiang/Zhengzhou 2017 (PMC11823611)
+  ST002044     = list(country = "India", body_site = "blood serum",
+                      location_type = "study_site"),                                # Kumar et al.; mwTab has no body_site col
+  ST002722     = list(country = "United States of America", body_site = "blood serum",
+                      location_type = "study_site"),                                # UCSD NAFLD Center 2014-2017
+  MSV000088255 = list(country = "United Kingdom", location_type = "study_site"),    # 100 spot urine, Glasgow, NHS 14/LO/188
+
+  # chromatography companions (prior curation)
+  MSV000092754 = list(chromatography = "HILIC"),                                    # HILIC companion of 092757
+  MSV000092757 = list(chromatography = "RP"),                                       # RP companion of 092754
+
+  # 082493/084008: omeprazole CYP2C19-probe cohort; genotype in rescue_samples.csv
+  MSV000082493 = list(country = "United States of America", location_type = "study_site",
+                      chromatography = "RP", health_status = "healthy"),
+  MSV000084008 = list(country = "United States of America", location_type = "study_site",
+                      chromatography = "RP", health_status = "healthy",
+                      body_site = "blood plasma"),
+  MSV000086975 = list(country = "United States of America", location_type = "study_site",
+                      chromatography = "RP", body_site = "blood plasma"),           # schizophrenia (PMID 34741130)
+  MSV000085256 = list(country = "United States of America", location_type = "study_site"),  # Alzheimer's (PMID 34244695)
+
+  # the ONE deposit whose location genuinely describes participant origin:
+  MSV000082433 = list(country = "Venezuela", location_type = "participant_origin",
+                      chromatography = "RP", health_status = "healthy")             # Amerindian communities
+)
+
+custom_col_map <- list(
+  MSV000092754 = list(
+    subject_id    = "codigo_num",
+    sex           = "sex",
+    age           = "age_at_earliest_visit",
+    health_status = "sero_final"),
+  MSV000092757 = list(
+    subject_id    = "codigo_num",
+    sex           = "sex",
+    age           = "age_at_earliest_visit",
+    health_status = "sero_final"),
+  # native columns the DRAFT_CANDIDATES heuristic misses (082493/084008 need none)
+  MSV000086975 = list(subject_id = "#SampleID", age = "AGE", health_status = "Metadata")
+)
+```
+
+## Consolidate and write the metadata table
+
+`dataset_metadata` is the single source of truth for downstream code:
+one row per kept `(deposit, assay)` entity, with all repository, paper,
+and column-mapping information attached.
+
+```{r build-metadata-table}
+#| code-fold: true
+kept_entities <- entity_coverage[entity_coverage$keep,
+                                 c("dataset_id", "deposit_id", "assay")]
+
+tech_renamed <- tech_raw |>
+  dplyr::rename(deposit_id     = dataset_id,
+                chromatography = chrom_type) |>
+  dplyr::select(deposit_id, assay, repository, chromatography)
+
+is_msv <- startsWith(kept_entities$deposit_id, "MSV")
+msv_meta <- kept_entities[is_msv, ] |>
+  dplyr::left_join(tech_renamed |> dplyr::select(-assay),
+                   by = "deposit_id")
+nonmsv_meta <- kept_entities[!is_msv, ] |>
+  dplyr::left_join(tech_renamed, by = c("deposit_id", "assay"))
+
+dataset_metadata <- dplyr::bind_rows(msv_meta, nonmsv_meta) |>
+  dplyr::left_join(coverage |> dplyr::rename(deposit_id = dataset_id),
+                   by = "deposit_id")
+
+const_fields <- unique(unlist(lapply(constants, names)))
+for (canon in const_fields) {
+  col <- paste0("const_", canon)
+  dataset_metadata[[col]] <- vapply(
+    dataset_metadata$deposit_id,
+    function(d) {
+      v <- constants[[d]][[canon]]
+      if (is.null(v)) NA_character_ else as.character(v)
+    },
+    character(1))
+}
+
+if ("const_chromatography" %in% names(dataset_metadata)) {
+  use_const <- !is.na(dataset_metadata$const_chromatography) &
+               (is.na(dataset_metadata$chromatography) |
+                dataset_metadata$chromatography == "" |
+                dataset_metadata$chromatography == "Unknown")
+  dataset_metadata$chromatography[use_const] <-
+    dataset_metadata$const_chromatography[use_const]
+}
+
+for (ds in names(custom_col_map)) {
+  ix <- which(dataset_metadata$deposit_id == ds)
+  if (!length(ix)) next
+  for (canon in names(custom_col_map[[ds]])) {
+    col_key <- paste0("col_", canon)
+    if (col_key %in% names(dataset_metadata)) {
+      dataset_metadata[[col_key]][ix] <- custom_col_map[[ds]][[canon]]
+    }
+  }
+}
+
+dataset_metadata <- dataset_metadata[
+  , c("dataset_id", "deposit_id", "assay", "repository", "chromatography",
+      "n_samples", "n_canonical_mapped",
+      grep("^col_",   names(dataset_metadata), value = TRUE),
+      grep("^const_", names(dataset_metadata), value = TRUE))]
+```
+
+```{r build-metadata-table-display}
+#| echo: false
+dataset_metadata
+```
+
+# Adduct inference
+
+We do not trust MASST's `Adduct` column: it is inherited from the matched
+*library* spectrum and need not reflect how the compound ionised in the query
+dataset. Instead we recompute the adduct ourselves:
+
+- compute the theoretical m/z of each candidate adduct
+  (`r paste(ADDUCT_CANDIDATES, collapse = ", ")`) and assign the one closest to
+  the observed `Precursor_MZ`, within 20 ppm;
+- in practice this is almost always `[M+H]+` for both compounds (the summary
+  table below);
+- keep an entity only if parent and metabolite share at least one adduct (they
+  must ionise the same way for the ratio to mean anything), and drop any hit
+  whose adduct is not in that shared set.
+
+```{r infer-adduct}
+role_formula <- setNames(compound_spec$formula, compound_spec$role)
+
+all_hits$adduct_inferred <- mapply(
+  infer_adduct,
+  all_hits$Precursor_MZ,
+  role_formula[all_hits$role],
+  USE.NAMES = FALSE
+)
+
+shared_per_entity <- all_hits |>
+  dplyr::filter(!is.na(adduct_inferred)) |>
+  dplyr::group_by(dataset_id) |>
+  dplyr::summarise(
+    shared = list(intersect(
+      adduct_inferred[role == "parent"],
+      adduct_inferred[role == "metabolite"])),
+    .groups = "drop")
+
+shared_lookup <- setNames(shared_per_entity$shared,
+                          shared_per_entity$dataset_id)
+
+entities_with_shared <- shared_per_entity$dataset_id[
+  vapply(shared_per_entity$shared, length, integer(1)) > 0]
+
+kept_mask <- !is.na(all_hits$adduct_inferred) &
+             all_hits$dataset_id %in% entities_with_shared &
+             mapply(function(ds, ad) ad %in% shared_lookup[[ds]],
+                    all_hits$dataset_id, all_hits$adduct_inferred,
+                    USE.NAMES = FALSE)
+
+dropped_entities <- setdiff(unique(all_hits$dataset_id),
+                            entities_with_shared)
+all_hits         <- all_hits[kept_mask, ]
+dataset_metadata <- dataset_metadata[
+  dataset_metadata$dataset_id %in% unique(all_hits$dataset_id), ]
+```
+
+```{r infer-adduct-summary}
+#| echo: false
+print(table(role   = all_hits$role,
+            adduct = all_hits$adduct_inferred,
+            useNA  = "ifany"))
+if (length(dropped_entities)) {
+  cat("\nEntities dropped (no shared adduct between parent and metabolite):\n  ",
+      paste(dropped_entities, collapse = "\n  "), "\n", sep = "")
+}
+cat("\nSurviving entities:", length(unique(all_hits$dataset_id)),
+    " | hits retained:", nrow(all_hits), "\n")
+```
+
+# Write curated hits
+
+```{r write-artifacts}
+write.csv(dataset_metadata, "artifacts/dataset_metadata_table.csv",
+          row.names = FALSE)
+write.csv(all_hits,         "artifacts/hits_curated.csv",
+          row.names = FALSE)
+```
+
+```{r write-artifacts-summary}
+#| echo: false
+cat("artifacts/dataset_metadata_table.csv :",
+    nrow(dataset_metadata), "rows\n")
+cat("artifacts/hits_curated.csv           :",
+    nrow(all_hits), "rows /",
+    length(unique(all_hits$dataset_id)), "entities\n")
+```
+
+# Confirmation (opt-in)
+
+The three confirmation notebooks in `confirmation/` (`massIVE-hit-confirmation.qmd`,
+`metaboLights-confirmation.qmd`, `metabolomics-workbench-confirmation.qmd`, one per
+repository) decide which curated candidates are *really* omeprazole / 5-OH. For
+each (dataset, assay, compound) they pull the MS2 scans behind the MASST hits, run
+**SIRIUS** for the molecular formula and **CSI:FingerID** for the structure, and
+assign a confidence tier (strict / standard / liberal / not_confirmed) from how
+well formula and structure match the target. Only passing features reach the
+`hits-confirmed-*` artifacts that `02` merges. This confirmation is the step that
+removes isobaric look-alikes such as MSV000086975 and MSV000085256.
+
+They run SIRIUS (slow, CSI:FingerID-queued, one shared instance), so they are
+skipped on a normal render. Render with `-P run_confirmations:true` to chain them
+here; each runs in a fresh quarto process, sequentially, so SIRIUS is never
+concurrent.
+
+```{r trigger-confirmations, eval=params$run_confirmations}
+for (q in c("confirmation/massIVE-hit-confirmation.qmd",
+            "confirmation/metaboLights-confirmation.qmd",
+            "confirmation/metabolomics-workbench-confirmation.qmd")) {
+  message("Rendering ", q, " …")
+  system2("quarto", c("render", shQuote(q)))
+}
+```
+
+# Appendix: dataset-specific notes
+
+Quirks recorded as data so downstream layers can act on them; not part of the
+main curation flow.
+
+## Related deposits: what is not independent
+
+A deposit accession is not the same thing as a study. Two of the accessions we
+keep come from a single study, and any analysis that treats each dataset as its
+own cohort (pooling, meta-analysis, counting subjects, weighting by precision)
+would silently pseudo-replicate it.
+
+**`MSV000082493` and `MSV000084008` are two accessions of one study** (the same
+14-subject crossover, Jarmusch / Tsunoda, PMC7485946): a cytochrome P450 probe
+cocktail including omeprazole was dosed on days 1 and 9, with cefprozil in between.
+The same physical files appear under both accessions, with different paths and
+extensions:
+
+```
+mzspec:MSV000082493:updates/2019-03-27_alan_jarmusch_6d15f636/peak/blood/DM003_1_360_RG10_01_43808.mzXML
+mzspec:MSV000084008:ccms_peak/blood/DM013_1_360_RD1_01_43865.mzML
+```
+
+We keep both accessions but must never treat them as independent cohorts. The
+de-duplication rule is applied downstream in `04` (collapse on chromatography +
+file name); here we only record the relationship so those layers can act on it.
+
+```{r related-deposits}
+related_deposits <- tibble::tribble(
+  ~dataset_id,    ~related_to,     ~relation,                  ~notes,
+  "MSV000084008", "MSV000082493",  "same_study_different_arm",
+  paste("Same 14-subject study (PMC7485946). 084008 re-deposits 082493's blood",
+        "arm: 171 of 172 blood files are shared. 082493 contributes feces/skin/",
+        "urine here, 084008 blood. Do not treat as independent cohorts and do",
+        "not count the subjects twice.")
+)
+write.csv(related_deposits, "artifacts/related_deposits.csv", row.names = FALSE)
+related_deposits
+```
+
+
+# Session info
+
+Recorded so the rendered HTML captures the exact package versions that
+produced the artifacts above.
+
+```{r session-info}
+sessionInfo()
+```

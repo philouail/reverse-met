@@ -1,0 +1,792 @@
+---
+title: "03: All-datasets MS1 extraction"
+subtitle: "Loop over curated datasets · per-dataset sample tables · cross-dataset summary"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+params:
+  render_reports: false
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+**Goal.** Notebooks `01` and `02` found and confirmed, per dataset, exactly
+where omeprazole (the parent drug) and 5-hydroxyomeprazole (its CYP2C19
+metabolite) sit in mass and retention time. This notebook takes those confirmed
+coordinates and goes back to *every* biological file in each dataset to measure
+the two compounds directly: it pulls out each compound's signal over time (its
+extracted-ion chromatogram, or EIC), detects the peak, integrates its area, and
+records a per-file `log2(parent / metabolite)` ratio. That ratio is the readout
+we carry into the downstream biological analyses (`04`, `05`): a high ratio means
+the drug is not being metabolised, a low ratio means it is.
+
+In other words: `01`/`02` establish that a dataset *contains* the drug pair;
+`03` quantifies it in every sample so the pair can be compared across files,
+subjects, and cohorts.
+
+## Why do this at all, rather than just use the MS2 matches?
+
+This is the central methodological claim of the project, so it is worth stating
+carefully.
+
+**A missing MS2 spectrum does not mean the compound is missing.** These deposits
+were acquired by data-dependent acquisition (DDA): during a run, the instrument
+decides *in real time* which ions to fragment, picking them mostly by intensity,
+within a limited duty cycle, and usually with dynamic exclusion and a cap on how
+many precursors it will chase per cycle. A compound can therefore be present in a
+sample, at a perfectly measurable level, and still receive **no MS2 scan at all**,
+purely because the instrument was busy with something else. Run the same sample
+twice and the set of fragmented precursors differs.
+
+So a search that relies on MS2 alone (MASST and relatives) cannot separate two
+very different situations:
+
+- the compound is genuinely absent, and
+- the compound is present but was never selected for fragmentation.
+
+Worse, the failure is not random. Selection is intensity-driven, so the compounds
+most likely to be missed are the **low-abundance** ones, which in this project
+means exactly the incidentally-dosed subject we are trying to find. MS2-only
+prevalence is therefore a **lower bound**, and a biased one.
+
+**The two levels have complementary strengths.** MS2 gives *identity*: fragments
+constrain the structure, and SIRIUS can tell isomers apart. MS1 gives *coverage*:
+it is recorded continuously for everything, with no selection step. Propagation
+combines them, using MS2 once to establish identity, then MS1 everywhere to
+measure it:
+
+> Confirm the compound by MS2 in the files where it happened to be fragmented,
+> which pins its mass **and** its retention time. Then look at that mass and
+> retention time in **every** file, including the many where the instrument never
+> fragmented it.
+
+**There is a direct precedent in proteomics.** This is the same problem, and the
+same solution, as *match-between-runs* (as popularised by MaxQuant, and now
+standard practice): identify a peptide by MS2 in the run where it was fragmented,
+then transfer that identification to other runs by accurate mass and aligned
+retention time, quantifying at MS1 in runs where the precursor was never selected.
+Proteomics adopted this because DDA under-samples in exactly the way described
+above, and match-between-runs recovers a large fraction of the missing
+measurements. Metabolomics repository reanalysis has largely not adopted the
+equivalent step. This notebook is that step.
+
+**The trade we are making is sensitivity for specificity, and it is real.** MS2
+can distinguish compounds that share a mass; MS1 cannot. Propagation therefore
+extends coverage only as far as the chromatography preserves identity. That is
+not hypothetical here: 5-hydroxyomeprazole has an exact isobaric twin, and getting
+the retention-time window wrong silently measures the wrong molecule (see the
+extraction-settings section). The method is only as good as that window, which is
+why so much of this notebook is about it.
+
+**And this is what makes the cross-repository comparison legitimate.** If we
+compared deposits by their MS2 detection rates, we would substantially be
+comparing instruments and acquisition settings: a deposit run with a faster
+instrument and a deeper precursor list fragments more, so it "detects" more, which
+looks like higher prevalence but is an artifact of the method. MS1 is acquired the
+same way regardless of what the instrument chose to fragment, so propagated
+detection removes that confound. Propagation is not merely a way to get more
+numbers; it is what makes numbers from different deposits mean the same thing.
+
+All compute goes through `run_ms1_for_dataset()` (`R/ms1.R`); this notebook holds
+only the loop, the extraction settings, and the cross-dataset summary. Deep
+diagnostics for a single dataset (EIC overlays, peak-width plots, PCA) live in
+`dataset-report.qmd`.
+
+Datasets are keyed by the combined `dataset_id` from `01`; the loop pulls the
+bare `deposit_id` and `assay` per row so repository downloads see plain
+accessions.
+
+**Reads:**
+
+- `artifacts/hits-confirmed-all.csv` (from `02`)
+- `artifacts/bio_files_per_ds.rds` (from `02`)
+- `artifacts/bio_assays_per_ds.rds` (from `02`)
+- `artifacts/dataset_metadata_table.csv` (from `01`)
+
+**Writes:**
+
+- `artifacts/sample_table_all.csv`: per-file sample table, cross-
+  dataset, one row per file with metrics + canonical metadata +
+  `detection_tier` + `log2_ratio`
+
+The full `run_ms1_for_dataset()` output for each dataset (chromatograms,
+metrics, per-dataset sample table) is already cached at
+`artifacts/per_dataset/<dataset_id>.rds` by the extraction step;
+`dataset-report.qmd` reads those directly.
+
+```{r setup}
+source("R/_setup.R")
+source("R/metadata.R")
+source("R/ms1.R")
+library(Chromatograms)
+library(MsQuality)
+```
+
+```{r load-artifacts}
+conf_final        <- read.csv("artifacts/hits-confirmed-all.csv",
+                              check.names = FALSE)
+conf_final$confidence <- factor(conf_final$confidence,
+                                 levels = c("strict", "standard",
+                                            "liberal", "not_confirmed"))
+bio_files_per_ds  <- readRDS("artifacts/bio_files_per_ds.rds")
+bio_assays_per_ds <- readRDS("artifacts/bio_assays_per_ds.rds")
+# Per file: does a metadata source (resolved in 01) cover it? Files without
+# metadata are extracted for the record only and must be excluded from any
+# stratified analysis (see 02). Flatten to one lookup keyed by dataset_id|basename
+# (dataset-scoped so identical basenames in two deposits can't collide).
+bio_meta_per_ds   <- readRDS("artifacts/bio_meta_per_ds.rds")
+has_metadata_lookup <- unlist(lapply(names(bio_meta_per_ds), function(ds) {
+  v <- bio_meta_per_ds[[ds]]
+  stats::setNames(as.logical(v), paste0(ds, "|", basename(names(v))))
+}))
+ds_meta_tbl       <- read.csv("artifacts/dataset_metadata_table.csv",
+                              check.names = FALSE)
+```
+
+# Extraction settings
+
+The extraction is governed by two numbers. Each says how tightly we look for
+the compound's signal:
+
+- **`PPM = 20`**: the mass tolerance, in parts-per-million. When we go looking
+  for a compound at its known mass, real instruments are slightly off, so we
+  accept anything within ±20 ppm (about ±0.007 Da at the omeprazole mass).
+- **`RT_PAD_S = 5`**: seconds of retention-time padding added on each side of
+  a dataset's confirmed-RT span. This one is load-bearing rather than cosmetic,
+  for reasons the section below explains.
+
+(There is no peak-edge padding: the picker integrates each peak valley-to-valley,
+so the integration extent is set by the peak's own shape, not a fixed margin —
+see "How the peaks are picked and filtered" below.)
+
+```{r extraction-settings}
+DATASETS_TO_RUN <- names(bio_files_per_ds)
+
+PPM            <- 20   # mass tolerance in parts-per-million
+RT_PAD_S       <- 5    # seconds padded on each side of the confirmed-RT span
+```
+
+## The retention-time window is set per dataset, and the isobaric sulfone
+
+Retention time (RT) is *when* a compound comes off the chromatography column. We
+only integrate signal inside an RT window, so the window has to sit over the peak.
+`derive_extraction_config()` builds it **per dataset** from that dataset's own
+SIRIUS-confirmed peaks: the window spans their RTs (earliest to latest), padded
+each side by `RT_PAD_S`. The confirmed span already absorbs cross-file drift,
+because it is the spread of MS2 detections across many files; the pad only has to
+cover drift in files that carry no confirmed hit of their own.
+
+**Why the isomer matters.** 5-hydroxyomeprazole is not the only thing at its
+mass. Omeprazole sulfone, the compound CYP3A4 makes from omeprazole, has the
+**identical formula** (`C17H19N3O4S`) and therefore the identical m/z (362.1169).
+MS1 cannot tell the two apart. Only chromatography separates them, and the
+consequences of losing that separation are severe: the sulfone reports CYP3A4
+activity, not the CYP2C19 activity we are trying to measure, and in a poor
+CYP2C19 metaboliser the drug shunts to CYP3A4, so the sulfone is *larger* than the
+real 5-OH peak. The picker defends against this primarily at the *selection* step:
+each candidate peak is weighted by its proximity to the expected RT, so an on-RT
+5-OH peak beats a larger-area sulfone elsewhere in the window. The window itself is
+a second, softer line of defence — kept modest so the sulfone rarely even enters
+it — but, as the sweep below shows, it is the on-RT selection that does the work.
+
+The margin is narrower than it looks. In MSV000084008 the confirmed 5-OH peaks
+span **3.4 s** (154.9 to 158.3), while the sulfone sits at **~181 s**. A ±5 s pad
+gives [150, 163] and is safe. A ±30 s pad gives [125, 188], which reaches the
+sulfone.
+
+**This is measured, not assumed.** That deposit's metadata records each subject's
+genotyped CYP2C19 phenotype (`PharmGeno_Phenotype_2C19`), which the pipeline never
+uses during extraction, so it is an independent target. Re-integrating the same
+cached chromatograms of MSV000084008 at a range of metabolite acceptance-window
+half-widths (parent fixed at ±5 s; metabolite centre ~156 s, sulfone ~181 s) and
+correlating the subject-level AUC ratio against that genotyped phenotype gives:
+
+| metabolite window | reaches sulfone? | Spearman ρ vs genotype |
+|---|---|---|
+| [151, 161] (±5 s)   | no  | **−0.756** (p = 0.002) |
+| [146, 166] (±10 s)  | no  | −0.756 |
+| [141, 171] (±15 s)  | no  | −0.756 |
+| [136, 176] (±20 s)  | no  | −0.756 |
+| [126, 186] (±30 s)  | **yes** | **−0.756** |
+
+With the picker described below, ρ is **invariant to the window width** — even at ±30 s,
+where the window reaches the sulfone, the **proximity-weighted selection** keeps the on-RT
+5-OH (~156 s) for every file that has one, so the picked peak never changes and the
+correlation is unchanged. This is not luck, and it is not a window that silently fails to
+widen: re-running the *identical* sweep with pure area-select — the earlier rule, which took
+the largest-area peak in the window — **collapses ρ from −0.756 to −0.012** at ±30 s,
+integrating the sulfone in 218 files. The number of candidate peaks inside the window grows
+from 3 to 10 across the sweep, so the sulfone genuinely enters; proximity weighting is simply
+what rejects it. The sulfone defence has therefore moved from "keep the window tight" to the
+on-RT selection itself. A modest window (±5 s) is still sensible for drift tolerance, but it
+is **no longer load-bearing** for the isomer separation.
+
+## How the peaks are picked and filtered
+
+The picker lives in `R/ms1.R` (stage 0) and was tuned by **auditing every confirmed
+dataset's chromatograms one at a time** — each candidate peak plotted and labelled by eye
+as real signal, noise, or an interferent (panels saved under `peaks_review_v2/`), with each
+threshold set to the value that kept every real omeprazole/5-OH peak while rejecting the most
+noise. It has four parts:
+
+- **Acceptance window (`new_win`).** Rather than a fixed window, each confirmed MS2 hit is
+  snapped to its nearest MS1 apex and the window brackets the robust consensus of those apexes
+  (± `APEX_PAD` = 5 s). The window only has to *contain* each file's apex; the integration
+  extent is set by the peak itself.
+- **Integration (`pick`).** For each local maximum, the peak is integrated **valley-to-valley**
+  — walking out from the apex until the trace returns to baseline or a deep valley, merging
+  shallow shoulders and sub-4 s doublets, stopping at dead gaps where the EIC dropped out. Area
+  is trapezoidal above the local baseline line; FWHM, prominence, SNR and the nearest-taller-
+  neighbour ratio are all computed on the whole peak.
+- **On-RT selection.** When several peaks fall in the window, the dominant one is chosen by AUC
+  **weighted by a gaussian in its distance from the expected RT** (`RT_SIGMA` = 4 s). This is
+  the sulfone defence *at the selection level*: a larger-area interferent elsewhere in the
+  window loses to the on-RT peak. (HILIC keeps pure area-select — its windows were audited
+  peak-by-peak.)
+- **Accept gate (`detected_new`), chromatography-conditional.** Shared across modes: ≥ 3 points
+  (HILIC ≥ 4); apex ≥ 500 (an absolute floor below which a peak is indistinguishable from noise
+  whatever its shape); SNR ≥ 12 for RP / ≥ 3 for HILIC; an FWHM band ([1, 30] s RP, [1.3, ∞) s
+  HILIC); and a slope check (FWHM within the base width). HILIC additionally requires
+  return-to-baseline (prominence ≥ 0.25·apex) and no much-taller near neighbour; RP drops those
+  two — they wrongly killed sharp truncated-flank peaks and real peaks sitting beside the sulfone
+  — but still demands a 3-point RP peak clear its own baseline. The RP floors are corpus-set:
+  every real RP peak clears SNR 20 (so 12 sits in the clean gap above the flat low-signal ramps),
+  and real RP peaks top out ~24 s FWHM.
+
+A handful of dirty-matrix peaks survive every rule — jagged stool/saliva EICs where noise and
+signal overlap on *every* shape metric. Those are removed by a small, documented **manual
+drop-list** (`curation/ms1_drop_list.csv`, ~20 peaks, each with a stated reason), keyed
+by `(dataset, role, file)`. This is deliberate: for a handful of genuinely ambiguous peaks a
+transparent per-peak removal is more honest than a gate no one can fully reason about.
+
+Mass tolerance (`PPM = 20`) was set the same way — 10 ppm rescued no real peaks, 40 ppm let in
+interfering ions; 20 ppm matches the corpus instruments (Q-Exactive, q-TOF, Orbitrap). This is
+inspection-backed calibration, not a formal benchmark, but every decision is auditable from the
+saved panels.
+
+# Per-dataset extraction
+
+For each dataset, `run_ms1_for_dataset()` loads the MS1 spectra, pulls each
+compound's extracted-ion chromatogram (EIC) at the confirmed mass and (widened)
+retention-time window, then **picks and integrates the on-RT peak per file** (the
+picker described above), applies the manual drop-list, flags files whose peak
+width is an outlier, joins the sample metadata, and emits a per-file table
+(`sample_tbl`) carrying the `detection_tier` (which of the two compounds were
+seen) and the `log2_ratio`. The deep per-dataset diagnostics (EIC overlays,
+peak-width plots, principal-component analysis) stay in `dataset-report.qmd`;
+this notebook reports only what generalises across the whole cohort.
+
+```{r run-all}
+#| echo: false
+# Per-dataset cache: each dataset's result lands in
+# artifacts/per_dataset/<dataset_id>.rds as soon as it finishes.
+# Re-renders skip datasets that already have a cached RDS, so
+# crashed / interrupted runs resume cleanly without redoing the
+# expensive sync + EIC step. Delete the per-dataset RDS to force
+# that dataset to re-run.
+CACHE_DIR <- "artifacts/per_dataset"
+dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
+
+results <- list()
+SKIPPED_DATASETS <- character(0)
+for (ds in DATASETS_TO_RUN) {
+  cache_path <- file.path(CACHE_DIR, paste0(ds, ".rds"))
+  if (file.exists(cache_path)) {
+    message("========== ", ds, " (cached) ==========")
+    results[[ds]] <- readRDS(cache_path)
+  } else {
+    message("\n========== ", ds, " ==========")
+    # Tolerate a dataset whose raw files can't be fetched (e.g. the MassIVE
+    # FTP is rate-limited / down): skip it with a logged reason and continue,
+    # rather than aborting the whole cross-dataset run. Skipped datasets are
+    # simply absent from `results` and get re-extracted on a later render once
+    # the source is reachable (their per-dataset cache is only written on
+    # success). SKIPPED_DATASETS records what was dropped.
+    res <- tryCatch(
+      run_ms1_for_dataset(
+        dataset_id       = ds,
+        conf_final       = conf_final,
+        bio_files_per_ds = bio_files_per_ds,
+        ds_meta_tbl      = ds_meta_tbl,
+        ppm              = PPM,
+        rt_pad_s         = RT_PAD_S),
+      error = function(e) {
+        message("  SKIPPED ", ds, ", extraction failed: ", conditionMessage(e))
+        NULL
+      })
+    if (is.null(res)) { SKIPPED_DATASETS <<- c(SKIPPED_DATASETS, ds); next }
+    results[[ds]] <- res
+    saveRDS(results[[ds]], cache_path)
+  }
+  # Recompute within-dataset stats from the sample table on every run
+  # (cheap, no extraction). Doing it here rather than only on a fresh
+  # extraction guarantees a uniform multi-stratifier structure even for
+  # per-dataset caches written before the switch to
+  # within_dataset_stats_multi(). Returns a list keyed by stratifier
+  # name (health_status + whatever passes usable_stratifiers()); the
+  # cross-dataset summary flattens it into a long CSV.
+  results[[ds]]$stats <- within_dataset_stats_multi(
+    results[[ds]]$sample_tbl)
+}
+if (length(SKIPPED_DATASETS))
+  message("\n", length(SKIPPED_DATASETS),
+          " dataset(s) SKIPPED (raw files unreachable; re-render once the ",
+          "source is back): ", paste(SKIPPED_DATASETS, collapse = ", "))
+```
+
+## Extraction runtime
+
+```{r}
+#| echo: false
+#| output: asis
+# The timing log is written by R/peak_review_panels.R (the single-threaded audit-panel
+# builder) and is git-ignored, so skip this table gracefully when it has not been
+# generated rather than failing the whole render.
+et_path <- "peaks_review_v2/_extract_times.csv"
+if (file.exists(et_path)) {
+  et <- read.csv(et_path, stringsAsFactors = FALSE)
+  et <- et[order(et$extract_seconds), ]
+  et$minutes    <- round(et$extract_seconds / 60, 1)
+  et$s_per_file <- round(et$extract_seconds / et$n_files, 2)
+  cat(sprintf(paste0(
+    "Loading each file's spectra and pulling its two EICs is the pipeline's dominant compute ",
+    "cost, and it runs **single-threaded on purpose** (the parallel `chromExtract` spawns a worker ",
+    "swarm that thrashes the machine and is *slower* here — see the `SerialParam` note in ",
+    "`R/ms1.R`). The table below gives the per-dataset wall-clock: about **%.1f hours** over %d ",
+    "datasets (%s files). Cost tracks file count and file size, not the number of detections; ",
+    "every dataset sits within a tight ~2–5 s per file. Timings are compute-only on cached ",
+    "files — FTP download adds ~8 s/file on top and is network-bound.\n\n"),
+    sum(et$extract_seconds) / 3600, nrow(et), format(sum(et$n_files), big.mark = ",")))
+  cat(knitr::kable(
+    et[, c("dataset", "n_files", "minutes", "s_per_file")],
+    col.names = c("dataset", "files", "min", "s / file"), align = "lrrr", row.names = FALSE),
+    sep = "\n")
+} else {
+  cat(sprintf(paste0(
+    "_Extraction-timing table skipped: `%s` is not present (git-ignored). Run ",
+    "`Rscript R/peak_review_panels.R` to regenerate it, then re-render._\n"), et_path))
+}
+```
+
+# Checks that can catch us being wrong
+
+The window problem described above went unnoticed for a long time, and the reason
+is worth naming: **nothing in the pipeline was capable of contradicting it.** The
+numbers looked plausible, and no check existed that would fail if they were wrong.
+Robustness, in practice, means deliberately building the things that can catch us.
+Four of them, in increasing order of how hard they are to argue with.
+
+**1. The confirmed-file positive control.** In the files where MS2 already proved
+the compound is present, MS1 extraction must find it. If it does not, propagation
+is losing real signal, and every prevalence number is an underestimate.
+`run_ms1_for_dataset()` reports this as `Confirmed files loaded N / with >=1 peak
+M`: **M should equal N**, and any shortfall is a bug rather than biology. This is
+the cheapest hard check in the pipeline and it needs no external data.
+
+**2. Decoy extraction (not yet implemented).** Borrowed from the decoy-database
+idea in proteomics: run the identical pipeline against targets that *cannot* be
+real, either a mass where nothing should elute, or the correct mass at a
+deliberately wrong retention time. Whatever detection rate comes back is our
+**empirical false-positive rate**. If the decoys light up, the detection rule is
+too permissive and every count here needs deflating. Nothing about this depends on
+believing our own reasoning, which is exactly why it is worth having.
+
+**3. Report the surface, not the best cell.** Every parameter here (`PPM`,
+`RT_PAD_S`, `BOUND_PAD_S`, the signal-to-noise cutoff, how below-detection samples
+are treated) is a choice, and a conclusion that survives only one setting is not a
+conclusion. The retention-time table above is the pattern to follow: a broad
+**plateau** where the answer is stable, and a **cliff with a mechanism** that
+explains exactly where and why it breaks. A single lucky optimum would not be
+evidence.
+
+**4. External ground truth, which beats every internal check.** Parameters can be
+tuned until an internal check passes; an outside number cannot be. `05` uses the
+one deposit where truth exists independently of us: a cohort in which every
+subject was deliberately dosed, with pre-dose samples that are known negatives,
+and a published pharmacokinetic value per subject that the pipeline never sees.
+
+A methodological warning that applies to all of this: **do not choose a parameter
+by maximising agreement with the thing you then cite as validation.** That is
+circular, and it is how the earlier over-wide window justified itself. Where a
+parameter must be tuned, tune it against something structurally independent of the
+validation target. The parent compound is useful here precisely because it has no
+isobaric twin, so its retention-time drift can be measured without reference to
+any downstream result.
+
+# Cross-dataset sample table
+
+```{r combine-tables}
+#| echo: false
+all_samples <- do.call(rbind, lapply(names(results), function(ds) {
+  st <- results[[ds]]$sample_tbl
+  # Keep only files still in the CURRENT bio_files. A cached extraction can hold
+  # rows for files a later QC rule removed: MSV000091520's cache still carries the
+  # 247 blank_QC files dropped when bio_files went 2391 -> 2144, because removing
+  # files needs no re-extraction and the cache was (correctly) not rebuilt. Without
+  # this filter those rows reach sample_table_all while being absent from the
+  # per-file table, so the two disagree. All 247 are detection_tier "neither" and
+  # every metrics row sits inside the current bio_files, so filtering changes no
+  # extraction result - it only drops rows that should no longer be counted.
+  keep <- norm_file_key(st$file) %in% norm_file_key(bio_files_per_ds[[ds]])
+  cbind(dataset_id = ds, assay = results[[ds]]$assay, st[keep, , drop = FALSE],
+        stringsAsFactors = FALSE)
+}))
+
+# Attach the has_metadata flag from 02. A file the metadata layer (resolved in
+# 01) does not cover was extracted only because it carries a confirmed hit; it is
+# kept for the presence record but excluded from every stratified analysis below.
+all_samples$has_metadata <- {
+  key <- paste0(all_samples$dataset_id, "|",
+                basename(as.character(all_samples$file)))
+  hit <- has_metadata_lookup[key]
+  ifelse(is.na(hit), FALSE, unname(hit))
+}
+
+write.csv(all_samples, "artifacts/sample_table_all.csv", row.names = FALSE)
+
+cat("Datasets processed :", length(results), "\n")
+cat("Total rows         :", nrow(all_samples),
+    "  (with metadata:", sum(all_samples$has_metadata),
+    "| record-only:", sum(!all_samples$has_metadata), ")\n\n")
+cat("Detection tier × dataset (metadata-carrying samples only):\n")
+print(table(all_samples$dataset_id[all_samples$has_metadata],
+            all_samples$detection_tier[all_samples$has_metadata],
+            useNA = "ifany"))
+```
+
+Every analysis after this point restricts to `has_metadata == TRUE`. The
+record-only rows (a confirmed hit on a file the metadata layer does not cover, so
+we cannot say which subject or group it belongs to) stay in `sample_table_all.csv`
+for the presence record and the propagation counts below, but they carry no
+stratum and never enter a contrast.
+
+```{r analysis-set}
+#| echo: false
+analysis_samples <- all_samples[all_samples$has_metadata %in% TRUE, ]
+```
+
+`sample_table_all.csv` is one row per subject (the `build_sample_table()` dedup).
+Genotype / longitudinal analyses (`05`) need the rows *before* that dedup, so we
+also write a per-file table, keeping `subject_id` (+ a `subject_key` fallback) so
+those analyses aggregate to one-per-subject themselves; the rows are not
+independent.
+
+```{r combine-tables-perfile}
+#| echo: false
+getcol <- function(df, nm)
+  if (nm %in% names(df)) as.character(df[[nm]]) else rep(NA_character_, nrow(df))
+
+all_samples_perfile <- dplyr::bind_rows(lapply(names(results), function(ds) {
+  r    <- results[[ds]]
+  meta <- tryCatch(load_metadata(ds),
+                   error = function(e) data.frame(file = basename(bio_files_per_ds[[ds]])))
+  st   <- build_sample_table(r$metrics_par, r$metrics_met,
+                             basename(bio_files_per_ds[[ds]]), meta, dedup = FALSE)
+  st$subject_key <- dplyr::coalesce(getcol(st, "subject_id"),
+                                    getcol(st, "sample_name"), as.character(st$file))
+  cbind(dataset_id = ds, assay = r$assay, st, stringsAsFactors = FALSE)
+}))
+write.csv(all_samples_perfile, "artifacts/sample_table_perfile.csv", row.names = FALSE)
+cat("Per-file rows:", nrow(all_samples_perfile),
+    " (vs", nrow(all_samples), "deduped)\n")
+```
+
+# Per-dataset within-stats summary
+
+Each dataset is a self-contained study with its own subjects, instrument, and
+grouping variables, so before pooling anything we ask what each one says on its
+own. For every dataset `within_dataset_stats()` (`R/ms1.R`) runs the same three
+tests, against whatever grouping that dataset actually provides (health status,
+sex, body site, cohort):
+
+- **Is the parent detected in a different fraction of files between groups?**
+  Fisher's exact test on a detected / not-detected by group table.
+- **Is the metabolite detected in a different fraction of files between groups?**
+  The same test, applied to the metabolite.
+- **Does `log2(parent / metabolite)` differ between groups?** Kruskal-Wallis
+  test, using only files where both compounds were cleanly detected.
+
+These per-dataset results are part of what we report, not throwaway diagnostics.
+What they are *not* is the cross-dataset answer: no single cohort here has the
+sample size to settle whether metabolism differs between groups, and the absolute
+ratio is not comparable between datasets (see the next section). Combining the
+per-dataset contrasts into one cross-cohort estimate is what `04` sets up, and
+`04` also explains why that pooling is not yet something we compute.
+
+## Why these two tests
+
+**Fisher's exact test** covers the detection questions, where each file is a
+yes/no and the data are a table of counts. The usual chi-squared test only
+*approximates* the answer, and that approximation degrades exactly where we live:
+a handful of files per group and cells that are frequently zero. Fisher's test
+computes the probability exactly instead, so it stays valid at these sample
+sizes. A small p-value means the drug is found at a genuinely different rate
+between groups. Read that carefully: it is mostly a statement about **who was
+dosed**, or where the drug distributes, rather than about how fast anyone
+metabolises it.
+
+**Kruskal-Wallis** covers the ratio, which is continuous. We cannot assume it is
+normally distributed: each dataset has few subjects, the ratio is the log of a
+quotient of two peak areas, and one odd file is common. Kruskal-Wallis is the
+rank-based counterpart of a one-way ANOVA, asking only whether one group's ratios
+tend to sit higher than another's, using the ordering of values rather than their
+magnitudes. That makes it robust to a single extreme file, and it extends to more
+than two groups. A small p-value here is the **metabolism** signal we actually
+care about.
+
+## Correcting for multiple testing
+
+We run these tests once per dataset per grouping variable, so we are testing many
+hypotheses against the same corpus and raw p-values would overstate the evidence.
+The table adds a Benjamini-Hochberg false-discovery-rate adjusted value (`q_*`)
+per test family, across all dataset and stratifier rows. **Read the `q` columns,
+not the raw `p`.**
+
+One reading note: the Fisher p-values are computed by Monte Carlo simulation
+(`fisher.test(simulate.p.value = TRUE)`, 2000 replicates), so the smallest value
+they can return is about 5e-04. A `p_*_fisher` of `5e-04` therefore means "below
+the resolution of the simulation", not exactly 0.0005.
+
+```{r within-stats-summary}
+#| echo: false
+# Each results[[ds]]$stats is now a named list keyed by stratifier
+# (always health_status if present, plus the usable ones). Flatten to
+# long-form: one row per (dataset_id × stratifier × test triple).
+pval <- function(test)
+  if (!is.null(test) && !is.null(test$p.value))
+    signif(test$p.value, 3) else NA_real_
+
+stats_summary <- do.call(rbind, lapply(names(results), function(ds) {
+  # Recompute here (rather than reading results[[ds]]$stats) so the chunk
+  # is robust to per-dataset caches that stored the older single-
+  # stratifier $stats structure; within_dataset_stats_multi() always
+  # returns the stratifier-keyed list this flattener expects.
+  st <- within_dataset_stats_multi(results[[ds]]$sample_tbl)
+  n_both <- sum(results[[ds]]$sample_tbl$detection_tier == "both",
+                na.rm = TRUE)
+  # Fallback: a dataset with no usable stratifier still gets one row
+  # so the dataset is not silently absent from the summary.
+  if (!length(st))
+    return(data.frame(dataset_id = ds, stratifier = NA_character_,
+                      n_both = n_both,
+                      p_parent_fisher = NA_real_,
+                      p_metab_fisher  = NA_real_,
+                      p_ratio_kw      = NA_real_,
+                      stringsAsFactors = FALSE))
+  do.call(rbind, lapply(names(st), function(sc) {
+    s <- st[[sc]]
+    data.frame(dataset_id      = ds,
+               stratifier      = sc,
+               n_both          = n_both,
+               p_parent_fisher = pval(s$fisher_parent),
+               p_metab_fisher  = pval(s$fisher_metab),
+               p_ratio_kw      = pval(s$kruskal_ratio),
+               stringsAsFactors = FALSE)
+  }))
+}))
+
+# Benjamini-Hochberg FDR within each test family, across every
+# dataset x stratifier row, because each row is one more hypothesis
+# tested against the same corpus. p.adjust() drops NAs from the count,
+# so families with untestable rows are not over-corrected.
+for (fam in c("parent_fisher", "metab_fisher", "ratio_kw"))
+  stats_summary[[paste0("q_", fam)]] <-
+    signif(p.adjust(stats_summary[[paste0("p_", fam)]], method = "BH"), 3)
+
+stats_summary <- stats_summary[, c("dataset_id", "stratifier", "n_both",
+                                   "p_parent_fisher", "q_parent_fisher",
+                                   "p_metab_fisher",  "q_metab_fisher",
+                                   "p_ratio_kw",      "q_ratio_kw")]
+write.csv(stats_summary, "artifacts/within_stats_summary.csv",
+          row.names = FALSE)
+stats_summary
+```
+
+## What the per-dataset tests actually show
+
+Two things stand out, and they pull in opposite directions.
+
+**The detection tests find real, strong differences.** Several deposits show
+parent and metabolite detection rates that differ sharply between groups, at the
+resolution floor of the simulation and comfortably surviving FDR correction: for
+example MSV000094097 across **body site**, and MTBLS1866 and MTBLS11656 across
+**health status / cohort**. These are believable, but they are not metabolism
+findings. A body-site difference says the drug reaches some compartments and not
+others; a health-status difference mostly says the treated patients are the ones
+who were prescribed omeprazole. Both are statements about exposure and
+distribution, and both are exactly the kind of confounding that a naive reading
+of "the drug differs between sick and healthy" would mistake for pharmacology.
+
+**The ratio tests, which are the metabolism readout, find nothing that survives
+correction.** The only contrast that is even nominally significant on raw
+p-values fails once the FDR adjustment accounts for how many tests we ran. That
+is the honest result for this layer: **within any single cohort here, we cannot
+demonstrate a difference in omeprazole metabolism between groups.** With a
+handful of dosed subjects per dataset, that is the expected outcome rather than a
+surprise. It is the motivation for looking across cohorts at all, so that they
+borrow strength from each other instead of each being asked a question it has no
+power to answer. `04` takes that up, and sets out what such a pooling would
+require before it can mean anything.
+
+Per-dataset detail (detection tables, ratio plots, EIC diagnostics, peak-width
+outliers, principal-component analysis) lives in the per-dataset HTML reports
+generated in the next section.
+
+# Per-dataset HTML reports
+
+`dataset-report.qmd` is a parameterised template: given one `dataset_id`, it
+produces a deep dive into that dataset alone. The loop below renders it once per
+dataset into `reports/report-<dataset_id>.html`.
+
+This is skipped on a normal render, because it is slow (one full quarto render
+per dataset) and only the per-dataset narrative depends on it. Render this
+notebook with `-P render_reports:true` to regenerate them:
+
+```
+quarto render 03-all-datasets.qmd -P render_reports:true
+```
+
+```{r render-per-dataset-reports, eval=params$render_reports}
+dir.create("reports", showWarnings = FALSE)
+for (ds in names(results)) {
+  message("Rendering report for ", ds, " …")
+  out <- paste0("report-", ds, ".html")
+  system2("quarto", c("render", shQuote("dataset-report.qmd"),
+                      "-P", shQuote(paste0("dataset_id:", ds)),
+                      "--output", shQuote(out)))
+  file.rename(out, file.path("reports", out))
+}
+message("Done: ", length(results), " report(s) in reports/")
+```
+
+# Cross-dataset diagnostics
+
+## Ratio distribution per dataset
+
+### Why only the comparison *inside* a dataset is meaningful
+
+A mass spectrometer does not measure concentration. It counts ions, and how many
+ions a compound yields depends on how readily that particular molecule ionises,
+which is a property of the molecule **and** of the method: the instrument, the
+ion source settings, the mobile phase, and the sample matrix all shift it.
+Omeprazole and 5-hydroxyomeprazole are different molecules, so they ionise with
+different efficiency. What we measure is therefore not the true molar ratio but
+
+```
+measured log2(parent / metabolite) = true log2(parent / metabolite) + offset
+```
+
+where `offset` is the log ratio of the two compounds' response factors. That
+offset is unknown, and it differs for every dataset, because every dataset used a
+different instrument and method. The standard way to remove it is to spike an
+isotope-labelled internal standard of each compound into every sample, and **no
+public deposit in this corpus did that**, so we cannot calibrate it away.
+
+That single fact drives how the plot below must be read:
+
+- **Within one dataset**, every file went through the same method, so the offset
+  is the same constant for all of them. Comparing groups inside a dataset
+  subtracts two numbers that share that constant, so it cancels, and what remains
+  is real biology. This is why the within-dataset tests above, and the
+  per-dataset contrasts `04` computes, are legitimate.
+- **Between datasets**, the offsets differ by an unknown amount. A dataset whose
+  box sits a full unit higher than another's may simply have used a method that
+  ionises the parent more efficiently. Reading that gap as biology would be
+  measuring the instrument, not the patient.
+
+So: compare the **spread and the sign within each box**. Do not rank the datasets
+by their vertical position. Each box uses only files where both compounds were
+cleanly detected (a peak in both, neither flagged as a peak-width outlier), and
+the file count is in each label.
+
+```{r plot-ratio-by-ds, fig.width = 8, fig.height = 5.5}
+# Short display label: strip the assay suffix that makes the MetaboLights and
+# Workbench ids unreadable on an axis, and fold the file count into the label so
+# no separate annotation can collide with the title. Datasets stay in
+# alphabetical order on purpose: sorting them by median would invite exactly the
+# cross-dataset ranking the text above says is meaningless.
+short_ds <- function(x) sub("_AN[0-9]+$", "", sub("_LC-MS_.*$", "", x))
+
+both_all <- analysis_samples |>
+  dplyr::filter(detection_tier == "both",
+                !par_fwhm_outlier %in% TRUE,
+                !met_fwhm_outlier %in% TRUE)
+
+both_lab <- both_all |>
+  dplyr::add_count(dataset_id, name = "n") |>
+  dplyr::mutate(ds_label = paste0(short_ds(dataset_id), "  (n=", n, ")"))
+
+ggplot(both_lab, aes(x = ds_label, y = log2_ratio)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+  geom_boxplot(outlier.shape = NA, fill = "grey95") +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 1.8) +
+  coord_flip() +
+  labs(x = NULL,
+       y = "log2(omeprazole peak area / 5-OH-omeprazole peak area)",
+       title = "Parent / metabolite ratio within each dataset") +
+  theme_bw()
+```
+
+## Per-dataset detection-tier composition
+
+Every file lands in one of four tiers: **both** compounds detected,
+**parent_only**, **metab_only**, or **neither**. This plot shows the share of
+each dataset's files in each tier, which is the clearest picture of what kind of
+cohort each deposit actually is.
+
+```{r plot-tier-composition, fig.width = 8, fig.height = 4.5}
+analysis_samples |>
+  dplyr::count(dataset_id, detection_tier) |>
+  dplyr::mutate(ds_label = short_ds(dataset_id)) |>
+  ggplot(aes(x = ds_label, y = n, fill = detection_tier)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  coord_flip() +
+  labs(x = NULL, y = "Share of files",
+       fill = "Detection tier",
+       title = "Detection-tier composition per dataset") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+### What the composition tells us
+
+**Most files are "neither", and that is the expected result, not a failure.**
+These are mostly general-population or disease cohorts, not drug trials: the vast
+majority of subjects were never prescribed omeprazole, so there is genuinely
+nothing in their files to find. A high "neither" share describes the cohort, not
+the pipeline. The deposits where "both" dominates are the drug-probe cohorts
+(MSV000082493 and MSV000084008, where every subject was dosed by design), and the
+contrast between those two shapes is the clearest illustration of what
+reverse-metabolomics is doing: finding the handful of incidentally-dosed people
+inside cohorts assembled for entirely unrelated reasons.
+
+**The split between `parent_only` and `metab_only` is informative, not noise.**
+A `parent_only` file means we saw the drug but not its metabolite; `metab_only`
+is the reverse. Neither is simply a miss. They are **censored** ratio
+observations: we know the ratio is very high (parent_only) or very low
+(metab_only), we just cannot say by how much, because one of the two peaks fell
+below the detection threshold.
+
+**That censoring is why the ratio analysis cannot simply keep the "both" files
+and forget the rest.** Restricting to "both" discards precisely the files with
+the most extreme ratios, which pulls any estimate toward the middle and
+understates real differences. Using them properly means treating them as bounds
+rather than pretending the missing peaks are missing at random, which is one of
+the open methodological questions `04` sets out.
+
+Taken together with the ratio plot above, the two figures frame the honest
+position of this layer: the ratio is only interpretable **within** a dataset, and
+within most datasets only a few files support it. Neither figure is meant to rank
+the deposits. They exist to show how much signal each cohort contributes and how
+much of it is censored, which is what any cross-cohort analysis would have to
+account for.

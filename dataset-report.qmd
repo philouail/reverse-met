@@ -1,0 +1,393 @@
+---
+title: "Dataset report"
+subtitle: "Per-dataset deep dive: extraction config, EIC diagnostics, detection tiers, within-study stats"
+date: today
+params:
+  dataset_id: "MTBLS1866_LC-MS_positive_reverse-phase_metabolite_profiling"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r setup}
+source("R/_setup.R")
+source("R/ms1.R")
+library(Chromatograms)
+library(ggplot2)
+
+ds <- params$dataset_id
+rds <- sprintf("artifacts/per_dataset/%s.rds", ds)
+if (!file.exists(rds))
+  stop("No cache for ", ds, " at ", rds, "; run 03 first.")
+
+res        <- readRDS(rds)
+sample_tbl <- res$sample_tbl
+sample_tbl$detection_tier <- factor(
+  sample_tbl$detection_tier,
+  levels = c("both", "parent_only", "metab_only", "neither"))
+
+tier_bar <- function(df, col) {
+  ggplot(df, aes(x = .data[[col]], fill = detection_tier)) +
+    geom_bar() +
+    labs(x = NULL, y = "files", fill = "Detection tier",
+         title = paste("Detection tier by", col)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1),
+          legend.position = "bottom")
+}
+```
+
+# `r params$dataset_id`
+
+```{r overview}
+#| results: asis
+cat("- **Deposit**: ", res$deposit_id, "\n",
+    "- **Assay**:   ", res$assay,      "\n",
+    "- **Files**:   ", nrow(sample_tbl), " biological MS files\n",
+    "- **m/z**:     parent ", round(res$cfg$mz_par, 4),
+    " · metabolite ", round(res$cfg$mz_met, 4), "\n",
+    "- **Adducts**: parent ", res$cfg$adduct_par,
+    " · metabolite ", res$cfg$adduct_met, "\n\n",
+    sep = "")
+cat("Detection tiers:\n\n```\n")
+print(table(sample_tbl$detection_tier))
+cat("```\n")
+```
+
+# Extraction config
+
+The m/z and RT windows below come from `derive_extraction_config()`
+applied to this dataset's SIRIUS-confirmed features. The window uses the
+median observed precursor m/z (not the theoretical mass) to absorb
+per-instrument calibration offset and anchor to the adduct SIRIUS resolved.
+The RT window is the range of confirmed RTs ± 30 s, conservative against
+within-study gradient drift.
+
+```{r config-table}
+#| results: asis
+fmt_rt <- function(r) sprintf("[%.1f, %.1f] s", r[1], r[2])
+cat("| | parent | metabolite |\n")
+cat("|---|---|---|\n")
+cat("| adduct      |", res$cfg$adduct_par, "|", res$cfg$adduct_met, "|\n")
+cat("| m/z         |", round(res$cfg$mz_par, 5), "|",
+                       round(res$cfg$mz_met, 5), "|\n")
+cat("| RT window   |", fmt_rt(res$cfg$rt_par_win), "|",
+                       fmt_rt(res$cfg$rt_met_win), "|\n")
+cat("| confirmed source files (positive controls) |",
+    length(res$cfg$confirmed_files_parent),     "|",
+    length(res$cfg$confirmed_files_metabolite), "|\n")
+```
+
+# EIC overlay
+
+`Chromatograms::chromExtract()` extracted EICs in a single pass: one
+trace per file, per role, at the m/z window above. The plots overlay all
+traces; a tight cluster at the configured RT is expected, while large
+vertical spread or shoulders indicate real biology or unresolved isobars.
+
+```{r eic-overlay, fig.width = 9, fig.height = 6}
+op <- par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+plotChromatogramsOverlay(res$chr_par,
+  col   = adjustcolor("steelblue", 0.5),
+  ylim  = eic_ylim(res$chr_par),
+  main  = paste(ds, "(parent EICs)"))
+plotChromatogramsOverlay(res$chr_met,
+  col   = adjustcolor("tomato", 0.5),
+  ylim  = eic_ylim(res$chr_met),
+  main  = paste(ds, "(metabolite EICs)"))
+par(op)
+```
+
+# Peak detection
+
+`MsCoreUtils::localMaxima` looks for a local maximum within a half-
+window of scans, above a fraction of the trace maximum. The summary
+below reports how many files produced at least one detected peak per
+role.
+
+```{r peak-summary}
+#| results: asis
+cat("- **Parent**     EICs with ≥1 peak: ",
+    sum(res$peaks_par > 0), " / ", length(res$peaks_par), "\n",
+    "- **Metabolite** EICs with ≥1 peak: ",
+    sum(res$peaks_met > 0), " / ", length(res$peaks_met), "\n",
+    sep = "")
+```
+
+## Positive-control check
+
+SIRIUS-confirmed files are positive controls: the EIC pipeline **must**
+detect a peak there. A failure flags a settings problem (PPM tolerance,
+RT window, or adduct choice), not a biology result.
+
+```{r positive-control}
+par_files_all <- basename(dataOrigin(res$chr_par))
+met_files_all <- basename(dataOrigin(res$chr_met))
+check_confirmed(par_files_all, res$peaks_par,
+                res$cfg$confirmed_files_parent,     "Parent    ")
+check_confirmed(met_files_all, res$peaks_met,
+                res$cfg$confirmed_files_metabolite, "Metabolite")
+```
+
+# "Neither" EIC inspection
+
+Files with zero peaks for **both** roles are either genuinely missing the
+compound or had a misplaced detection window. We re-extract a wider RT
+window (±60 s) and drop the EICs empty at the target m/z. What remains,
+files with *some* signal at the target mass that still failed the peak
+threshold, is the informative subset to inspect. The shaded band marks
+the configured detection window.
+
+```{r neither-eics, fig.width = 11, fig.height = 4}
+files_par_ok <- basename(dataOrigin(res$chr_par))[res$peaks_par > 0]
+files_met_ok <- basename(dataOrigin(res$chr_met))[res$peaks_met > 0]
+all_files    <- basename(dataOrigin(res$chr_par))
+neither_files <- setdiff(all_files, union(files_par_ok, files_met_ok))
+
+WIDE_PAD_S <- 60
+rt_wide_lo <- min(res$cfg$rt_par_win[1], res$cfg$rt_met_win[1]) - WIDE_PAD_S
+rt_wide_hi <- max(res$cfg$rt_par_win[2], res$cfg$rt_met_win[2]) + WIDE_PAD_S
+PPM <- 20
+
+if (length(neither_files)) {
+  neither_orig <- dataOrigin(res$chr_par)[all_files %in% neither_files]
+
+  peak_tbl_wide <- rbind(
+    data.frame(role = "parent", msLevel = 1L, dataOrigin = neither_orig,
+               rtMin = rt_wide_lo, rtMax = rt_wide_hi,
+               mzMin = res$cfg$mz_par * (1 - PPM * 1e-6),
+               mzMax = res$cfg$mz_par * (1 + PPM * 1e-6),
+               stringsAsFactors = FALSE),
+    data.frame(role = "metabolite", msLevel = 1L, dataOrigin = neither_orig,
+               rtMin = rt_wide_lo, rtMax = rt_wide_hi,
+               mzMin = res$cfg$mz_met * (1 - PPM * 1e-6),
+               mzMax = res$cfg$mz_met * (1 + PPM * 1e-6),
+               stringsAsFactors = FALSE)
+  )
+  chr_neither_wide <- chromExtract(res$chr_all, peak_tbl_wide,
+                                   by = c("msLevel", "dataOrigin"))
+  n_total    <- length(chr_neither_wide)
+  chr_signal <- filterEmptyChromatograms(chr_neither_wide)
+  n_empty    <- n_total - length(chr_signal)
+
+  cat("\"Neither\" files:", length(neither_files), "(", n_total, "EICs)\n")
+  cat("  genuinely empty (no ion at target m/z) :", n_empty, "→ dropped\n")
+  cat("  some signal, sub-threshold             :", length(chr_signal),
+      "→ shown\n")
+
+  if (length(chr_signal)) {
+    cd <- chromData(chr_signal)
+    keep_files <- unique(basename(cd$dataOrigin))
+    if (length(keep_files) > 24) {
+      keep_files <- keep_files[seq_len(24)]
+      cat("  (capped to first 24 files for the plot)\n")
+      chr_signal <- chr_signal[basename(cd$dataOrigin) %in% keep_files]
+      cd <- chromData(chr_signal)
+    }
+
+    df_neither <- do.call(rbind, lapply(seq_len(length(chr_signal)), function(i) {
+      pd <- peaksData(chr_signal)[[i]]
+      data.frame(role = cd$role[i], file = basename(cd$dataOrigin[i]),
+                 rtime = pd$rtime, intensity = pd$intensity,
+                 stringsAsFactors = FALSE)
+    }))
+
+    win_rects <- data.frame(
+      role = c("parent", "metabolite"),
+      xmin = c(res$cfg$rt_par_win[1], res$cfg$rt_met_win[1]),
+      xmax = c(res$cfg$rt_par_win[2], res$cfg$rt_met_win[2]),
+      stringsAsFactors = FALSE)
+
+    print(
+      ggplot(df_neither, aes(x = rtime, y = intensity)) +
+        geom_rect(data = win_rects,
+                  aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+                  inherit.aes = FALSE, fill = "steelblue", alpha = 0.15) +
+        geom_line(colour = "grey30") +
+        facet_grid(role ~ file, scales = "free_y") +
+        labs(x = "Retention time (s)", y = "Intensity",
+             title = "\"Neither\" files with sub-threshold signal",
+             subtitle = paste0("Shaded: configured detection window  ·  ",
+                               "wide window ±", WIDE_PAD_S, " s")) +
+        theme_bw(base_size = 9) +
+        theme(strip.text.x     = element_text(size = 7),
+              strip.background = element_rect(fill = "grey92"))
+    )
+  } else {
+    cat("All \"neither\" EICs are genuinely empty; nothing to inspect.\n")
+  }
+} else {
+  cat("No \"neither\" files: every loaded file produced ≥1 peak in at least one role.\n")
+}
+```
+
+# FWHM outliers
+
+Within one dataset peak width should be roughly constant (fixed gradient,
+same compound across injections). A file whose FWHM departs strongly from
+the median (> 3 × MAD) usually means the EIC integrates two fused peaks, a
+baseline-noise lump, or a co-eluting isobar; its AUC is suspect and
+flagged before entering the ratio.
+
+```{r fwhm-summary}
+#| results: asis
+cat("- **Parent**     median FWHM = ",
+    round(median(res$metrics_par$par_fwhm, na.rm = TRUE), 1),
+    " s, outliers flagged: ",
+    sum(res$metrics_par$par_fwhm_outlier %in% TRUE), "\n",
+    "- **Metabolite** median FWHM = ",
+    round(median(res$metrics_met$met_fwhm, na.rm = TRUE), 1),
+    " s, outliers flagged: ",
+    sum(res$metrics_met$met_fwhm_outlier %in% TRUE), "\n",
+    sep = "")
+```
+
+Each flagged EIC is plotted against a reference EIC from the file closest
+to the median FWHM. A genuine outlier looks deformed (double apex,
+asymmetric tail, broad shoulder, noisy baseline); one that looks
+structurally similar to the reference is a false alarm from small FWHM
+variance and should stay in the ratio.
+
+```{r fwhm-plots, fig.width = 10, fig.height = 5}
+plot_fwhm_outliers(res$chr_par_narrow, res$metrics_par, "par", "Parent")
+plot_fwhm_outliers(res$chr_met_narrow, res$metrics_met, "met", "Metabolite")
+```
+
+# PCA of EIC metrics
+
+An unsupervised view on the per-file metric matrix (`par_auc`, `met_auc`,
+`par_fwhm`, `met_fwhm`, `log2_ratio`), coloured by `health_status` and
+labelled by `subject_id`. A cluster split that does **not** track
+`health_status` is evidence of a latent covariate the deposit does not
+expose: a missing-metadata diagnostic, not just an exploratory plot.
+
+```{r pca, fig.width = 7, fig.height = 5}
+both_for_pca <- as.data.frame(sample_tbl[sample_tbl$detection_tier == "both", ])
+both_for_pca$.row_id <- seq_len(nrow(both_for_pca))
+
+pc_cols <- c("par_auc", "met_auc", "par_fwhm", "met_fwhm", "log2_ratio")
+pc_cols <- intersect(pc_cols, names(both_for_pca))
+pc_mat  <- as.matrix(both_for_pca[, pc_cols, drop = FALSE])
+rownames(pc_mat) <- as.character(both_for_pca$.row_id)
+
+inf_cols <- apply(pc_mat, 2, function(x) {
+  v <- stats::sd(x, na.rm = TRUE); !is.na(v) && v > 0 })
+pc_mat <- pc_mat[, inf_cols, drop = FALSE]
+pc_mat <- pc_mat[stats::complete.cases(pc_mat), , drop = FALSE]
+
+if (nrow(pc_mat) >= 5 && ncol(pc_mat) >= 2) {
+  pc      <- stats::prcomp(pc_mat, scale. = TRUE)
+  row_ids <- as.integer(rownames(pc$x))
+  pc_df   <- cbind(
+    as.data.frame(pc$x[, 1:min(2, ncol(pc$x)), drop = FALSE]),
+    both_for_pca[row_ids,
+                 intersect(c("subject_id", "health_status", "country"),
+                           names(both_for_pca)), drop = FALSE])
+
+  p <- ggplot(pc_df, aes(PC1, PC2))
+  if ("health_status" %in% names(pc_df))
+    p <- p + aes(colour = health_status)
+  if ("subject_id" %in% names(pc_df))
+    p <- p + aes(label = subject_id) +
+         geom_text(vjust = -0.7, size = 3, show.legend = FALSE)
+  print(
+    p +
+      geom_point(size = 3, alpha = 0.85) +
+      labs(title    = paste(ds, "(PCA of EIC metrics)"),
+           subtitle = paste("n =", nrow(pc_df), "subjects"),
+           caption  = "Cluster splits not tracking health_status hint at unmeasured covariates") +
+      theme_bw() +
+      theme(legend.position = "bottom")
+  )
+} else {
+  cat("Skipping PCA: need ≥5 `both` samples and ≥2 non-constant metrics ",
+      "(have ", nrow(pc_mat), " rows, ", ncol(pc_mat), " informative cols).\n",
+      sep = "")
+}
+```
+
+# Stratified by health_status
+
+```{r hs-bar}
+#| fig-width: 6.5
+#| fig-height: 4
+if ("health_status" %in% names(sample_tbl) &&
+    length(unique(na.omit(sample_tbl$health_status))) >= 1) {
+  print(tier_bar(sample_tbl, "health_status"))
+}
+```
+
+```{r hs-stats}
+ws <- within_dataset_stats(sample_tbl, group_col = "health_status")
+ws$detection_table
+```
+
+```{r hs-interpret}
+#| results: asis
+cat(interpret_within_stats(ws))
+```
+
+```{r hs-ratio}
+#| fig-width: 6.5
+#| fig-height: 5
+both <- sample_tbl[sample_tbl$detection_tier == "both" &
+                   !sample_tbl$par_fwhm_outlier %in% TRUE &
+                   !sample_tbl$met_fwhm_outlier %in% TRUE, ]
+if (nrow(both) > 0 && "health_status" %in% names(both)) {
+  print(
+    ggplot(both, aes(x = health_status, y = log2_ratio)) +
+      geom_jitter(width = 0.18, alpha = 0.85, size = 2.5) +
+      stat_summary(fun = median, geom = "crossbar",
+                   width = 0.5, colour = "grey20", linewidth = 0.4) +
+      geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+      labs(x = NULL, y = "log2(omeprazole / 5-OH-omeprazole)",
+           title = paste0("Ratio by health_status (n=", nrow(both), ")")) +
+      theme_bw() +
+      theme(legend.position = "none",
+            axis.text.x = element_text(angle = 35, hjust = 1))
+  )
+}
+```
+
+# Additional stratifiers
+
+Sections below are generated only for canonical fields this dataset
+actually carries (≥2 levels, ≥3 samples each), beyond `health_status`.
+
+```{r extra-stratifiers}
+#| results: asis
+extra <- usable_stratifiers(sample_tbl, exclude = "health_status")
+
+if (!length(extra)) {
+  cat("_None: `health_status` is the only usable stratifier for this dataset._\n")
+} else {
+  tmpl <- paste(
+    "## Stratified by `%1$s`",
+    "",
+    "```{r}",
+    "ws_x <- within_dataset_stats(sample_tbl, group_col = \"%1$s\")",
+    "ws_x$detection_table",
+    "```",
+    "",
+    "```{r}",
+    "#| fig-width: 6.5",
+    "#| fig-height: 4",
+    "print(tier_bar(sample_tbl, \"%1$s\"))",
+    "```",
+    "",
+    "```{r}",
+    "#| results: asis",
+    "cat(interpret_within_stats(ws_x))",
+    "```",
+    "", sep = "\n")
+  for (f in extra)
+    cat(knitr::knit_child(text = sprintf(tmpl, f), quiet = TRUE), sep = "\n")
+}
+```
