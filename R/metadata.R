@@ -1,24 +1,20 @@
 # R/metadata.R — per-dataset biological metadata, table-driven.
-#
-# harvest_metadata_coverage(ds): auto-match canonical -> native column names (for 01).
+# harvest_metadata_coverage(ds): auto-match canonical -> native column names.
 # load_metadata(dataset_id): apply the table's col_*/const_* spec to the native table.
 
 CANONICAL_COLS <- c("file", "sample_name", "subject_id", "sex", "age",
                     "group", "health_status", "body_site", "country",
                     "treatment", "timepoint")
 
-# Native column names that hold the raw-file name in a MassIVE sample table.
-# Pan-ReDU uses "filename"; submitter TSVs vary ("Metabolomics_FileName" in the
-# schizophrenia deposit MSV000086975, "FileName" elsewhere).
-# Minimum number of canonical DRAFT_CANDIDATES fields a submitter-only file must
-# populate before it is admitted to the corpus (see msv_native_sample_table).
+# MIN_SUBMITTER_FIELDS: min canonical DRAFT_CANDIDATES fields a submitter-only file
+# must populate to be admitted (see msv_native_sample_table).
+# MSV_FILENAME_COLS: native raw-file-name columns; naming varies across submitter TSVs.
 MIN_SUBMITTER_FIELDS <- 2L
 
 MSV_FILENAME_COLS <- c("filename", "Filename", "FileName",
                        "Metabolomics_FileName")
 
-# Combined dataset_id (primary key): one per (deposit, assay) so assays of the
-# same deposit stay separated. Returns the bare deposit accession when assay is NA.
+# Combined dataset_id key: one per (deposit, assay); bare accession when assay is NA.
 make_dataset_id <- function(deposit_id, assay) {
   mapply(function(d, a) {
     if (is.na(a) || !nzchar(a)) return(d)
@@ -29,13 +25,9 @@ make_dataset_id <- function(deposit_id, assay) {
   }, deposit_id, assay, USE.NAMES = FALSE)
 }
 
-# Candidate native-column names per canonical field, matched case-insensitively
-# (full-string) against the native columns; first hit wins. Covers four
-# repository conventions:
-#   - ISA-Tab (MetaboLights):       "Source Name", "Characteristics[...]"
-#   - mwTab (Workbench):            "Subject ID", "Factors: Gender", …
-#   - MassIVE deposit TSV (legacy): "ATTRIBUTE_*"
-#   - Pan-ReDU (GNPS2):             bare canonical names like "BiologicalSex"
+# Candidate native columns per canonical field; matched case-insensitively full-string,
+# first hit wins. Covers ISA-Tab (MetaboLights), mwTab (Workbench), MassIVE "ATTRIBUTE_*",
+# and Pan-ReDU bare names.
 DRAFT_CANDIDATES <- list(
   subject_id    = c("Source Name", "Subject", "Subject ID", "SubjectID",
                     "ATTRIBUTE_Subject",
@@ -59,18 +51,15 @@ DRAFT_CANDIDATES <- list(
                     "Factors: Health.*", "Factors: Status.*",
                     "ATTRIBUTE_HealthStatus", "ATTRIBUTE_Disease",
                     "HealthStatus"),
-  # ATTRIBUTE_Body_Site (underscored) is MSV000082493's submitter spelling and did
-  # NOT match "ATTRIBUTE_BodySite": its 341 blood_plasma files came through with
-  # body_site = NA, i.e. invisible to every body-site-stratified analysis, which
-  # is the matrix the CYP2C19 ratio is actually defined in. Keep both spellings.
+  # Keep both BodySite spellings: 082493's underscored ATTRIBUTE_Body_Site else NA-s
+  # its 341 blood_plasma files, the matrix the CYP2C19 ratio is defined in.
   body_site     = c("Characteristics\\[Organism part\\]",
                     "Characteristics\\[Sample type\\]",
                     "Characteristics\\[Body site\\]",
                     "ATTRIBUTE_BodySite", "ATTRIBUTE_Body_Site",
                     "ATTRIBUTE_Sampletype", "ATTRIBUTE_Sample_Type",
                     "UBERONBodyPartName"),
-  # Sampling time within a study. Needed to reconstruct a PK curve and integrate a
-  # per-subject AUC, which is far less noisy than a single-timepoint ratio.
+  # Sampling time: needed to reconstruct a PK curve and integrate per-subject AUC.
   timepoint     = c("ATTRIBUTE_Time_Point_Mins", "ATTRIBUTE_Time_Point",
                     "ATTRIBUTE_Timepoint", "ATTRIBUTE_Study_Day",
                     "Factor Value\\[Time.*\\]", "Factors: Time.*",
@@ -121,22 +110,10 @@ native_sample_table <- function(deposit_id) {
   } else NULL
 }
 
-# MassIVE: keep every file EITHER source describes, then validate against the
-# deposit's own inventory.
-#
-# Pan-ReDU used to be treated as authoritative for which files exist, because a
-# submitter TSV can advertise filenames that do not resolve (MSV000095143's
-# submitter has ZERO stem overlap with Pan-ReDU, and those stems are not on
-# MassIVE at all). But Pan-ReDU is only a proxy for existence, and it under-covers
-# deposits: on MSV000082493 it indexes the original submission (690 files) and
-# misses the entire 341-file blood collection added in the 2019 `updates/` tree -
-# together with that TSV's CYP2C19 genotype, phenotype and per-drug dosing
-# columns. Using Pan-ReDU as the row set silently discarded 733 annotated files.
-#
-# So: full outer join on filename stem, then drop any submitter-only row whose
-# file is not in massive_list_files(). That keeps the phantom protection (the
-# real check, against the inventory) while recovering genuinely annotated files.
-# NULL only if both sources are missing.
+# MassIVE: full outer join of Pan-ReDU and submitter TSV on filename stem, then drop
+# submitter-only rows absent from massive_list_files(). Pan-ReDU under-covers deposits
+# (misses 082493's 341-file blood collection + its CYP2C19 columns); the inventory check
+# keeps phantom protection while recovering annotated files. NULL if both sources missing.
 msv_native_sample_table <- function(deposit_id) {
   pr <- fetch_panredu_metadata(deposit_id)
 
@@ -161,8 +138,7 @@ msv_native_sample_table <- function(deposit_id) {
     return(pr)
   }
 
-  # Case-insensitive stem join: Pan-ReDU and submitter often differ in
-  # capitalization (Chagas: "Female" vs "female") on otherwise-identical stems.
+  # Case-insensitive stem join: sources differ in capitalization on identical stems.
   pr$.stem    <- tolower(tools::file_path_sans_ext(basename(pr$filename)))
   local$.stem <- tolower(tools::file_path_sans_ext(
                           basename(local[[local_fcol]])))
@@ -173,8 +149,7 @@ msv_native_sample_table <- function(deposit_id) {
           by = ".stem", all.x = TRUE)
   } else pr
 
-  # Files the submitter describes but Pan-ReDU never indexed, kept only when the
-  # deposit inventory confirms they exist.
+  # Submitter-only files, kept only when the deposit inventory confirms they exist.
   extra <- local[!local$.stem %in% pr$.stem, , drop = FALSE]
   if (nrow(extra)) {
     real <- tryCatch(
@@ -188,12 +163,8 @@ msv_native_sample_table <- function(deposit_id) {
              else extra[extra$.stem %in% real, , drop = FALSE]
   }
   if (nrow(extra)) {
-    # Existing is not the same as usable: a submitter-only row is only worth
-    # adding if it actually carries analysable metadata. Count how many canonical
-    # DRAFT_CANDIDATES fields resolve to a real value (is_missing_val treats
-    # "not applicable" and the other ReDU/MIxS placeholders as absent) and
-    # require MIN_SUBMITTER_FIELDS of them. Files that fail this are left out
-    # rather than entering the corpus as thinly-annotated rows.
+    # Keep a submitter-only row only if >= MIN_SUBMITTER_FIELDS canonical fields resolve
+    # to a real value (is_missing_val treats ReDU/MIxS placeholders as absent).
     n_fields <- rowSums(vapply(DRAFT_CANDIDATES, function(pat) {
       cl <- match_candidate(names(extra), pat)
       if (is.na(cl) || !nzchar(cl) || !cl %in% names(extra))
@@ -232,8 +203,7 @@ harvest_metadata_coverage <- function(deposit_id) {
                    function(f) match_candidate(cols, DRAFT_CANDIDATES[[f]]),
                    character(1))
 
-  # Demote mappings to NA when the column exists but holds no usable values
-  # (only REDU/MIxS placeholders). See REDU_MISSING in R/assay_metadata.R.
+  # Demote a mapping to NA when its column holds only REDU/MIxS placeholders (see REDU_MISSING).
   has_value <- function(col_name) {
     if (is.na(col_name) || !col_name %in% names(s)) return(FALSE)
     any(!is_missing_val(s[[col_name]]))
@@ -262,8 +232,7 @@ read_metadata_table <- function(
   read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
 }
 
-# Apply col_*/const_* spec to a native sample table -> one row per native sample,
-# canonical columns (minus file, which is joined per-assay later).
+# Apply col_*/const_* spec -> one row per native sample, canonical cols (file joined per-assay later).
 apply_spec_to_native <- function(native, spec) {
   out <- data.frame(row.names = seq_len(nrow(native)))
   for (canon in setdiff(CANONICAL_COLS, "file")) {
@@ -276,7 +245,6 @@ apply_spec_to_native <- function(native, spec) {
       out[[canon]] <- const_val
     } else if (!is.na(native_col) && nzchar(native_col) &&
                native_col %in% names(native)) {
-      # REDU/MIxS placeholders ("-", "missing value", …) -> NA.
       v <- as.character(native[[native_col]])
       v[is_missing_val(v)] <- NA_character_
       out[[canon]] <- v
@@ -287,8 +255,7 @@ apply_spec_to_native <- function(native, spec) {
   out
 }
 
-# load_metadata(dataset_id): dataset_id is the combined key; deposit_id and
-# assay are looked up from the metadata table.
+# load_metadata(dataset_id): combined key; deposit_id and assay looked up from the table.
 load_metadata <- function(dataset_id,
                           table_path =
                             "artifacts/dataset_metadata_table.csv") {
@@ -380,20 +347,16 @@ expand_files_massive <- function(deposit_id, native, s_canon, spec) {
 
 # ===== Pan-ReDU (was panredu.R) =====
 
-# R/panredu.R — fetch per-file Pan-ReDU metadata from GNPS2.
-#
-# Pan-ReDU is GNPS2's harmonised metadata layer over MassIVE / MetaboLights /
-# Workbench; for MassIVE deposits it is often the only standardised source.
-# Used as a fallback / gap-fill alongside any local deposit TSV.
+# GNPS2's harmonised metadata layer over MassIVE/MetaboLights/Workbench; often the only
+# standardised source for MassIVE deposits. Used as fallback/gap-fill alongside local TSVs.
 
 PANREDU_URL_TMPL <- paste0(
   "https://redu.gnps2.org/attribute/ATTRIBUTE_DatasetAccession/",
   "attributeterm/%s/files?filters=%%5B%%5D"
 )
 
-# Fetch Pan-ReDU per-file metadata for one accession (MSV / MTBLS / ST, since
-# Pan-ReDU harmonises all three). Returns a data.frame (one row per file) or
-# NULL on failure/empty. Caches to <cache_dir>/<ds>_panredu.tsv to avoid re-fetching.
+# Fetch Pan-ReDU per-file metadata for one accession (MSV/MTBLS/ST). Returns a data.frame
+# (one row per file) or NULL on failure/empty; caches to <cache_dir>/<ds>_panredu.tsv.
 fetch_panredu_metadata <- function(ds,
                                    cache_dir = "dataset_metadata",
                                    force = FALSE,
@@ -439,51 +402,33 @@ fetch_panredu_metadata <- function(ds,
 
 # ---- extraction-set selection from the deposit inventory -----------------
 
-# Map possibly-prefixed cache filenames back to the bare names the pipeline keys on.
-# The MsBackend packages prefix cached files to dodge cross-dataset collisions:
-#   MetaboLights -> "<mtblsId>_<assayIndex>_<name>"  e.g. MTBLS1866_1_1_p.mzML
-#   MassIVE      -> "<massiveId>_<name>"
-#   Workbench    -> "<zipbase>_<name>"                e.g. ST002044_rawdata_D_3.mzML
-# All files in one dataset share one prefix; detect it from a file whose bare suffix
-# is in `bare_ref`, then strip it. Already-bare names pass through.
-# (Lives here, not in ms1.R, because norm_file_key() below calls it and several
-# scripts source metadata.R alone.)
+# Map prefixed cache filenames back to the bare names the pipeline keys on. MsBackend prefixes
+# cached files to dodge cross-dataset collisions: MetaboLights "<id>_<assayIndex>_<name>"
+# (e.g. MTBLS1866_1_1_p.mzML), MassIVE "<id>_<name>", Workbench "<zipbase>_<name>". Detect the
+# shared prefix from a file whose suffix is in `bare_ref`, then strip it; bare names pass through.
+# Lives here (not ms1.R) because norm_file_key() calls it and scripts source metadata.R alone.
 to_bare_name <- function(x, bare_ref) {
   if (!length(x)) return(x)
   bare_ref <- unique(bare_ref)
-  not_bare <- x[!x %in% bare_ref]
-  if (!length(not_bare)) return(x)
-  f1   <- not_bare[1]
-  cand <- bare_ref[vapply(bare_ref,
-                          function(b) endsWith(f1, paste0("_", b)),
-                          logical(1))]
-  if (!length(cand)) return(x)                 # prefix undetectable
-  b1     <- cand[which.max(nchar(cand))]
-  prefix <- substr(f1, 1, nchar(f1) - nchar(b1))
-  ifelse(startsWith(x, prefix),
-         substr(x, nchar(prefix) + 1L, nchar(x)), x)
+  # Resolve each name individually. Deriving one prefix from the first example assumes a
+  # deposit has only one form, and MTBLS1866 carries both MTBLS1866_129_p.mzML and the
+  # doubled MTBLS1866_1_MTBLS1866_DA44_p.mzML. Longest match wins, and the leading "_"
+  # keeps 21_p from resolving against 1_p.
+  vapply(x, function(f) {
+    if (f %in% bare_ref) return(f)
+    cand <- bare_ref[endsWith(f, paste0("_", bare_ref))]
+    if (!length(cand)) return(f)
+    cand[which.max(nchar(cand))]
+  }, character(1), USE.NAMES = FALSE)
 }
 
-# Normalise a file name for cross-source matching: drop our accession prefix, drop
-# the extension, lower-case. So MSV000082433_957.mzML, 957.mzXML and 957.mzML all
-# reduce to "957".
-#
-# `bare_ref`: pass the dataset's real file names (bio_files) whenever `x` comes from
-# the CACHE. The MsBackend packages prefix cached files with the accession AND the
-# assay - MetaboLights caches as "MTBLS1866_1_1_p.mzML" (accession `MTBLS1866_`,
-# assay `1_`, name `1_p`), Workbench as "ST002044_rawdata_D_102.mzML". The accession
-# regex alone leaves a stray "1_" / "rawdata_" that matches nothing, silently
-# emptying the join. The assay token CANNOT be stripped by regex: after removing the
-# accession from "MTBLS1866_1_1_p" there is no way to tell whether the assay is "1"
-# and the name "1_p", or the assay "1_1" and the name "p". It is only decidable by
-# detecting the shared prefix against the real file list, which is what
-# `to_bare_name()` does - so give it the list.
-#
-#   cache-derived  (dataOrigin, metrics_*$file) -> norm_file_key(x, bio_files)
-#   repo-derived   (hits_curated$file_path, submitter TSVs) -> norm_file_key(x)
-#
-# Omitting `bare_ref` keeps the original behaviour, which is correct for names that
-# were never cache-prefixed.
+# Normalise a file name for cross-source matching: drop accession prefix + extension, lower-case,
+# so MSV000082433_957.mzML, 957.mzXML and 957.mzML all reduce to "957".
+# Pass `bare_ref` (the dataset's real bio_files) whenever `x` comes from the cache: MsBackend
+# prefixes with accession and assay, and no regex can tell the assay token from the name, so
+# to_bare_name() resolves it against the real file list. Omit it for repo-derived names.
+#   cache-derived (dataOrigin, metrics_*$file) -> norm_file_key(x, bio_files)
+#   repo-derived  (hits_curated$file_path, submitter TSVs) -> norm_file_key(x)
 norm_file_key <- function(x, bare_ref = NULL) {
   b <- basename(as.character(x))
   if (!is.null(bare_ref) && length(bare_ref))
@@ -492,30 +437,13 @@ norm_file_key <- function(x, bare_ref = NULL) {
   tolower(sub("[.][^.]*$", "", b))
 }
 
-# Build the MS1 extraction set for a MassIVE deposit from the deposit's OWN file
-# inventory, not from a metadata catalog. Pan-ReDU (and other catalogs) only list
-# files that were submitted with harmonised metadata, which can be a strict subset
-# of what the deposit holds and what MASST searched (e.g. MSV000082433: Pan-ReDU
-# has 223 files on 3 plates, the deposit has 457 biological spectra on 6 plates,
-# and the one confirmed incidental exposure sits on a plate Pan-ReDU never
-# received). Sourcing from the deposit keeps "repository content == MASST search
-# space".
-#
-# Returns a data.frame(file, has_metadata):
-#   - file        loadable basename (what the MsBackend syncs)
-#   - has_metadata TRUE if a metadata source covers it. Files WITHOUT metadata are
-#                  kept only when they carry a confirmed hit (so no confirmed
-#                  exposure is ever dropped), and must be excluded from downstream
-#                  stratified analysis (nothing to stratify on).
-#
-# `meta_keys`  = norm_file_key() of every file we have USABLE metadata for. QC and
-#                blanks are excluded there, from the metadata's own SampleType via
-#                EXCL_ST, not by guessing from file names: MSV000094097's
-#                "Pool_blood_plasma_*" files are SampleType "animal" (real samples)
-#                while MSV000091520's "NoInj_*" are "blank_QC".
-# `hit_files`  = loadable basenames of every confirmed-hit file for this deposit
-#                (what the MsBackend syncs). These are always kept, whatever tree
-#                they live in, so no confirmed exposure is ever lost.
+# Build the MS1 extraction set for a MassIVE deposit from the deposit's OWN inventory, not a
+# metadata catalog: Pan-ReDU lists only harmonised-metadata files, a strict subset of what the
+# deposit holds and what MASST searched (082433: 223 catalog vs 457 spectra).
+# Returns data.frame(file, has_metadata); no-metadata files are kept only when they carry a
+# confirmed hit and must be excluded from stratified analysis.
+#   meta_keys = norm_file_key() of files with usable metadata (QC/blanks excluded by SampleType/EXCL_ST, not by name).
+#   hit_files = basenames of confirmed-hit files; always kept, whatever tree they live in.
 select_bio_files_massive <- function(deposit_id, meta_keys = character(),
                                      hit_files = character()) {
   inv <- tryCatch(MsBackendMassIVE::massive_list_files(deposit_id),
@@ -527,27 +455,18 @@ select_bio_files_massive <- function(deposit_id, meta_keys = character(),
     as.character(inv[[fc]])
   } else as.character(inv)
 
-  # One copy per sample, deduplicated by normalised name rather than by taking a
-  # single tree. Deposits hold the same sample several times (`ccms_peak/`,
-  # `peak/`, ...): on MSV000082493 all 813 ccms_peak basenames reappear under
-  # `peak/`, so deduplicating on the name achieves what the old `^ccms_peak/`
-  # filter achieved. Restricting to that tree also silently dropped whole
-  # collections added in a later deposit update - 082493's 341 blood_plasma files
-  # exist ONLY under updates/.../peak/blood/, and blood is the matrix its CYP2C19
-  # ratio is defined in. Prefer the ccms_peak copy (the processed tree MASST
-  # indexes) when a sample appears more than once.
+  # One copy per sample, deduplicated by normalised name not by picking a single tree:
+  # deposits hold the same sample under ccms_peak/, peak/, ...; restricting to one tree drops
+  # collections added by later updates (082493's 341 blood_plasma files live only under
+  # updates/.../peak/blood/, the CYP2C19 matrix). Prefer the ccms_peak copy on duplicates.
   ms  <- grep("[.](mzML|mzXML)$", paths, value = TRUE, ignore.case = TRUE)
   ms  <- ms[order(!grepl("^ccms_peak/", ms, ignore.case = TRUE))]
   bio <- ms[!duplicated(norm_file_key(basename(ms)))]
-  # Biological files that have metadata (usable downstream) ...
   with_meta <- basename(bio)[norm_file_key(basename(bio)) %in% meta_keys]
-  # ... plus every confirmed-hit file, whatever tree it sits in (blood on this
-  # deposit lives under updates/.../peak/blood/, not ccms_peak/).
+  # Plus every confirmed-hit file, whatever tree it sits in.
   all_files <- unique(c(with_meta, basename(as.character(hit_files))))
 
-  # Pooled QC material is dropped outright (see EXCL_POOL): it is not an
-  # independent sample, so it belongs in neither the numerator nor the
-  # denominator of a prevalence.
+  # Pooled QC dropped outright (EXCL_POOL): not an independent sample, so out of num and denom.
   n_pool <- sum(grepl(EXCL_POOL, all_files, perl = TRUE))
   if (n_pool) {
     message("  ", deposit_id, ": dropped ", n_pool, " pooled-QC files")
@@ -561,12 +480,10 @@ select_bio_files_massive <- function(deposit_id, meta_keys = character(),
 
 # ===== assay/technical metadata (was assay_metadata.R) =====
 
-# R/assay_metadata.R — per-(dataset, assay) technical metadata.
-# fetch_assay_metadata(dataset_ids): one row per (dataset_id, assay). Sources:
-# MTBLS from mtbls_assay_data; ST from mwb_metadata()$MS_run; MSV from the
-# local deposit TSV first, then Pan-ReDU as per-field fallback.
+# fetch_assay_metadata(dataset_ids): one row per (dataset_id, assay). Sources: MTBLS from
+# mtbls_assay_data, ST from mwb_metadata()$MS_run, MSV from local TSV then Pan-ReDU fallback.
 
-# ReDU / MIxS placeholders treated as missing. Shared with metadata.R.
+# ReDU/MIxS placeholders treated as missing.
 REDU_MISSING <- c("missing value", "not applicable", "not collected",
                   "not provided", "restricted access", "na", "n/a", "",
                   "-", "unknown", "no data")
@@ -715,23 +632,15 @@ fetch_assay_metadata <- function(dataset_ids) {
 
 # ===== biological file selection (was bio_files.R) =====
 
-# R/bio_files.R — helpers for biological file selection from each repository
-
 META_DIR <- "dataset_metadata"
 EXCL_ST  <- "(?i)^(blank|qc|pool|reference|standard|control|empty)"
 
-# Pooled QC material, excluded by FILE NAME because the declared sample type is
-# misleading for it. MSV000094097's 30 "Pool_blood_plasma_*" files are labelled
-# SampleType "animal" - technically true, since the pool is made FROM the animal
-# samples, so EXCL_ST (which matches on the declared type) never fires. But a pool
-# is one homogeneous material re-injected many times, not an independent
-# biological observation: leaving it in inflates both the detection count and the
-# prevalence denominator. This is the one place a name-based rule overrides
-# declared metadata, and it is deliberately narrow (leading "pool" only).
+# Pooled QC excluded by file name: 094097's "Pool_*" files are SampleType "animal" so EXCL_ST
+# never fires, yet a re-injected pool inflates counts and denominator. The one name-based
+# override; deliberately narrow (leading "pool" only).
 EXCL_POOL <- "(?i)^pool"
 
-# Assay file names for a MetaboLights study from its ISA investigation file
-# (cached locally on first call).
+# Assay file names for a MetaboLights study from its ISA investigation file (cached locally).
 mtbls_inv_assay_names <- function(ds) {
   inv_path <- file.path(META_DIR, paste0(ds, "_i_Investigation.txt"))
   if (!file.exists(inv_path)) {
@@ -748,8 +657,7 @@ mtbls_inv_assay_names <- function(ds) {
   an[nchar(an) > 0]
 }
 
-# Fetch (or load from cache) one assay table for a MetaboLights study.
-# Tries MsBackendMetaboLights::mtbls_assay_data() first, falls back to FTP.
+# Fetch (or load from cache) one MetaboLights assay table; tries mtbls_assay_data() then FTP.
 fetch_assay_table <- function(ds, assay_name) {
   cache_path <- file.path(META_DIR, assay_name)
   if (file.exists(cache_path))
@@ -774,10 +682,8 @@ fetch_assay_table <- function(ds, assay_name) {
   adf
 }
 
-# Pick the spectral file column from an ISA assay table.
-# "Derived Spectral Data File" is preferred over "Raw Spectral Data File"
-# because MetaboLights often leaves the Raw column all-NA while Derived has paths.
-# Returns NA if neither column exists (e.g. an NMR-only assay table).
+# Pick the spectral file column from an ISA assay table: prefer Derived over Raw (Raw is often
+# all-NA while Derived has paths). NA if neither exists (e.g. NMR-only assay).
 fcol_pick <- function(adf) {
   derived <- grep("Derived Spectral Data File", names(adf),
                   value = TRUE, ignore.case = TRUE)[1]
@@ -786,8 +692,7 @@ fcol_pick <- function(adf) {
        value = TRUE, ignore.case = TRUE)[1]
 }
 
-# Returns a named list `assay_name -> character vector of file basenames`,
-# or NULL for MassIVE (no formal assay concept). NMR-only assays are skipped.
+# Named list assay_name -> file basenames; NULL for MassIVE (no assay concept), NMR assays skipped.
 assay_lookup_for <- function(ds) {
   if (startsWith(ds, "MTBLS")) {
     an_names <- mtbls_inv_assay_names(ds)
@@ -824,8 +729,7 @@ assay_lookup_for <- function(ds) {
   } else NULL
 }
 
-# Look up which assay a file belongs to within a given lookup. Returns NA
-# if no assay's file list contains this basename.
+# Which assay a file belongs to in a lookup; NA if no assay's list has this basename.
 file_to_assay <- function(file_basename, lookup) {
   if (is.null(lookup) || is.na(file_basename) || !nzchar(file_basename))
     return(NA_character_)
@@ -835,12 +739,9 @@ file_to_assay <- function(file_basename, lookup) {
   NA_character_
 }
 
-# MassIVE phantom-file guard: Pan-ReDU/ReDU can advertise .mzXML names never
-# deposited as spectra (present only as .hdx/.u2/.unt). Such phantoms made
-# massive_sync_data_files() report "None found" and abort the whole dataset
-# (MSV000084008: 21 phantoms, count 461 vs real 439). Keep only files that
-# truly exist as .mzML/.mzXML in the deposit's own listing.
-# Uses MsBackendMassIVE ONLY (project rule: never curl/FTP for repository data).
+# MassIVE phantom-file guard: Pan-ReDU can advertise .mzXML names never deposited as spectra;
+# such phantoms made massive_sync_data_files() abort the dataset (084008: 21 phantoms). Keep only
+# files truly present as .mzML/.mzXML in the deposit listing. MsBackendMassIVE only (never curl/FTP).
 massive_real_ms_files <- function(deposit_id) {
   fl <- MsBackendMassIVE::massive_list_files(deposit_id)
   nm <- if (is.data.frame(fl)) {

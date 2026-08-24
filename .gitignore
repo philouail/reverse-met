@@ -65,3 +65,19 @@ _*_tmp.R
 *.raw
 docs/TODO.md
 /docs
+
+# ── LaTeX build products (thesis/preview.pdf is the only kept output) ────
+thesis/*.aux
+thesis/*.bbl
+thesis/*.bcf
+thesis/*.blg
+thesis/*.fdb_latexmk
+thesis/*.fls
+thesis/*.log
+thesis/*.run.xml
+thesis/*-SAVE-ERROR
+# page previews rendered for visual checks; the PDF is the kept output
+thesis/*.jpg
+thesis/*.png
+/thesis
+/results

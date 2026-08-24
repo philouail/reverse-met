@@ -41,7 +41,7 @@ Results are written to disk for manual review.
 
 ```{r}
 #| include: false
-# This notebook lives in confirmation/ — run it from the repo root so
+# This notebook lives in confirmation/, so run it from the repo root and
 # source("R/...") and read("artifacts/...") paths resolve.
 knitr::opts_knit$set(root.dir = "..")
 ```
@@ -59,21 +59,17 @@ library(MetaboCoreUtils)
 library(RuSirius)
 library(dplyr)
 library(tidyr)
-# load_metadata(): the harmonised per-file metadata built in 01. Needed here so
-# the SIRIUS cap can be stratified by biofluid rather than silently favouring
-# whichever matrix ionises best.
+# load_metadata(): the harmonised per-file metadata built in 01. Needed to label each hit
+# with its biofluid, which is what the (now disabled) cap stratified on.
 source("R/metadata.R")
 ```
 
 # Compound targets
 
 ```{r compound-spec}
-compound_spec <- data.frame(
-  role    = c("parent",       "metabolite"),
-  name    = c("omeprazole",   "5-hydroxyomeprazole"),
-  formula = c("C17H19N3O3S",  "C17H19N3O4S"),
-  ikey1   = c("SUBDBMMJDZJVOS", "CMZHQFXXAAIBKE")
-)
+# compound_spec is defined once in R/masst.R, sourced below. The local copy that
+# used to sit here named its InChIKey column `ikey1` while the shared one names it
+# `inchikey_block1`, so sourcing silently replaced it and every lookup returned NULL.
 ```
 
 # Load curated hits
@@ -92,21 +88,26 @@ hits_massive <- hits_curated[
   startsWith(hits_curated$ATTRIBUTE_DatasetAccession, "MSV"), ]
 
 massive_datasets <- unique(hits_massive$ATTRIBUTE_DatasetAccession)
+# Overridable for a targeted re-run: CONFIRM_ONLY="MSV000082493,MSV000084008" restricts
+# the loop to those deposits. Empty (the default) processes all of them, as before.
+# NOTE: a restricted run also restricts the combined artifact written at the end of this
+# notebook, so the other deposits' confirmations must be merged back afterwards.
+.only <- trimws(unlist(strsplit(Sys.getenv("CONFIRM_ONLY", ""), ",")))
+.only <- .only[nzchar(.only)]
+if (length(.only)) {
+  massive_datasets <- intersect(massive_datasets, .only)
+  cat("CONFIRM_ONLY set: restricted to", paste(massive_datasets, collapse = ", "), "\n")
+}
 cat(length(massive_datasets), "MassIVE datasets to process\n")
 ```
 
 # Helper functions
 
 ```{r helpers}
-ADDUCT_CANDIDATES <- c(
-  "[M+H]+",
-  "[M+Na]+",
-  "[M+K]+",
-  "[M+NH4]+",
-  "[M-H]-",
-  "[M+Cl]-"
-)
-PPM <- 20
+# ADDUCT_CANDIDATES and the ppm tolerance are defined once in R/masst.R; a local copy
+# here drifted out of step with it, so the list is taken from there.
+source("R/masst.R")
+PPM <- 25
 RT_TOL <- 3
 
 # Cap the number of hits sent to SIRIUS, PER (role x biofluid).
@@ -127,7 +128,17 @@ RT_TOL <- 3
 # Capping per (role x biofluid) guarantees every biofluid gets an attempt, so a
 # biofluid that still ends up with no confirmation is genuine evidence and its
 # samples can be excluded on principle rather than by accident.
-CAP_PER_ROLE_BIOFLUID <- 25
+# THE CAP IS NOW OFF by default (CONFIRM_CAP=Inf). It was capping the evidence, not just
+# the compute: the confirmed set is what anchors the RT window AND what the downstream
+# presence analysis counts, so a top-N by cosine was deciding which hits existed. Uncapping
+# took the confirmed set from 241 features to 7,201 and the positive control from a
+# capped subset to 768 of 771 files. Set CONFIRM_CAP to a number to restore a per-stratum
+# top-N; the stratified logic below is kept because it is the right shape if a cap is ever
+# needed again.
+CAP_PER_ROLE_BIOFLUID <- {
+  .v <- Sys.getenv("CONFIRM_CAP", "Inf")
+  if (identical(tolower(.v), "inf")) Inf else as.numeric(.v)
+}
 
 # Biofluid label for each hit, taken from the harmonised per-file metadata that
 # `01` built (col_body_site -> body_site). Never parsed from filenames. Hits whose
@@ -511,7 +522,7 @@ resolve_all <- function(results_dir = "results", compound_spec) {
       resolve_features(
         res,
         target_formula     = compound_spec$formula[i],
-        target_ikey_prefix = compound_spec$ikey1[i]
+        target_ikey_prefix = compound_spec$inchikey_block1[i]
       ) |>
         mutate(dataset_id = ds, role = role, .before = xcms_fts) ->
         all_rows[[paste(ds, role, sep = "::")]]

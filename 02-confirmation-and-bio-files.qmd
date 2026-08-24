@@ -56,13 +56,15 @@ deposit-level key to `deposit_id`, and attach the combined `dataset_id` and
 chromatography from `dataset_metadata_table.csv` via a `(deposit_id, assay)`
 join.
 
-The count here is **12**, not the 14 curated in `01`: SIRIUS confirmed the
-omeprazole / 5-OH pair in 12 datasets and rejected two (MSV000086975 and
-MSV000085256) where MASST flagged features at the target masses but the MS2
-supported a different, isobaric formula. Both are correct rejections: SIRIUS's
-top formula for the parent is fluorinated and sulfur-free (C17H16FN3O4 for
-086975, C14H16F3N4O3 for 085256), not omeprazole's C17H19N3O3S, so these are
-isobaric look-alikes rather than the target.
+The count here is **12**, not the 15 curated in `01`, and the three that drop do
+so for two different reasons. Two (MSV000086975 and MSV000085256) are **isobaric
+look-alikes**: MASST flagged features at the target masses, but SIRIUS's top
+formula for the parent is fluorinated and sulfur-free (C17H16FN3O4 for 086975,
+C14H16F3N4O3 for 085256), not omeprazole's C17H19N3O3S. Both are correct
+rejections. The third (MSV000091951) is **not** a look-alike: omeprazole is
+genuinely confirmed there (22 features, structure rank 1, Tanimoto ~0.98), but no
+metabolite feature ever confirms, so it fails the both-roles filter below and
+cannot yield a ratio.
 
 ```{r load-confirmed}
 conf_all <- rbind(
@@ -98,32 +100,37 @@ print(table(unique(conf_all[, c("dataset_id", "chromatography")])$chromatography
 
 # Filter cascade
 
-Both parent/metabolite hits per assay and a shared adduct were already
-required upstream, so the remaining filters narrow to what is *interpretable*
-after SIRIUS: highest tier per dataset+role, both roles still present after
-annotation.
+Both parent and metabolite hits per assay were already required upstream, so the
+remaining filter narrows to what is *interpretable* after SIRIUS: both roles still
+present after annotation. Two rules that used to live here are gone. Curation no longer
+requires the two compounds to share an adduct (`01` explains why that deleted evidence of
+presence rather than protecting the ratio), and this notebook no longer collapses each
+(dataset, role) to its best tier --- see below.
 
-## Highest confidence tier per (dataset, role)
+## Every confirmed tier is kept
 
 SIRIUS returns a formula rank and a structure rank per feature; we bin them into
 tiers (set in the confirmation notebooks):
 
-- **strict** — formula rank 1 and structure rank 1;
-- **standard** — formula rank ≤ 3 and structure rank ≤ 5;
-- **liberal** — formula rank ≤ 15 and structure rank ≤ 15;
-- **not_confirmed** — beyond liberal; dropped before the confirmed CSVs.
+- **strict**: formula rank 1 and structure rank 1;
+- **standard**: formula rank ≤ 3 and structure rank ≤ 5;
+- **liberal**: formula rank ≤ 15 and structure rank ≤ 15;
+- **not_confirmed**: beyond liberal; dropped before the confirmed CSVs.
 
-A feature can match at several tiers, so we keep only the highest tier reached
-per (dataset, role).
+Every confirmed feature is kept, at whatever tier it reached. An earlier version
+collapsed each (dataset, role) to its best tier alone, which meant that one
+`strict` parent feature in a deposit discarded every `standard` parent feature in
+that same deposit — including rank-1 identifications on other files. That is the
+right rule for choosing an **RT anchor**, where the most confident evidence should
+set the window, and the wrong rule for everything else, where a confirmed feature
+is a confirmed feature. The tier restriction now lives in
+`derive_extraction_config()`, which is the only consumer that needs it; the
+`confidence` column flows through here unchanged so any downstream analysis can
+still stratify or weight by tier.
 
-```{r filter-best-confidence}
+```{r keep-confidence-tier}
 CONF_ORDER <- c(strict = 1, standard = 2, liberal = 3, not_confirmed = 4)
-
-conf_best <- conf_all |>
-  dplyr::group_by(dataset_id, role) |>
-  dplyr::filter(CONF_ORDER[as.character(confidence)] ==
-                  min(CONF_ORDER[as.character(confidence)])) |>
-  dplyr::ungroup()
+conf_best  <- conf_all
 ```
 
 ## Both roles confirmed (any tier above not_confirmed)
@@ -187,7 +194,11 @@ plot_rt_windows <- function(df, title) {
           strip.background = element_rect(fill = "grey92"))
 }
 
-plot_rt_windows(conf_final, "Per-dataset RT windows - all confirmed features")
+.p_rt <- plot_rt_windows(conf_final, "Per-dataset RT windows - all confirmed features")
+# This is the chapter figure too, so it is written from here rather than redrawn.
+dir.create("thesis/graphics", showWarnings = FALSE, recursive = TRUE)
+ggsave("thesis/graphics/flagship_rt_windows_raw.png", .p_rt, width = 9, height = 5, dpi = 200)
+.p_rt
 ```
 
 Chromatography labels come from the deposit / ReDU metadata and paper constants
@@ -196,9 +207,9 @@ each method's gradient), so the spread within a phase facet is expected, not
 evidence of mislabelling. Two datasets are RT outliers worth checking against their
 source methods:
 
-- **MTBLS11656** — confirmed RT ≈ 523 s, very late for RP (every other RP dataset
+- **MTBLS11656**: confirmed RT ≈ 523 s, very late for RP (every other RP dataset
   sits at 88–203 s);
-- **MSV000092754** — confirmed RT ≈ 107 s, unusually early for HILIC (every other
+- **MSV000092754**: confirmed RT ≈ 107 s, unusually early for HILIC (every other
   HILIC dataset here sits at 279–507 s).
 
 ## MS2 trigger RT versus MS1 chromatographic apex
@@ -348,7 +359,7 @@ A file enters the set if it is **either**:
 
 - covered by a metadata source (Pan-ReDU ∪ submitter table, reconciled in `01`),
   with QC injections, blanks and reference standards removed by the *declared*
-  sample-type column — never by file name (`EXCL_ST` on `SampleType` /
+  sample-type column, never by file name (`EXCL_ST` on `SampleType` /
   `MS_SampleType`); **or**
 - carrying a confirmed MASST hit, whatever tree it sits in, so no confirmed
   exposure is ever lost.
@@ -515,7 +526,7 @@ bio_counts
 
 What `03` needs: the confirmed features (`hits-confirmed-all.csv`), the
 per-dataset summary (`datasets-confirmed.csv`), and the three per-dataset lists
-that drive extraction — the biological files to load (`bio_files_per_ds.rds`),
+that drive extraction: the biological files to load (`bio_files_per_ds.rds`),
 their assay (`bio_assays_per_ds.rds`), and the has-metadata flag per file
 (`bio_meta_per_ds.rds`).
 

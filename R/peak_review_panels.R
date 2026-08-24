@@ -1,18 +1,18 @@
 # Peak-review panel generator for the manual audit. Uses the CANONICAL picker from R/ms1.R
-# (constants + walk_bound + pick + detected_new + new_win + snap_one + is_dropped, sourced below);
-# this file adds only the panel-drawing + wide-EIC cache runner. Does NOT touch the pipeline.
+# (constants + walk_bound + pick + accept_peak + acceptance_window + snap_one + is_dropped, sourced below);
+# this file adds only the panel-drawing + wide-EIC cache runner. Does not touch the pipeline.
 # Re-picks the confirmation peaks from the cached wide EIC (chr_all): builds the MS1-apex window
-# (new_win), integrates each in-window local max valley-to-valley (pick), gates it (detected_new),
+# (acceptance_window), integrates each in-window local max valley-to-valley (pick), gates it (accept_peak),
 # applies the drop-list; writes panels to peaks_review_v2/<ds>/{detected,filtered} + index.csv.
 #   Rscript R/peak_review_panels.R MSV000094097 [more datasets...]
 suppressPackageStartupMessages({
   source("R/_setup.R"); source("R/metadata.R"); source("R/ms1.R"); library(Chromatograms)
 })
-# Single-threaded extraction: the parallel chromExtract spawns a large worker swarm
-# that thrashes the machine and is SLOWER here; serial is lighter.
+# Single-threaded: measured, parallel backends give no gain here because the cost is
+# disk I/O rather than CPU (Serial 13.4 s vs Snow(4/8) 12.4 s on a cold 144-file dataset).
 BiocParallel::register(BiocParallel::SerialParam())
 
-# Picker constants + functions (walk_bound, pick, detected_new, new_win, snap_one, is_dropped)
+# Picker constants + functions (walk_bound, pick, accept_peak, acceptance_window, snap_one, is_dropped)
 # all come from R/ms1.R (sourced above). Only the panel-runner extras live here.
 PLOT_PAD <- 4                      # RT margin each side of the peak boundaries in review panels
 OUT      <- "peaks_review_v2"
@@ -21,7 +21,7 @@ dir.create(OUT, showWarnings = FALSE)
 bfd <- readRDS("artifacts/bio_files_per_ds.rds")
 dm  <- read.csv("artifacts/dataset_metadata_table.csv", check.names = FALSE, stringsAsFactors = FALSE)
 
-# Confirmed-hit anchors + manual overrides + drop-list, fed to R/ms1.R's new_win() / is_dropped().
+# Confirmed-hit anchors + manual overrides + drop-list, fed to R/ms1.R's acceptance_window() / is_dropped().
 hits_all <- read.csv("artifacts/hits-confirmed-all.csv", stringsAsFactors = FALSE)
 ov_all <- if (file.exists("curation/rt_apex_overrides.csv"))
   read.csv("curation/rt_apex_overrides.csv", stringsAsFactors = FALSE) else
@@ -89,8 +89,13 @@ build_cache <- function(ds, r, ppm = 20) {
   secs <- round(proc.time()[3] - t0, 1)
   nf <- length(unique(c(cache$par$files, cache$met$files)))
   tl <- file.path(OUT, "_extract_times.csv")
-  if (!file.exists(tl)) cat("dataset,n_files,extract_seconds\n", file = tl)  # header on first write
-  cat(sprintf("%s,%d,%.1f\n", short, nf, secs), file = tl, append = TRUE)
+  # Stamp the run date and the Chromatograms version: extraction cost tracks that
+  # package, so a timing is only comparable to another run on the same version.
+  if (!file.exists(tl))
+    cat("dataset,n_files,extract_seconds,run_date,chromatograms\n", file = tl)
+  cat(sprintf("%s,%d,%.1f,%s,%s\n", short, nf, secs, format(Sys.Date()),
+              as.character(utils::packageVersion("Chromatograms"))),
+      file = tl, append = TRUE)
   message(sprintf("[%s] EIC extraction: %.1f s for %d files", short, secs, nf))
   saveRDS(cache, cf); cache
 }
@@ -106,10 +111,10 @@ for (ds in sel) {
   for (s in c("detected", "filtered")) unlink(file.path(dd, s), recursive = TRUE)
   for (s in c("detected", "filtered")) dir.create(file.path(dd, s), showWarnings = FALSE)
   cache <- build_cache(ds, r)
-  rows <- list(); nd_old <- c(par = 0, met = 0); nd_new <- c(par = 0, met = 0)
+  rows <- list(); n_any_auc <- c(par = 0, met = 0); n_accepted <- c(par = 0, met = 0)
   for (role in c("par", "met")) {
     role_full <- if (role == "par") "parent" else "metabolite"
-    win <- new_win(ds, role_full, cache[[role]], bare, cache[[role]]$win, hits_all, ov_all)
+    win <- acceptance_window(ds, role_full, cache[[role]], bare, cache[[role]]$win, hits_all, ov_all, is_hilic)
     bn <- cache[[role]]$files; tr <- cache[[role]]$traces
     m <- as.data.frame(if (role == "par") r$metrics_par else r$metrics_met)
     mk <- basename(m$file)
@@ -117,15 +122,15 @@ for (ds in sel) {
       p <- pick(tr[[i]]$rt, tr[[i]]$it, win[1], win[2], is_hilic)
       id <- sprintf("%s_%s_%03d", short, role, i)
       dropped <- is_dropped(short, role_full, bn[i], drop_all)   # manual reviewer removal
-      det <- detected_new(p, is_hilic) && !dropped
-      nd_new[role] <- nd_new[role] + det
+      det <- accept_peak(p, is_hilic) && !dropped
+      n_accepted[role] <- n_accepted[role] + det
       j <- match(bn[i], mk)
-      old_auc <- if (!is.na(j)) m[[paste0(role, "_auc")]][j] else NA
-      if (!is.na(old_auc)) nd_old[role] <- nd_old[role] + 1  # old counted any AUC
+      any_auc <- if (!is.na(j)) m[[paste0(role, "_auc")]][j] else NA
+      if (!is.na(any_auc)) n_any_auc[role] <- n_any_auc[role] + 1  # any integrated peak, gate aside
       if (is.null(p)) next
       sd <- if (det) "detected" else "filtered"
       tag <- sprintf("%s | %s | %s", id, if (role == "par") "parent" else "metabolite",
-                     if (det) "DETECTED (new)" else if (dropped) "MANUAL DROP" else "filtered (new)")
+                     if (det) "DETECTED" else if (dropped) "MANUAL DROP" else "filtered")
       sub <- sprintf("FWHM %s s | SNR %s | pkwidth %.1f s | pts %d | AUC %s",
                      if (is.na(p$fwhm)) "NA" else round(p$fwhm, 1),
                      if (is.finite(p$snr)) round(p$snr, 1) else "NA",
@@ -138,7 +143,7 @@ for (ds in sel) {
     }
   }
   if (length(rows)) write.csv(do.call(rbind, rows), file.path(dd, "index.csv"), row.names = FALSE)
-  message(sprintf("%s: parent old(any-AUC)=%d new=%d | metab old=%d new=%d",
-                  short, nd_old["par"], nd_new["par"], nd_old["met"], nd_new["met"]))
+  message(sprintf("%s: parent any-AUC=%d accepted=%d | metab any-AUC=%d accepted=%d",
+                  short, n_any_auc["par"], n_accepted["par"], n_any_auc["met"], n_accepted["met"]))
 }
 message("done -> ", OUT, "/")

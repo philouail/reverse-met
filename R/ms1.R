@@ -1,26 +1,12 @@
 # R/ms1.R — MS1 EIC → peak → metric pipeline (+ EIC/peaks/stats/plots helpers).
-#
-# Pipeline stages (all backend-agnostic except load_spectra_ms1):
-#   1. load_spectra_ms1(ds, files) → MS1 Spectra
-#   2. derive_extraction_config(...) → assay/mz/rt windows (per-dataset; see body)
-#   3. extract_eics(...) → EICs
-#   4. process_eics(...) → narrow chromatograms + metrics (FWHM flag)
-#   5. build_sample_table(...) → per-file table with detection_tier + log2_ratio
-#   6. run_ms1_for_dataset(...) wraps 1, 3, 4, 5 for the cross-dataset loop
+# Stages: load_spectra_ms1 → derive_extraction_config → extract_eics →
+# process_eics → build_sample_table; run_ms1_for_dataset wraps them per dataset.
 
 # ==========================================================================
 # ---- 0. peak-picker core -------------------------------------------------
-# Raw (rt, it) of one file + an acceptance RT window -> one integrated peak (or
-# NULL), plus the accept gate and the MS1-apex window builder. Pure numerics on
-# vectors (no Chromatograms/backend dependency); the pipeline stages below feed it
-# each EIC's (rtime, intensity). Design + every threshold: 03-all-datasets.qmd and
-# the peak-picker-redesign memory. In brief: new_win() snaps each confirmed MS2 hit
-# to its MS1 apex and brackets the robust consensus (+/- APEX_PAD); pick() integrates
-# each in-window local max valley-to-valley (merging <PROX_S-from-apex pairs + shallow
-# saddles, stopping at deep valleys / dead gaps), caps the tail at +/- MAXW_FWHM*FWHM,
-# and selects the dominant peak by AUC weighted (RP) toward the expected RT so an
-# on-RT peak beats a larger-area interferent (the isobaric omeprazole sulfone);
-# detected_new() is the chromatography-conditional accept gate.
+# One file's (rt, it) + acceptance window -> one integrated peak (or NULL), the
+# accept gate, and the apex-window builder. Pure vector numerics, no backend dep.
+# Design + every threshold: 03-all-datasets.qmd and the peak-picker-redesign memory.
 
 WIDE_EXTRA <- 50      # s of extra EIC each side of the window so the valley walk has data
 HWS        <- 1L      # local-maxima half-window (beat immediate neighbours; suits sparse peaks)
@@ -39,16 +25,15 @@ SNR_MIN_HILIC <- 3    # apex height above its local baseline line, in noise unit
 SNR_MIN_RP    <- 12   # RP floor: every real RP peak clears SNR 20; 12 sits below them, above flat ramps
 MIN_INT       <- 500  # absolute apex-intensity floor (both modes): below this a peak is noise
 MAXW_FWHM  <- 3       # cap each half-boundary at this many FWHM from the apex (drop a sharp peak's tail)
-APEX_PAD   <- 5       # pad to LOCATE the apex window (new_win); also the tail-rejection tolerance
+APEX_PAD   <- 5       # pad to LOCATE the apex window (acceptance_window); also the tail-rejection tolerance
 RT_SIGMA   <- 4       # RP selection: gaussian down-weight of AUC by distance from the expected RT
-SNAP_W     <- 20      # new_win: snap a confirmed MS2 rt to the most intense MS1 apex within +/- this
-CLUST_TOL  <- 12      # new_win: keep snapped apexes within this of their median (robust consensus)
+SNAP_W     <- 20      # acceptance_window: snap a confirmed MS2 rt to the most intense MS1 apex within +/- this
+CLUST_TOL  <- 12      # acceptance_window: keep snapped apexes within this of their median (robust consensus)
+COHERE_S   <- 1       # acceptance_window: extend the window over peaks this close to its edge (cluster cohesion)
 
-# Walk one flank from the apex to the boundary. Descend to a valley; keep going past it (merge the
-# shoulder max beyond) when that shoulder sits < PROX_S from the APEX (a close pair, whatever the
-# valley depth) OR the saddle is shallow (valley > MERGE_FRAC of the shoulder). Stop at the baseline
-# floor or a dead gap (the EIC dropped out -> the peak ended; do not glue on a far point). Proximity
-# is from the apex, not the last-merged max, so it cannot chain across a dense trace to a distant peak.
+# Walk one flank from the apex: descend to a valley, then merge the shoulder beyond it when that
+# shoulder sits < PROX_S from the apex OR the saddle is shallow (valley > MERGE_FRAC of the shoulder);
+# stop at the baseline floor or a dead gap. Proximity is apex-relative, so it can't chain to a distant peak.
 walk_bound <- function(it, ai, dir, floor_lv, apex, rt = NULL, gap = Inf, clust = 0) {
   n <- length(it); i <- ai
   jumped <- function(a, b) !is.null(rt) && abs(rt[b] - rt[a]) > gap
@@ -72,8 +57,7 @@ walk_bound <- function(it, ai, dir, floor_lv, apex, rt = NULL, gap = Inf, clust 
 pick <- function(rt, it, acc_lo, acc_hi, hilic = FALSE) {
   o0 <- order(rt); rt <- rt[o0]; it <- it[o0]
   gap_thr <- max(GAP_FACTOR * stats::median(diff(rt)), GAP_MIN_S)
-  # baseline & noise from the FULL window (NA/below-detection scans read as 0) so the estimate
-  # includes the real baseline; detected-points-only inflates noise on a peak-dominated sparse EIC.
+  # baseline & noise from the FULL window (NA/below-detection as 0); detected-points-only inflates noise.
   it0 <- it; it0[!is.finite(it0) | it0 < 0] <- 0
   baseline <- as.numeric(stats::quantile(it0, 0.10))
   bpts  <- it0[it0 <= stats::median(it0)]
@@ -133,19 +117,17 @@ pick <- function(rt, it, acc_lo, acc_hi, hilic = FALSE) {
   }
   peaks <- Filter(Negate(is.null), lapply(cand, build_peak))
   if (!length(peaks)) return(NULL)
-  # RP: weight AUC by a gaussian in distance from the expected RT (window centre) so the on-RT peak
-  # beats a larger-area interferent elsewhere. HILIC: pure area-select (its windows were audited).
+  # RP: weight AUC toward the window centre so the on-RT peak beats a larger-area interferent. HILIC: area-select.
   auc <- vapply(peaks, function(p) p$auc, numeric(1))
   score <- if (hilic) auc else
     auc * exp(-0.5 * ((vapply(peaks, function(p) p$apex_rt, numeric(1)) - (acc_lo + acc_hi) / 2) / RT_SIGMA)^2)
   peaks[[which.max(score)]]
 }
 
-# Chromatography-conditional accept gate. Shared: point count, intensity floor, SNR, FWHM band,
-# slope (FWHM within base width). HILIC also: return-to-baseline (prominence) + no much-taller
-# neighbour (both audited on HILIC). RP drops those two (they killed sharp truncated-flank peaks
-# and peaks beside the sulfone) but still demands a 3-point peak clear its own baseline.
-detected_new <- function(p, hilic) {
+# Chromatography-conditional accept gate. Shared: point count, intensity floor, SNR, FWHM band, slope.
+# HILIC adds return-to-baseline (prominence) + no much-taller neighbour. RP drops those two (they killed
+# sharp truncated-flank peaks beside the sulfone) but still makes a 3-point peak clear its own baseline.
+accept_peak <- function(p, hilic) {
   if (is.null(p) || !is.finite(p$auc)) return(FALSE)
   min_pts <- if (hilic) MIN_PTS_HILIC else MIN_PTS
   fw      <- if (hilic) FWHM_BAND_HILIC else FWHM_BAND_RP
@@ -161,6 +143,54 @@ detected_new <- function(p, hilic) {
 }
 
 # snap one confirmed MS2 rt to the most intense MS1 apex within +/- SNAP_W of it
+# MsQuality measures the peak the picker chose, handed its boundaries, so width, FWHM,
+# prominence and shape are mzQC controlled-vocabulary quantities rather than local
+# re-implementations. gaussian_similarity needs >= 5 points and is NA on the sparsest
+# peaks, so it is recorded but never gated on. Apex and SNR stay local: both belong to the
+# peak the picker selected, and MsQuality cannot be told which peak that is.
+add_msquality <- function(chr, picks) {
+  n <- length(picks)
+  pb <- matrix(NA_real_, n, 2,
+               dimnames = list(NULL, c("left_boundary", "right_boundary")))
+  for (i in seq_len(n))
+    if (!is.null(picks[[i]])) pb[i, ] <- c(picks[[i]]$lb, picks[[i]]$rb)
+  if (!any(is.finite(pb[, 1]))) return(picks)
+  fwhm  <- MsQuality::xicFwhm(chr, peakBoundary = pb)
+  width <- MsQuality::peakWidth(chr, peakBoundary = pb)
+  prom  <- MsQuality::peakProminence(chr, peakBoundary = pb)
+  gauss <- MsQuality::gaussianSimilarity(chr, peakBoundary = pb)[, "gaussian_similarity"]
+
+  # maxIntensity() takes no peakBoundary, so scope it by handing it a Chromatograms holding
+  # only the picked regions. Bit-identical to the local apex on every reverse-phase peak
+  # tested; it can differ on a merged HILIC cluster, where the integrated region contains a
+  # shoulder taller than the apex the picker chose, so the local value wins there.
+  pd  <- Chromatograms::peaksData(chr)
+  sub <- lapply(seq_len(n), function(i) {
+    if (is.null(picks[[i]])) return(data.frame(rtime = numeric(), intensity = numeric()))
+    d <- as.data.frame(pd[[i]])
+    d[d$rtime >= picks[[i]]$lb & d$rtime <= picks[[i]]$rb, c("rtime", "intensity")]
+  })
+  pkchr <- Chromatograms::Chromatograms(
+    Chromatograms::ChromBackendMemory(),
+    chromData = data.frame(msLevel = 1L, mz = NA_real_,
+                           dataOrigin = paste0("p", seq_len(n))),
+    peaksData = sub)
+  apex <- MsQuality::maxIntensity(pkchr)
+
+  for (i in seq_len(n)) {
+    if (is.null(picks[[i]])) next
+    # keep the local value where MsQuality cannot return one, so the gate never sees NA
+    if (is.finite(fwhm[i]))  picks[[i]]$fwhm    <- fwhm[i]
+    if (is.finite(width[i])) picks[[i]]$pkwidth <- width[i]
+    # the apex must stay the SELECTED peak's, so adopt MsQuality's only when they agree
+    if (is.finite(apex[i]) && isTRUE(all.equal(apex[i], picks[[i]]$apex)))
+      picks[[i]]$apex <- apex[i]
+    picks[[i]]$msq_prominence <- prom[i]
+    picks[[i]]$gauss          <- gauss[i]
+  }
+  picks
+}
+
 snap_one <- function(rt, it, center) {
   ok <- is.finite(rt) & is.finite(it) & it > 0; rt <- rt[ok]; it <- it[ok]
   if (length(rt) < 3) return(NA_real_)
@@ -170,11 +200,11 @@ snap_one <- function(rt, it, center) {
   rt[cand[which.max(it[cand])]]
 }
 
-# MS1-apex acceptance window: consensus of the snapped confirmed apexes +/- APEX_PAD. `cache_role`
-# is list(files = basenames, traces = list(list(rt=, it=))); `bare` normalises a filename to the
-# match key; `old_win` is the fallback. `conf` is the confirmed-hit table (== conf_final, cols
-# dataset_id/role/rt/source_file); `ov` the manual apex overrides (rt_apex_overrides.csv).
-new_win <- function(ds, role_full, cache_role, bare, old_win, conf, ov) {
+# MS1-apex acceptance window: consensus of snapped confirmed apexes +/- APEX_PAD, then extended
+# over peaks contiguous with that span. `bare` normalises a filename to the match key; `conf` is the
+# confirmed-hit table, `ov` the manual apex overrides, `old_win` the fallback, `hilic` the picker mode.
+acceptance_window <- function(ds, role_full, cache_role, bare, old_win, conf, ov,
+                              hilic = FALSE) {
   hh <- conf[conf$dataset_id == ds & conf$role == role_full, ]
   if (!nrow(hh)) return(old_win)
   fk <- bare(cache_role$files); ms2 <- suppressWarnings(as.numeric(hh$rt))
@@ -185,15 +215,58 @@ new_win <- function(ds, role_full, cache_role, bare, old_win, conf, ov) {
     if (length(k)) return(ovr$apex_rt[k[1]])
     snap_one(cache_role$traces[[j]]$rt, cache_role$traces[[j]]$it, ms2[i])
   }, numeric(1))
-  a <- apex[is.finite(apex)]; if (!length(a)) return(old_win)
-  cons <- stats::median(a); inl <- a[abs(a - cons) <= CLUST_TOL]
+  # One anchor per file: a file fragmented 15 times must not out-vote one fragmented 5
+  # times, since the number of MS2 events is an artefact of DDA. Take the most intense
+  # apex rather than the median, because a file's hits can snap to different peaks and a
+  # median would land between them, on nothing.
+  keep_a <- is.finite(apex)
+  if (!any(keep_a)) return(old_win)
+  a_int <- vapply(seq_len(nrow(hh)), function(i) {
+    if (!keep_a[i]) return(NA_real_)
+    j <- match(bare(hh$source_file[i]), fk); if (is.na(j)) return(NA_real_)
+    tr <- cache_role$traces[[j]]
+    tr$it[which.min(abs(tr$rt - apex[i]))]
+  }, numeric(1))
+  a <- vapply(split(seq_len(nrow(hh))[keep_a], bare(hh$source_file)[keep_a]),
+              function(ix) apex[ix][which.max(a_int[ix])], numeric(1))
+  a <- a[is.finite(a)]; if (!length(a)) return(old_win)
+  # Consensus is the best-supported cluster, not the median: anchors are not always
+  # unimodal, and a median can fall in the gap between two clusters. Where two clusters are
+  # equally supported the deposit does not tell us which retention time is the compound, so
+  # both are spanned and the window is flagged uncertain rather than resolved by tie-break.
+  nbrs <- vapply(a, function(z) sum(abs(a - z) <= CLUST_TOL), integer(1))
+  top  <- a[nbrs == max(nbrs)]
+  tied <- diff(range(top)) > CLUST_TOL
+  inl  <- if (tied) a else a[abs(a - stats::median(top)) <= CLUST_TOL]
   if (!length(inl)) return(old_win)
-  pad <- if (length(inl) >= 2) APEX_PAD else 2 * APEX_PAD
-  c(min(inl) - pad, max(inl) + pad)
+  # One pad, never two. The old rule doubled it for a lone anchor, which widens the window exactly
+  # when the evidence is thinnest: that is how MSV000082433 admitted a feature 6.9 s off the
+  # confirmed RT (37 detections -> 6 once the pad is single).
+  w   <- c(min(inl) - APEX_PAD,     max(inl) + APEX_PAD)
+  cap <- c(min(inl) - 2 * APEX_PAD, max(inl) + 2 * APEX_PAD)
+  # A fixed edge is only fair when it lands in a gap, so extend over peaks that are CONTIGUOUS with
+  # what is already accepted (within COHERE_S). That rescues peaks a hard cut would clip 0.4 s from
+  # their neighbour, without ever reaching a separate cluster: growth stops at the first real gap
+  # and is capped at 2 * APEX_PAD either way.
+  cand <- vapply(cache_role$traces, function(t) {
+    p <- pick(t$rt, t$it, cap[1], cap[2], hilic)
+    if (is.null(p) || !accept_peak(p, hilic)) NA_real_ else p$apex_rt
+  }, numeric(1))
+  cand <- cand[is.finite(cand)]
+  for (i in seq_len(20)) {
+    lo <- cand[cand < w[1] & cand >= w[1] - COHERE_S]
+    hi <- cand[cand > w[2] & cand <= w[2] + COHERE_S]
+    if (!length(lo) && !length(hi)) break
+    if (length(lo)) w[1] <- max(min(lo), cap[1])
+    if (length(hi)) w[2] <- min(max(hi), cap[2])
+  }
+  # Record WHY the window is what it is, so a wide one is never mistaken for a confident one.
+  attr(w, "n_anchor_files") <- length(a)
+  attr(w, "uncertain")      <- tied
+  w
 }
 
-# Manual reviewer drop-list, keyed by (dataset, role, file) on norm_file_key -- a stable key that
-# survives re-extraction and file re-ordering. `drop_all` = ms1_drop_list.csv (cols dataset/role/file).
+# Manual reviewer drop-list, keyed on norm_file_key (stable across re-extraction/re-ordering). `drop_all` = ms1_drop_list.csv.
 is_dropped <- function(dataset, role_full, file, drop_all) {
   if (!nrow(drop_all)) return(FALSE)
   dl <- drop_all[drop_all$dataset == dataset & drop_all$role == role_full, ]
@@ -207,9 +280,8 @@ load_spectra_ms1 <- function(deposit_id, files, assay = character()) {
   pat    <- paste0("(", paste(gsub("\\.", "\\\\.", wanted),
                               collapse = "|"), ")$")
   be <- if (startsWith(deposit_id, "MTBLS")) {
-          # Pass assayName so the correct assay's files load. MsBackendMetaboLights
-          # (>= 1.7.4, gabri) bakes the assay index into the cache filename, so a
-          # deposit's pos/neg files with identical basenames no longer collide.
+          # Pass assayName so the right assay loads: MsBackendMetaboLights (>= 1.7.4, gabri) bakes the
+          # assay index into the cache filename, so same-basename pos/neg files no longer collide.
           MsBackendMetaboLights::mtbls_sync_data_files(
             mtblsId = deposit_id, assayName = assay, fileName = wanted)
           backendInitialize(MsBackendMetaboLights(),
@@ -244,44 +316,27 @@ dominant_adduct <- function(df) {
   names(tab)[which.max(tab)]
 }
 
-# Pick the assay with the most confirmed (parent+metabolite) features, then
-# derive m/z and RT windows from the dominant adduct per role. Returns a list
-# ready for extract_eics().
-# rt_pad_s = 5 is not a comfort default: it is load-bearing. 5-hydroxyomeprazole
-# (CYP2C19) and omeprazole sulfone (CYP3A4) are exact isomers (C17H19N3O4S,
-# m/z 362.1169), so MS1 cannot tell them apart and only retention time separates
-# them. In MSV000084008 the confirmed 5-OH span is 3.4 s wide (154.9-158.3) and
-# the sulfone sits at ~181 s. A wide pad lets the sulfone into the window, and
-# peakBoundary() then integrates it instead (it is the larger peak in a poor
-# CYP2C19 metaboliser). Validated against the source study's published
-# PharmKinetics_CYP2C19: pad 3-20 s gives r = +0.55 to +0.62 (p < 0.005), pad 30 s
-# gives r = -0.01 (p = 0.96), i.e. the signal is destroyed exactly when the pad
-# reaches the sulfone. Do not widen this without re-running that check.
+# Pick the assay with the most confirmed parent+metabolite features, then derive m/z and RT windows
+# from the dominant adduct per role. Returns a list ready for extract_eics().
+# rt_pad_s = 5 is load-bearing: 5-OH-omeprazole (CYP2C19) and omeprazole sulfone (CYP3A4) are exact
+# isomers at m/z 362.1169, so only RT separates them. In MSV000084008 the 5-OH span is 154.9-158.3 s
+# and the sulfone sits at ~181 s; a wide pad lets the sulfone in and it gets integrated instead.
+# Validated vs PharmKinetics_CYP2C19: pad 3-20 s r=+0.55..+0.62 (p<0.005), pad 30 s r=-0.01 — do not widen.
 derive_extraction_config <- function(dataset_id, conf_final,
                                      rt_pad_s = 5, bio_files = NULL) {
   pc <- conf_final[conf_final$dataset_id == dataset_id, ]
   if (!nrow(pc)) stop("No confirmed features for ", dataset_id)
 
-  # Membership rule: the retention-time anchor must come only from confirmed
-  # hits on files we actually extract. A MASST/SIRIUS hit can live on a file that
-  # is not in this deposit's extraction set (e.g. MSV000082493's confirmations
-  # sit on blood files that belong to the re-deposit MSV000084008, while 082493
-  # itself contributes feces/skin/urine). Anchoring on those imports a foreign
-  # matrix's retention time. Filter here so the window is always derived from the
-  # same population it is applied to. A dataset left with no parent or no
-  # metabolite anchor after filtering has no valid in-set confirmation and must
-  # be re-confirmed (see the biofluid-stratified cap in the confirmation qmds),
-  # so we stop loudly rather than fall back to foreign files.
+  # Membership rule: the RT anchor must come only from confirmed hits on files we actually extract.
+  # A MASST/SIRIUS hit can sit on a file outside this deposit's set (e.g. 082493's confirmations live
+  # on 084008 blood files while 082493 contributes feces/skin/urine); anchoring there imports a foreign
+  # matrix's RT. If filtering leaves no parent or metabolite anchor, stop loudly rather than fall back.
   if (!is.null(bio_files)) {
-    # Match confirmed-hit files to the extraction set on a normalised key that
-    # drops our accession prefix (MsBackend caches MassIVE files as MSV000..._<name>;
-    # we prefix MetaboLights/Workbench downloads with the accession), the
-    # extension (.mzML vs .mzXML re-deposits), and case. Same rule as
-    # norm_file_key() in R/metadata.R.
-    stem <- function(x) tolower(sub("[.][^.]*$", "",
-              sub("^(MSV[0-9]+|MTBLS[0-9]+|ST[0-9]+)[_-]", "",
-                  basename(as.character(x)))))
-    in_set <- stem(pc$source_file) %in% stem(bio_files)
+    # norm_file_key(), never a local copy of the rule: confirmation writes back names like
+    # ST002044_rawdata_NHF_45.mzML and MTBLS11656_1_MTBLS11656_B-112.mzXML, where the prefix
+    # carries an assay segment and can be doubled. A one-prefix strip matched neither, and
+    # dropped both deposits at this check.
+    in_set <- norm_file_key(pc$source_file, bio_files) %in% norm_file_key(bio_files, bio_files)
     n_par <- sum(in_set & pc$role == "parent")
     n_met <- sum(in_set & pc$role == "metabolite")
     if (n_par == 0 || n_met == 0)
@@ -305,6 +360,20 @@ derive_extraction_config <- function(dataset_id, conf_final,
   assay <- assay_tab$assay[1]
   ac    <- if (is.na(assay)) pc[is.na(pc$assay), ]
            else              pc[!is.na(pc$assay) & pc$assay == assay, ]
+
+  # Anchor on the best tier available, per role. This restriction belongs HERE and nowhere else:
+  # the RT window should be set by the most confident identification, but a deposit's confirmed
+  # feature set must not be thinned just because one of its features reached a higher tier.
+  # Applied after the membership and assay filters, so the tier is the best among confirmations
+  # that are actually usable for this extraction rather than the best that ever existed.
+  if ("confidence" %in% names(ac)) {
+    ord <- c(strict = 1, standard = 2, liberal = 3, not_confirmed = 4)
+    ac  <- do.call(rbind, lapply(split(ac, ac$role), function(z) {
+      r <- ord[as.character(z$confidence)]
+      z[!is.na(r) & r == min(r, na.rm = TRUE), ]
+    }))
+  }
+
   ad_p  <- dominant_adduct(ac[ac$role == "parent",     ])
   ad_m  <- dominant_adduct(ac[ac$role == "metabolite", ])
 
@@ -312,11 +381,8 @@ derive_extraction_config <- function(dataset_id, conf_final,
                  na.rm = TRUE)
   mz_m <- median(ac$mz[ac$role == "metabolite" & ac$adduct_inferred == ad_m],
                  na.rm = TRUE)
-  # Per-dataset RT window: span this dataset's confirmed RTs (min..max) and pad
-  # each side by rt_pad_s. The confirmed span already absorbs cross-file drift
-  # (it is the spread of MS2 detections across many files), so the pad only has
-  # to cover drift in files that carry no confirmed hit. Keep it small: see the
-  # isomer note above for what a generous pad costs.
+  # Per-dataset RT window: span this dataset's confirmed RTs and pad by rt_pad_s. The span already
+  # absorbs cross-file drift, so the pad only covers files with no confirmed hit — keep it small (isomer note above).
   rt_p <- ac$rt[ac$role == "parent"     & ac$adduct_inferred == ad_p]
   rt_m <- ac$rt[ac$role == "metabolite" & ac$adduct_inferred == ad_m]
   rt_p <- rt_p[is.finite(rt_p)]; rt_m <- rt_m[is.finite(rt_m)]
@@ -336,18 +402,14 @@ derive_extraction_config <- function(dataset_id, conf_final,
 
 # ---- 3. EIC extraction ---------------------------------------------------
 
-# Padding kept in chr_all beyond the detection windows. Must stay >= the widest
-# re-extraction any consumer does against chr_all: dataset-report.qmd inspects
-# "neither" files at +/- 60 s (WIDE_PAD_S), so 75 s leaves headroom. Narrowing this
-# further shrinks chr_all more but would silently return empty EICs there.
+# Padding kept in chr_all beyond the detection windows. Must stay >= the widest re-extraction any
+# consumer does: dataset-report.qmd inspects "neither" files at +/- 60 s, so 75 s leaves headroom.
 CHR_ALL_PAD_S <- 75
 
 extract_eics <- function(ms1, mz_par, mz_met,
                          rt_par_win, rt_met_win, ppm = 20) {
-  # Restrict the spectra to the RT/mz neighbourhood before building chr_all.
-  # Verified on MSV000084008 (40 files, 29 detections): identical files and a max
-  # relative AUC difference of 0, with chr_all much smaller and extract_eics ~16%
-  # faster. The dominant cost is now the per-file pick() loop, not the extraction.
+  # Restrict spectra to the RT/mz neighbourhood before building chr_all. Verified on MSV000084008 as
+  # AUC-identical, with chr_all much smaller and extraction ~16% faster.
   rt_lo <- min(rt_par_win[1], rt_met_win[1]) - CHR_ALL_PAD_S
   rt_hi <- max(rt_par_win[2], rt_met_win[2]) + CHR_ALL_PAD_S
   mz_lo <- min(mz_par, mz_met) * (1 - 50e-6)
@@ -356,8 +418,7 @@ extract_eics <- function(ms1, mz_par, mz_met,
 
   all_orig <- unique(dataOrigin(ms1))
   peak_tbl <- rbind(
-    # Extract WIDE_EXTRA s past each acceptance window so pick()'s valley-to-valley walk always has
-    # data (broad peaks run far past the apex); new_win/pick then only accept apexes in the window.
+    # Extract WIDE_EXTRA s past each window so pick()'s valley walk has data; only in-window apexes are accepted.
     data.frame(role = "parent",     msLevel = 1L, dataOrigin = all_orig,
                rtMin = rt_par_win[1] - WIDE_EXTRA, rtMax = rt_par_win[2] + WIDE_EXTRA,
                mzMin = mz_par * (1 - ppm * 1e-6),
@@ -370,12 +431,9 @@ extract_eics <- function(ms1, mz_par, mz_met,
                stringsAsFactors = FALSE)
   )
   chr_all  <- Chromatograms(ms1)
-  # chromExtract yields a lazily Spectra-backed object, so every downstream
-  # peaksData()/intensity() re-materialises it from the spectra — count_peaks() and the
-  # pick() trace-build each paid that (~15% of extract compute on MSV000084008). Pull the
-  # targeted EICs into memory once with setBackend(): subsequent access (count_peaks, pick,
-  # dataset-report plots) then reads from RAM. chr_all is left Spectra-backed — it is only
-  # re-chromExtract'd (reports/panels) and stays small in the cache.
+  # chromExtract yields a lazily Spectra-backed object, so every downstream peaksData()/intensity()
+  # re-materialises it. setBackend() pulls the targeted EICs into RAM once (count_peaks/pick/plots then
+  # read from memory). chr_all stays Spectra-backed — only reports/panels re-chromExtract it, and it stays small.
   chr_eics <- setBackend(
     chromExtract(chr_all, peak_tbl, by = c("msLevel", "dataOrigin")),
     ChromBackendMemory())
@@ -388,15 +446,18 @@ extract_eics <- function(ms1, mz_par, mz_met,
 
 # ---- 4. peak pick (per file) + metrics + FWHM flag -----------------------
 
-# For each file: build the MS1-apex acceptance window (new_win), pick the dominant peak (pick),
-# gate it (detected_new) and apply the manual drop-list. Emits metrics_* with the SAME schema as
-# before (auc/fwhm/prominence/pkwidth/snr) PLUS a `detected` flag, the apex RT and point count, so
-# build_sample_table and 05 read one authoritative detection instead of re-deriving a shape rule.
-# count_peaks and the (wide) per-file EICs are kept as chr_*_narrow for dataset-report diagnostics.
-ROLE_COLS <- c("auc", "fwhm", "prominence", "pkwidth", "snr", "apex_rt", "npts", "detected")
+# Per file: build the acceptance window, pick the dominant peak, gate it (accept_peak), apply the drop-list.
+# metrics_* keep the auc/fwhm/prominence/pkwidth/snr schema PLUS a `detected` flag (+ apex RT, npts) so
+# build_sample_table and 05 read one authoritative detection. Wide per-file EICs kept as chr_*_narrow for reports.
+# gauss = MsQuality gaussian_similarity, recorded but never gated on (NA below 5 points).
+# msq_prom = MsQuality peakProminence, a peak-to-baseline ratio -- not the same quantity as
+# `prominence`, an absolute rise above the higher boundary, and not its threshold.
+ROLE_COLS <- c("auc", "fwhm", "prominence", "pkwidth", "snr", "apex_rt", "npts",
+               "gauss", "msq_prom", "detected")
 
 process_eics <- function(chr_par, chr_met, chr_all, dataset_id, cfg, conf, ov, drop_all,
                          is_hilic, files_base) {
+  RT_ANCHOR <- list()
   peaks_par <- count_peaks(chr_par)
   peaks_met <- count_peaks(chr_met)
   bare <- function(x) norm_file_key(to_bare_name(basename(as.character(x)), files_base))
@@ -405,9 +466,13 @@ process_eics <- function(chr_par, chr_met, chr_all, dataset_id, cfg, conf, ov, d
     files  <- basename(dataOrigin(chr))
     traces <- lapply(Chromatograms::peaksData(chr),
                      function(pd) list(rt = pd[, "rtime"], it = pd[, "intensity"]))
-    win    <- new_win(dataset_id, role_full, list(files = files, traces = traces),
-                      bare, old_win, conf, ov)
+    win    <- acceptance_window(dataset_id, role_full, list(files = files, traces = traces),
+                      bare, old_win, conf, ov, is_hilic)
+    RT_ANCHOR[[role]] <<- list(win = as.numeric(win),
+                               n_anchor_files = attr(win, "n_anchor_files"),
+                               uncertain = isTRUE(attr(win, "uncertain")))
     picks  <- lapply(traces, function(tr) pick(tr$rt, tr$it, win[1], win[2], is_hilic))
+    picks  <- add_msquality(chr, picks)
     keep   <- which(!vapply(picks, is.null, logical(1)))
     cols   <- paste0(role, "_", ROLE_COLS)
     if (!length(keep)) {
@@ -417,7 +482,7 @@ process_eics <- function(chr_par, chr_met, chr_all, dataset_id, cfg, conf, ov, d
     }
     pk <- picks[keep]; fl <- files[keep]
     det <- vapply(seq_along(pk), function(i)
-      detected_new(pk[[i]], is_hilic) &&
+      accept_peak(pk[[i]], is_hilic) &&
       !is_dropped(dataset_id, role_full, fl[i], drop_all), logical(1))
     m <- data.frame(
       file       = fl,
@@ -428,6 +493,9 @@ process_eics <- function(chr_par, chr_met, chr_all, dataset_id, cfg, conf, ov, d
       snr        = vapply(pk, function(p) p$snr,        numeric(1)),
       apex_rt    = vapply(pk, function(p) p$apex_rt,    numeric(1)),
       npts       = vapply(pk, function(p) as.integer(p$npts), integer(1)),
+      gauss      = vapply(pk, function(p) if (is.null(p$gauss)) NA_real_ else p$gauss, 0),
+      msq_prom   = vapply(pk, function(p)
+                     if (is.null(p$msq_prominence)) NA_real_ else p$msq_prominence, 0),
       detected   = det,
       stringsAsFactors = FALSE)
     stats::setNames(m, c("file", cols))
@@ -440,38 +508,34 @@ process_eics <- function(chr_par, chr_met, chr_all, dataset_id, cfg, conf, ov, d
 
   list(peaks_par = peaks_par, peaks_met = peaks_met,
        chr_par_narrow = chr_par, chr_met_narrow = chr_met,  # wide EICs serve dataset-report plots
-       metrics_par = metrics_par, metrics_met = metrics_met)
+       metrics_par = metrics_par, metrics_met = metrics_met,
+       rt_anchor = RT_ANCHOR)
 }
 
 # ---- 5. sample-table assembly --------------------------------------------
 
-# NOTE: to_bare_name() now lives in R/metadata.R, next to norm_file_key(), which
-# calls it. Keeping it here would make metadata.R depend on ms1.R being sourced
-# first, and several scripts source metadata.R alone.
+# NOTE: to_bare_name() lives in R/metadata.R next to norm_file_key() (which calls it); several scripts
+# source metadata.R alone, so it can't depend on ms1.R.
 
 build_sample_table <- function(metrics_par, metrics_met, files_base, meta,
                                dedup = TRUE) {
-  # dedup = TRUE  -> one row per subject (default; 05 clinical-group analyses,
-  #                  avoids pseudoreplication).
-  # dedup = FALSE -> one row per file, subject_id retained, so genotype /
-  #                  longitudinal / specimen analyses dedup themselves as needed
-  #                  (see 05's per-file table and 05-cyp-validation.qmd).
-  # Reconcile prefixed cache filenames to the bare bio_files names so the joins
-  # below match. Without this every metrics row misses and the dataset collapses
-  # to "neither".
-  metrics_par$file <- to_bare_name(metrics_par$file, files_base)
-  metrics_met$file <- to_bare_name(metrics_met$file, files_base)
-  sample_tbl <- merge(metrics_par, metrics_met, by = "file", all = TRUE)
-  sample_tbl <- merge(data.frame(file = files_base, stringsAsFactors = FALSE),
-                      sample_tbl, by = "file", all.x = TRUE)
+  # dedup = TRUE -> one row per subject (default; 05 clinical groups, avoids pseudoreplication).
+  # dedup = FALSE -> one row per file (subject_id retained) for genotype/longitudinal/specimen analyses.
+  # Merge on norm_file_key, never the bare name: some cache names carry the accession twice
+  # (MTBLS1866_1_MTBLS1866_DA44_p.mzML), which no bare-name match resolves. That silently
+  # demoted 19 detected files to "neither" before it was caught.
+  metrics_par$.k <- norm_file_key(to_bare_name(metrics_par$file, files_base))
+  metrics_met$.k <- norm_file_key(to_bare_name(metrics_met$file, files_base))
+  metrics_par$file <- NULL; metrics_met$file <- NULL
+  sample_tbl <- merge(metrics_par, metrics_met, by = ".k", all = TRUE)
+  sample_tbl <- merge(data.frame(file = files_base, .k = norm_file_key(files_base),
+                                 stringsAsFactors = FALSE),
+                      sample_tbl, by = ".k", all.x = TRUE)
+  sample_tbl$.k <- NULL
 
-  # Join the metadata on the NORMALISED key, not the raw name. A metadata source
-  # may spell the extension differently from the deposit: MSV000084008's submitter
-  # TSV lists "DM001_9_000_RD11_01_43875.mzXML" while the deposit holds the same
-  # file as ".mzML". Merging on the literal string matched 0 of 461 rows there, so
-  # subject_id, body_site and timepoint all silently became NA for the entire
-  # plasma cohort. norm_file_key drops the extension (and the accession), and
-  # matches 439.
+  # Join metadata on the NORMALISED key, not the raw name: a source may spell the extension differently
+  # (084008's submitter TSV says .mzXML, the deposit .mzML), so a literal merge matched 0/461 rows and
+  # left subject_id/body_site/timepoint NA for the whole cohort. norm_file_key drops extension+accession (439 match).
   sample_tbl$.k <- norm_file_key(sample_tbl$file)
   meta          <- meta[!duplicated(norm_file_key(meta$file)), , drop = FALSE]
   meta$.k       <- norm_file_key(meta$file)
@@ -479,9 +543,8 @@ build_sample_table <- function(metrics_par, metrics_met, files_base, meta,
   sample_tbl    <- merge(sample_tbl, meta, by = ".k", all.x = TRUE)
   sample_tbl$.k <- NULL
 
-  # Detection is decided once, in the picker (detected_new + the manual drop-list); metrics_*
-  # carry it as par_detected / met_detected. Files with no picked peak merge in as NA -> FALSE.
-  # The gate itself (chromatography-conditional) is documented in 03-all-datasets.qmd.
+  # Detection is decided once in the picker (accept_peak + drop-list); metrics_* carry par_detected/
+  # met_detected. Files with no picked peak merge in as NA -> FALSE. Gate documented in 03-all-datasets.qmd.
   par_detected <- sample_tbl$par_detected %in% TRUE
   met_detected <- sample_tbl$met_detected %in% TRUE
 
@@ -498,12 +561,16 @@ build_sample_table <- function(metrics_par, metrics_met, files_base, meta,
   # Per-file table (subject_id retained) when dedup is off.
   if (!dedup) return(as.data.frame(sample_tbl))
 
-  # Dedup to one file per subject by highest combined AUC. Fall back to
-  # sample_name then file when subject_id is NA, else all NA rows collapse to
-  # one group.
+  # Dedup to one file per subject by highest combined AUC. Fall back to sample_name then file when
+  # subject_id is NA, else all-NA rows collapse into one group.
+  # Take the key columns defensively: a metadata source can fail (the Workbench fetch is a
+  # network call) and hand back a frame with only `file`, in which case subject_id/sample_name
+  # are absent rather than NA and coalesce() dies on a zero-length vector.
+  col_or_na <- function(nm) if (nm %in% names(sample_tbl)) as.character(sample_tbl[[nm]])
+                            else rep(NA_character_, nrow(sample_tbl))
   sample_tbl$.dedup_key <- dplyr::coalesce(
-    as.character(sample_tbl$subject_id),
-    as.character(sample_tbl$sample_name),
+    col_or_na("subject_id"),
+    col_or_na("sample_name"),
     as.character(sample_tbl$file))
 
   sample_tbl |>
@@ -518,8 +585,7 @@ build_sample_table <- function(metrics_par, metrics_met, files_base, meta,
 
 # ---- 6. cross-dataset wrapper --------------------------------------------
 
-# Cross-dataset entry point. Resolves deposit_id, assay, m/z and RT windows
-# from the artifacts; the caller supplies only the dataset_id and three artifacts.
+# Cross-dataset entry point. Resolves deposit_id/assay/mz/RT windows from the artifacts; caller passes dataset_id + three artifacts.
 run_ms1_for_dataset <- function(dataset_id,
                                 conf_final,
                                 bio_files_per_ds,
@@ -548,8 +614,7 @@ run_ms1_for_dataset <- function(dataset_id,
 
   if (verbose) message("[", dataset_id, "] loading ", length(files),
                        " MS1 files …")
-  # For MetaboLights, pass the assay so same-basename pos/neg modes in separate
-  # assays are disambiguated at fetch time (ignored for non-MTBLS deposits).
+  # For MetaboLights, pass the assay so same-basename pos/neg modes are disambiguated at fetch time.
   ms1 <- load_spectra_ms1(deposit_id, files, assay = assay)
 
   if (verbose) message("[", dataset_id, "] extracting EICs …")
@@ -577,6 +642,10 @@ run_ms1_for_dataset <- function(dataset_id,
     deposit_id     = deposit_id,
     assay          = assay,
     cfg            = cfg,
+    # Per role: the window actually used, how many FILES anchored it, and whether the
+    # anchors were split between equally-supported retention times. A wide window with
+    # uncertain = TRUE is an unresolved anchor, not a confident wide peak.
+    rt_anchor      = proc$rt_anchor,
     chr_all        = eics$chr_all,
     chr_par        = eics$chr_par,
     chr_met        = eics$chr_met,
@@ -592,10 +661,7 @@ run_ms1_for_dataset <- function(dataset_id,
 
 # ===== EIC extraction (was eic.R) =====
 
-# R/eic.R — EIC extraction helpers
-
-# Compute a shared y-axis limit across all EICs in a Chromatograms object.
-# The 5% headroom prevents the apex from touching the plot border.
+# Shared y-axis limit across all EICs; 5% headroom keeps the apex off the border.
 eic_ylim <- function(chr) {
   ints <- unlist(intensity(chr), use.names = FALSE)
   c(0, max(ints, na.rm = TRUE) * 1.05)
@@ -603,12 +669,8 @@ eic_ylim <- function(chr) {
 
 # ===== peak detection + metrics (was peaks.R) =====
 
-# R/peaks.R — peak detection and EIC quality metrics
-
-# Count chromatographic peaks in each EIC using a local-maxima detector.
-# hws: half-window size in scans (a peak must be the maximum within ±hws
-# neighbours). pct_max: minimum height as a fraction of the trace maximum
-# (filters sub-noise wiggles).
+# Count peaks per EIC via a local-maxima detector. hws: half-window in scans (max within ±hws
+# neighbours). pct_max: min height as a fraction of the trace max (filters sub-noise wiggles).
 count_peaks <- function(chr, hws = 3L, pct_max = 0.1) {
   ints <- intensity(chr)
   vapply(ints, function(x) {
@@ -620,9 +682,8 @@ count_peaks <- function(chr, hws = 3L, pct_max = 0.1) {
   }, integer(1L))
 }
 
-# Flag files whose FWHM deviates more than 3 × MAD from the dataset median.
-# NA inputs (files with no detected peak) are treated as non-outliers so they
-# do not propagate into downstream sum() calls.
+# Flag files whose FWHM deviates > 3 × MAD from the dataset median. NA inputs (no detected peak)
+# count as non-outliers so they don't propagate into downstream sum() calls.
 flag_fwhm <- function(df, col) {
   v   <- df[[col]]
   med <- median(v, na.rm = TRUE)
@@ -633,16 +694,13 @@ flag_fwhm <- function(df, col) {
   flagged
 }
 
-# Report whether SIRIUS-confirmed files produced a detected peak. Confirmed
-# files are positive controls: a miss is a settings problem (ppm, RT window,
-# adduct), not biology. Extension-agnostic match — MassIVE often hosts the same
-# scan data as both .mzML and .mzXML, and submitter vs Pan-ReDU TSV can disagree.
+# Report whether SIRIUS-confirmed files produced a peak. They are positive controls: a miss is a
+# settings problem (ppm/RT/adduct), not biology. Extension-agnostic match (.mzML vs .mzXML re-deposits).
 check_confirmed <- function(files, n_peaks, conf_files, role) {
-  # Normalise both sides the way the rest of the pipeline does (drop our accession
-  # prefix, extension, case) so a naming difference is never mistaken for a miss.
-  key       <- function(x) tolower(sub("[.][^.]*$", "",
-                 sub("^(MSV[0-9]+|MTBLS[0-9]+|ST[0-9]+)[_-]", "", basename(x))))
-  idx       <- which(key(files) %in% key(conf_files))
+  # Canonical rule, not a private copy: a local one-prefix regex is what silently lost 21 of
+  # MTBLS1866's 23 anchors elsewhere. Both sides are cache-derived here, so they agree today,
+  # but the point is not to keep a second implementation that can drift.
+  idx <- which(norm_file_key(files) %in% norm_file_key(conf_files))
   cat(role, "- confirmed files loaded:", length(idx),
       "| with >=1 peak:", sum(n_peaks[idx] > 0), "\n")
 
@@ -651,135 +709,33 @@ check_confirmed <- function(files, n_peaks, conf_files, role) {
     cat("  WARNING missed:", paste(missed, collapse = ", "), "\n")
 }
 
-# ===== within-study stats (was within_stats.R) =====
-
-# R/within_stats.R — within-dataset descriptive + nonparametric tests on a
-# sample_tbl from build_sample_table(). Returns a list usable as a per-dataset
-# print-out (04) and as a row for the cross-dataset aggregation (05).
-#
-# Three tests, each guarded for n / group-count:
-#   - Fisher exact on parent presence (yes/no) x group
-#   - Fisher exact on metab  presence (yes/no) x group
-#   - Kruskal-Wallis on log2_ratio x group (both-tier only, FWHM-cleaned)
-# Censored cases (parent_only / metab_only) count as "present" in the Fisher
-# tests; they can't enter Kruskal-Wallis without a Tobit-style model (future work).
-
-within_dataset_stats <- function(sample_tbl, group_col = "health_status") {
+# Description, not inference: detection tier by group and the per-group ratio summary.
+# The per-dataset Fisher and Kruskal tests that used to live here tested files rather than
+# subjects, so their p-values estimated nothing. Contrast testing belongs in `05`, under
+# the analysis-unit rule.
+describe_by_group <- function(sample_tbl, group_col = "health_status") {
   if (!group_col %in% names(sample_tbl)) {
-    warning(group_col, " not in sample_tbl — skipping within-dataset stats")
+    warning(group_col, " not in sample_tbl - skipping group description")
     return(NULL)
   }
   g <- sample_tbl[[group_col]]
-  n_groups <- length(unique(g[!is.na(g)]))
-
-  parent_present <- !is.na(sample_tbl$par_auc)
-  metab_present  <- !is.na(sample_tbl$met_auc)
-
-  safe_fisher <- function(present) {
-    if (n_groups < 2) return(NULL)
-    tab <- table(present = present, group = g)
-    if (any(dim(tab) < 2)) return(NULL)
-    tryCatch(fisher.test(tab, simulate.p.value = TRUE),
-             error = function(e) NULL)
-  }
-
   both <- sample_tbl[sample_tbl$detection_tier == "both" &
                      !sample_tbl$par_fwhm_outlier %in% TRUE &
                      !sample_tbl$met_fwhm_outlier %in% TRUE, ]
-  both_g <- both[[group_col]]
-  both_n_groups <- length(unique(both_g[!is.na(both_g)]))
-
-  kruskal_ratio <- if (both_n_groups >= 2 && nrow(both) >= 5)
-    tryCatch(kruskal.test(both$log2_ratio ~ both_g),
-             error = function(e) NULL) else NULL
-
   per_group_ratio <- if (nrow(both) > 0)
     dplyr::group_by(both, .data[[group_col]]) |>
-    dplyr::summarise(
-      n          = dplyr::n(),
-      median_l2r = median(log2_ratio, na.rm = TRUE),
-      iqr_l2r    = stats::IQR(log2_ratio, na.rm = TRUE),
-      .groups    = "drop") else NULL
-
-  list(
-    group_col       = group_col,
-    detection_table = table(detection_tier = sample_tbl$detection_tier,
-                            group          = g,
-                            useNA          = "ifany"),
-    fisher_parent   = safe_fisher(parent_present),
-    fisher_metab    = safe_fisher(metab_present),
-    kruskal_ratio   = kruskal_ratio,
-    per_group_ratio = per_group_ratio
-  )
+    dplyr::summarise(n          = dplyr::n(),
+                     median_l2r = median(log2_ratio, na.rm = TRUE),
+                     iqr_l2r    = stats::IQR(log2_ratio, na.rm = TRUE),
+                     .groups    = "drop") else NULL
+  list(group_col       = group_col,
+       detection_table = table(detection_tier = sample_tbl$detection_tier,
+                               group = g, useNA = "ifany"),
+       per_group_ratio = per_group_ratio)
 }
 
-# Turn a within_dataset_stats() result into a short plain-English readout.
-# Returns a single markdown string; intended for a `results = "asis"` chunk.
-interpret_within_stats <- function(ws, alpha = 0.05) {
-  if (is.null(ws)) return("_No stratifier available — within-dataset stats skipped._")
-  gc <- ws$group_col
-
-  p_par <- if (!is.null(ws$fisher_parent)) ws$fisher_parent$p.value else NA
-  p_met <- if (!is.null(ws$fisher_metab))  ws$fisher_metab$p.value  else NA
-  p_kw  <- if (!is.null(ws$kruskal_ratio)) ws$kruskal_ratio$p.value else NA
-
-  sig <- function(p) !is.na(p) && p < alpha
-  fmt <- function(p) if (is.na(p)) "n/a" else signif(p, 2)
-
-  det_bits <- c()
-  if (!is.na(p_par))
-    det_bits <- c(det_bits, sprintf("parent detection %s %s (Fisher p = %s)",
-      if (sig(p_par)) "**is** associated with" else "is not associated with",
-      gc, fmt(p_par)))
-  if (!is.na(p_met))
-    det_bits <- c(det_bits, sprintf("metabolite detection %s %s (p = %s)",
-      if (sig(p_met)) "**is** associated with" else "is not associated with",
-      gc, fmt(p_met)))
-  det_sentence <- if (length(det_bits))
-    paste0("Presence/absence: ", paste(det_bits, collapse = "; "), ".")
-  else "Presence/absence: not testable (single group or no variation)."
-
-  ratio_sentence <- if (is.na(p_kw)) {
-    "Ratio: not enough `both`-tier samples across ≥2 groups for a Kruskal-Wallis test."
-  } else if (sig(p_kw)) {
-    sprintf("Ratio: log2(par/met) **differs** by %s among detected samples (Kruskal-Wallis p = %s).",
-            gc, fmt(p_kw))
-  } else {
-    sprintf("Ratio: among detected samples, log2(par/met) does not differ by %s (Kruskal-Wallis p = %s).",
-            gc, fmt(p_kw))
-  }
-
-  # Combined-pattern note when detection is group-linked but ratio is not
-  note <- if (sig(p_par) && !is.na(p_kw) && !sig(p_kw))
-    paste0(" Whether the drug is present tracks the clinical grouping, ",
-           "but the CYP2C19 ratio in those who carry it does not — ",
-           "consistent with prescription pattern (who is on a PPI) driving ",
-           "detection, while the metaboliser phenotype is independent of it.")
-  else ""
-
-  paste0("**Interpretation.** ", det_sentence, " ", ratio_sentence, note)
-}
-
-# Run within_dataset_stats() for every stratifier the sample_tbl supports,
-# health_status first (primary clinical group), then the others per
-# usable_stratifiers(). Returns a named list keyed by stratifier; empty if none.
-within_dataset_stats_multi <- function(sample_tbl) {
-  primary <- "health_status"
-  cols <- if (primary %in% names(sample_tbl))
-            c(primary, usable_stratifiers(sample_tbl, exclude = primary))
-          else
-            usable_stratifiers(sample_tbl, exclude = character(0))
-  if (!length(cols)) return(list())
-  out <- vector("list", length(cols))
-  names(out) <- cols
-  for (gc in cols) out[[gc]] <- within_dataset_stats(sample_tbl, group_col = gc)
-  out
-}
-
-# Which canonical fields are usable as stratifiers: categorical, present, with
-# >= min_levels distinct values each backed by >= min_per_level samples.
-# `exclude` drops fields handled elsewhere (health_status by default).
-# subject_id / sample_name / file are never stratifiers; age is continuous.
+# Canonical fields usable as stratifiers: categorical, present, >= min_levels values each backed by
+# >= min_per_level samples. `exclude` drops fields handled elsewhere; id/name/file/age never qualify.
 usable_stratifiers <- function(sample_tbl, exclude = "health_status",
                                min_levels = 2L, min_per_level = 3L) {
   cand <- intersect(c("sex", "group", "country", "body_site", "treatment"),
@@ -798,12 +754,8 @@ usable_stratifiers <- function(sample_tbl, exclude = "health_status",
 
 # ===== plots (was plots.R) =====
 
-# R/plots.R — shared plotting functions
-
-# Plot EICs for FWHM-outlier files alongside a reference EIC (the file closest
-# to the median FWHM). A genuine outlier looks deformed vs the reference (double
-# apex, asymmetric tail, broad shoulder, noisy baseline); if it looks similar,
-# the flag is a false alarm and the file should stay in the ratio.
+# Plot FWHM-outlier EICs alongside a reference (the file nearest the median FWHM). A genuine outlier
+# looks deformed vs the reference; if it looks similar the flag is a false alarm and the file stays in.
 plot_fwhm_outliers <- function(chr, metrics, prefix, role_label) {
   oc        <- paste0(prefix, "_fwhm_outlier")
   fc        <- paste0(prefix, "_fwhm")

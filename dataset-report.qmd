@@ -325,13 +325,11 @@ if ("health_status" %in% names(sample_tbl) &&
 ```
 
 ```{r hs-stats}
-ws <- within_dataset_stats(sample_tbl, group_col = "health_status")
+# Description only. The per-dataset p-values that used to appear here tested files rather
+# than subjects, so they estimated nothing; `05` runs the contrasts under the unit rule.
+ws <- describe_by_group(sample_tbl, group_col = "health_status")
 ws$detection_table
-```
-
-```{r hs-interpret}
-#| results: asis
-cat(interpret_within_stats(ws))
+ws$per_group_ratio
 ```
 
 ```{r hs-ratio}
@@ -372,19 +370,15 @@ if (!length(extra)) {
     "## Stratified by `%1$s`",
     "",
     "```{r}",
-    "ws_x <- within_dataset_stats(sample_tbl, group_col = \"%1$s\")",
+    "ws_x <- describe_by_group(sample_tbl, group_col = \"%1$s\")",
     "ws_x$detection_table",
+    "ws_x$per_group_ratio",
     "```",
     "",
     "```{r}",
     "#| fig-width: 6.5",
     "#| fig-height: 4",
     "print(tier_bar(sample_tbl, \"%1$s\"))",
-    "```",
-    "",
-    "```{r}",
-    "#| results: asis",
-    "cat(interpret_within_stats(ws_x))",
     "```",
     "", sep = "\n")
   for (f in extra)

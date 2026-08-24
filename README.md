@@ -141,35 +141,45 @@ flowchart TD
 
 | stage | qmd | what it produces |
 |---|---|---|
-| 0 | `00-onboarding.qmd` | fetches the pinned per-deposit metadata and standardises it to `artifacts/rescue_samples.csv` + `rescue_dataset_constants.csv` (run first) |
 | 1 | `01-masst-curation.qmd` | `hits_curated.csv` (every MASST hit in a kept dataset); `dataset_metadata_table.csv` (one row per kept dataset, canonical-field mappings + paper-derived constants) |
 | 2 | `confirmation/massIVE-hit-confirmation.qmd` · `confirmation/metaboLights-confirmation.qmd` · `confirmation/metabolomics-workbench-confirmation.qmd` → `02-confirmation-and-bio-files.qmd` | SIRIUS-confirmed features (filtered, RT/mz diagnostics) and per-dataset biological file lists |
 | 3 | `03-all-datasets.qmd` (cross-dataset loop, cross-dataset summary) and `dataset-report.qmd` (per-dataset HTML deep dive — extraction config, EIC overlays, peak detection, "Neither" inspection, FWHM outliers, PCA, detection tiers, within-study stats; rendered from `03` with `-P render_reports:true`) | per-file `detection_tier` + `log2_ratio`, per-dataset within-stats, per-dataset HTML reports |
-| 4 | `04-meta-analysis.qmd` | pooled cross-cohort effect sizes (Hedges' g, log-OR), random-effects τ²/I², Tobit censored-ratio handling, Chagas HILIC ↔ RP cross-chromatography calibration |
-| 5 | `05-cyp-validation.qmd` | the omeprazole / 5-OH ratio against the genotyped CYP2C19 phenotype in the Jarmusch/Tsunoda probe cohort (ground-truth check) |
+| 4 | `04-cyp-validation.qmd` | the omeprazole / 5-OH ratio against the genotyped CYP2C19 phenotype in the Jarmusch/Tsunoda probe cohort (ground-truth check that licenses the corpus expansion) |
+| 5 | `05-meta-analysis.qmd` | Part A: MS2 → MS1 detection-rate (prevalence) expansion per cohort, presence-based so isomer-immune, plus the per-deposit contrast scan under the analysis-unit rule. Part B: the quantitative strand and its limits — the per-deposit offset is mostly matrix rather than instrument, and no ratio contrast survives FDR anywhere. |
 
 ---
 
 ## Current state
 
 > [!NOTE]
-> **Headline results (settled 2026-07-21).**
-> - **MS1 propagation gain** — against an uncapped MASST-hit baseline, over
->   distinct annotated files: omeprazole **280 → 1,115 (4.0×)**, 5-OH
->   **367 → 1,176 (3.2×)**. The gain is largest exactly where DDA
->   under-sampled (thin-MS2 cohorts 10–24×) and near 1× where MASST already
->   fragmented everything (the dosed probe cohort, 1.4×). Only **3 files**
->   corpus-wide carry a confirmed MS2 hit with no MS1 detection, so the tight
->   RT window costs essentially no confirmed signal.
+> **Headline results (settled 2026-08-03).** The story is *validate then
+> expand*: reproduce the probe study's ratio at MS1, validate it against the
+> genotype the authors never tested (`04`), then demonstrate corpus-scale
+> propagation (`05`).
 > - **CYP2C19 validation** — the per-subject **AUC** of parent/metabolite over
->   the dosing interval tracks genotyped phenotype at **Spearman ρ = −0.80,
->   p = 0.0006** (MSV000084008 plasma, 14 subjects), monotonic across all five
->   phenotype classes and robust to leave-one-subject-out (all p ≤ 0.0035).
+>   the dosing interval tracks genotyped phenotype at **Spearman ρ = −0.756,
+>   p = 0.0018** (MSV000084008 plasma, 14 subjects), monotonic across all five
+>   phenotype classes and robust to leave-one-subject-out (all p ≤ 0.0063).
 >   The earlier single-timepoint ratio on the *same* data gave p = 0.51;
 >   integrating to an AUC is the entire difference. Genotype is external to the
 >   mass spec, and the AUC is built mostly from MS1-propagated peaks — so this
 >   is a genuine validation of the pipeline. Limits: n = 14, one cohort, three
 >   classes have a single subject.
+> - **MS1 propagation gain** — measured against the MASST MS2 baseline over the same
+>   4,668 metadata-carrying files (`05` Part A): omeprazole **280 → 526 (×1.88)**,
+>   5-OH **367 → 542 (×1.48)**, and files supporting a **usable ratio 223 → 470
+>   (×2.11)**. The gain is largest where DDA under-sampled (MSV000094097 gains its
+>   first usable ratio, 0 → 18) and smallest in the dosed cohort, where fragmentation
+>   already caught nearly everything. No deposit now goes backwards. **Do not quote
+>   the old "159 seeds → 626 (×3.9)"** (two different denominators) or the
+>   "436 → 666 / 519 → 732" pair, which predates the uncapped confirmation.
+> - **Propagation controls** — the **positive control re-detects 768 of 771**
+>   extracted files carrying a SIRIUS-confirmed spectrum (parent 338/338, metabolite
+>   430/433), and the **negative control is empty**: 0 of 49 pre-dose plasma draws,
+>   and 0 of 49 at five minutes. **Synthetic decoys were dropped** — in an untargeted
+>   file a real compound can sit at the decoy mass, so a hit there bounds the
+>   false-positive rate from above without estimating it. Never quote the old
+>   "0 of 30,042" decoy numbers.
 >
 > The **isobaric-interference** problem that once inverted the ratio is fixed.
 > The metabolite RT window admitted **omeprazole sulfone** (`C17H19N3O4S`,
@@ -179,19 +189,19 @@ flowchart TD
 > unaffected; the presence/gain results rest on the parent, which has no
 > isobaric twin.
 >
-> A rendered summary deck lives in `reverse-met-pipeline-results.pptx`
+> A rendered summary deck lives in `deck/reverse-met-pipeline-results.pptx`
 > (regenerate with `python deck/build_deck.py`); per-stage timing is in
-> [`docs/pipeline-timing.md`](docs/pipeline-timing.md).
+> `docs/pipeline-timing.md` (both `deck/` and `docs/` are local, git-ignored).
 
 | | |
 |---|---|
 | FASSTrecords extraction | DOI 10.5281/zenodo.18199544 · 128 datasets with a hit · **44 with both compounds** |
-| After curation (`01`) | **15 (deposit, assay) entities** kept; 8,547 MASST hits carried forward; spanning UK, Italy, China, India, USA, Venezuela |
+| After curation (`01`) | **15 (deposit, assay) entities** kept; 9,243 MASST hits carried forward; spanning UK, Italy, China, India, USA, Venezuela |
 | Excluded with audit trail | dropped deposits categorised as `no_or_limited_metadata`, `access_restricted`, `dia`, `in_vitro`, `non_human`, `reference_material`, or `no_assay_with_both_roles` (see `other_exclusions` in `01`) |
-| After SIRIUS confirmation (`02`) | **12 datasets** survive; 241 confirmed features (124 metabolite + 117 parent). MSV000086975 and MSV000085256 rejected: SIRIUS calls their spectra fluorinated, sulfur-free formulas (e.g. `C17H16FN3O4`, `C14H16F3N4O3`), not omeprazole. Working as intended. |
+| After SIRIUS confirmation (`02`) | **12 datasets** survive; 7,201 confirmed features after uncapping SIRIUS (the earlier 241 was a per-role cap, not a limit of the data). MSV000086975 and MSV000085256 rejected: SIRIUS calls their spectra fluorinated, sulfur-free formulas (e.g. `C17H16FN3O4`, `C14H16F3N4O3`), not omeprazole. Working as intended. |
 | All-datasets loop (`03`) | runs the per-dataset EIC → peak → ratio pipeline across every confirmed dataset; writes the deduped `sample_table_all.csv`, and the per-file `sample_table_perfile.csv`. Per-dataset detail lives in one HTML per dataset, rendered from `dataset-report.qmd` by re-rendering `03` with `-P render_reports:true` |
-| Meta-analysis (`04`) | pools per-study Δ log₂(par/met) via random-effects (REML); Chagas HILIC ↔ RP cross-chromatography calibration is the one direct test of response-factor cancellation |
-| CYP2C19 ground-truth (`05`) | **validated.** The probe cohort (Jarmusch/Tsunoda, PMC7485946) is a two-period crossover in 14 healthy subjects dosed a CYP probe cocktail on days 1 and 9 with cefprozil in between; omeprazole is its CYP2C19 probe. Reconstructing the **per-subject AUC** of parent/metabolite across the serial PK timepoints (recovered from the submitter metadata) and correlating it against the genotyped phenotype gives **ρ = −0.80, p = 0.0006**, monotonic across all five phenotype classes, robust to leave-one-out. The genotype is external to the mass spec and the AUC is built mostly from MS1-propagated peaks, so this validates the pipeline end-to-end. The single-timepoint ratio on the same data was null (p = 0.51) — the AUC is what makes it work. Limits: n = 14, one cohort, and three phenotype classes (Poor / Rapid / Ultrarapid) have a single subject each, so it is a strong proof-of-concept, not a powered epidemiological result. |
+| CYP2C19 ground-truth (`04`) | **validated.** The probe cohort (Jarmusch/Tsunoda, PMC7485946) is a two-period crossover in 14 healthy subjects dosed a CYP probe cocktail on days 1 and 9 with cefprozil in between; omeprazole is its CYP2C19 probe. Reconstructing the **per-subject AUC** of parent/metabolite across the serial PK timepoints (recovered from the submitter metadata) and correlating it against the genotyped phenotype gives **ρ = −0.756, p = 0.0018**, monotonic across all five phenotype classes, robust to leave-one-out (all p ≤ 0.0063). The genotype is external to the mass spec and the AUC is built mostly from MS1-propagated peaks, so this validates the pipeline end-to-end. The single-timepoint ratio on the same data was null (p = 0.51) — the AUC is what makes it work. Limits: n = 14, one cohort, and three phenotype classes (Poor / Rapid / Ultrarapid) have a single subject each, so it is a strong proof-of-concept, not a powered epidemiological result. |
+| Meta-analysis (`05`) | Part A expands the classic reverse-metabolomics prevalence analysis (MS2 vs MS1 detection rate per compound per cohort, presence-based so isomer-immune) and adds the per-deposit contrast scan: propagation takes testable contrasts 33 → 48 and survivors at FDR 0.05 from 5 → 11, losing none. Part B is the quantitative strand: no ratio contrast survives FDR in any deposit, and the variance decomposition shows the cross-deposit offset is body site (37.9%) far more than study (2.9%). It deliberately does not pool an absolute ratio into one estimate. |
 
 The audit trail for every curation decision is in git: the
 `other_exclusions` tibble in `01`, the inline citation comments on
@@ -213,7 +223,8 @@ quarto::quarto_render("01-masst-curation.qmd")
 quarto::quarto_render("02-confirmation-and-bio-files.qmd")
 quarto::quarto_render("03-all-datasets.qmd")
 # quarto render 03-all-datasets.qmd -P render_reports:true   # per-dataset HTMLs
-quarto::quarto_render("04-meta-analysis.qmd")
+quarto::quarto_render("04-cyp-validation.qmd")   # validate on the ground-truth cohort
+quarto::quarto_render("05-meta-analysis.qmd")    # then expand across the corpus
 ```
 
 The first render of `01` will auto-fetch MTBLS / ST / Pan-ReDU
@@ -234,16 +245,15 @@ The pipeline documents in execution order:
 
 | document | description | reads | writes |
 |---|---|---|---|
-| `00-onboarding.qmd` | Fetch pinned per-deposit metadata (tagged GitHub commit / Pan-ReDU / MetaboLights ISA-Tab), standardise to one per-sample schema | `dataset_metadata/*` (re-fetched if absent) | `artifacts/rescue_samples.csv`, `artifacts/rescue_dataset_constants.csv`, `artifacts/MSV000082493_samples.csv` |
 | `01-masst-curation.qmd` | FASSTrecords discovery (skips without the DB), load MASST exports, hard-stop + manual exclusion, per-assay refinement, harvest tech + biological metadata | FASSTrecords DB (optional), `StructureMASST_output/*.csv`, `dataset_metadata/*` | `StructureMASST_output/fasstrecords_hits.csv` (discovery), `artifacts/hits_curated.csv`, `artifacts/dataset_metadata_table.csv` |
 | `confirmation/massIVE-hit-confirmation.qmd` | SIRIUS confirmation for MassIVE datasets | `artifacts/hits_curated.csv`, `sirius_projects/MSV*/` | `artifacts/hits-confirmed-massive.csv`, `results/MSV*/` |
 | `confirmation/metaboLights-confirmation.qmd` | SIRIUS confirmation for MetaboLights datasets | `artifacts/hits_curated.csv`, `sirius_projects/MTBLS*/` | `artifacts/hits-confirmed-metaboLights.csv`, `results/MTBLS*/` |
 | `confirmation/metabolomics-workbench-confirmation.qmd` | SIRIUS confirmation for Workbench datasets | `artifacts/hits_curated.csv`, `sirius_projects/ST*/` | `artifacts/hits-confirmed-metabolomics-workbench.csv`, `results/ST*/` |
 | `02-confirmation-and-bio-files.qmd` | Combine confirmed features, filter cascade, RT/m/z diagnostics, per-repository biological file selection | `artifacts/hits-confirmed-*.csv`, `artifacts/dataset_metadata_table.csv`, `dataset_metadata/` | `artifacts/hits-confirmed-all.csv`, `artifacts/datasets-confirmed.csv`, `artifacts/bio_files_per_ds.rds`, `artifacts/bio_assays_per_ds.rds` |
-| `03-all-datasets.qmd` | Per-dataset EIC → peak → ratio pipeline, looped over every kept dataset; cross-dataset summary plots | `artifacts/*.csv`, `artifacts/*.rds` | `artifacts/sample_table_all.csv`, `artifacts/within_stats_summary.csv` (per-dataset caches already written under `artifacts/per_dataset/` by the extraction step) |
+| `03-all-datasets.qmd` | Per-dataset EIC → peak → ratio pipeline, looped over every kept dataset; cross-dataset summary plots | `artifacts/*.csv`, `artifacts/*.rds` | `artifacts/sample_table_all.csv`, `artifacts/sample_table_perfile.csv` (per-dataset caches already written under `artifacts/per_dataset/` by the extraction step) |
 | `dataset-report.qmd` (parameterised template; rendered once per dataset by `03` when `render_reports:true`) | Per-dataset deep dive HTML — extraction config, EIC overlays, peak detection + positive-control check, "Neither" EIC inspection, FWHM outliers, PCA, detection-tier breakdown, within-study stratifier stats | `artifacts/per_dataset/<dataset_id>.rds` | `reports/report-<dataset_id>.html` |
-| `04-meta-analysis.qmd` | Pool per-study Δ log₂(par/met) via random-effects (REML); Hedges' g and log-OR outcomes; subgroup by chromatography / body_site / country; Chagas HILIC↔RP cross-chromatography calibration; Tobit-style censored handling; mixed-effects alternative | `artifacts/sample_table_all.csv`, `artifacts/datasets-confirmed.csv` | `artifacts/meta_effects.csv`, `artifacts/meta_rma.rds`, plots |
-| `05-cyp-validation.qmd` | CYP2C19 ground-truth: omeprazole / 5-OH ratio vs the genotyped phenotype in the Jarmusch/Tsunoda probe cohort (stem-join to the genotype table); file- and subject-level tests, plasma vs non-plasma | `artifacts/rescue_samples.csv`, `artifacts/per_dataset/*.rds` | figures + tables (inline) |
+| `04-cyp-validation.qmd` | CYP2C19 ground-truth: omeprazole / 5-OH ratio vs the genotyped phenotype in the Jarmusch/Tsunoda probe cohort (stem-join to the genotype table); file- and subject-level tests, plasma vs non-plasma | `artifacts/rescue_samples.csv`, `artifacts/per_dataset/*.rds` | figures + tables (inline) |
+| `05-meta-analysis.qmd` | Part A: per-file MS2 vs MS1 detection prevalence per compound per cohort (presence-based, isomer-immune) and the per-deposit contrast scan. Part B: the quantitative strand and its limits; duplicate/collision audit; Chagas HILIC↔RP paired look (underpowered, deliberately not tested). Absolute-ratio pooling is described, not run | `artifacts/sample_table_all.csv`, `artifacts/sample_table_perfile.csv`, `artifacts/hits_curated.csv`, `artifacts/datasets-confirmed.csv` | `artifacts/meta_effects.csv`, plots |
 
 ### R helper library
 
@@ -273,7 +283,6 @@ All intermediate files go here; nothing writes to the repo root.
 | `bio_files_per_ds.rds` | `02` | `03` |
 | `bio_assays_per_ds.rds` | `02` | `03` |
 | `sample_table_all.csv` | `03` | `04` |
-| `within_stats_summary.csv` | `03` | `04` |
 | `per_dataset/<dataset_id>.rds` | extraction step | `dataset-report.qmd`, `05` |
 
 ### curation/
@@ -291,12 +300,12 @@ Read by `R/ms1.R` (extraction) and `R/peak_review_panels.R` (audit panels).
 ### dataset_metadata/
 
 Flat directory of cached native metadata files — **git-ignored** (regenerated by
-`00-onboarding.qmd` + `R/metadata.R` from pinned sources; a fresh clone re-fetches
+`01-masst-curation.qmd` + `R/metadata.R` from pinned sources; a fresh clone re-fetches
 them, so nothing here is committed). Patterns + sources:
 
 | pattern | source | how it gets cached |
 |---|---|---|
-| `MSV*_metadata.{tsv,csv}` | MassIVE deposit (submitter-supplied) | downloaded / pinned-fetched (082493, 084008 via `00-onboarding.qmd`); cached on disk, git-ignored |
+| `MSV*_metadata.{tsv,csv}` | MassIVE deposit (submitter-supplied) | downloaded / pinned-fetched (082493, 084008 via `01-masst-curation.qmd`); cached on disk, git-ignored |
 | `MSV*_panredu.tsv` | GNPS2 Pan-ReDU | auto-fetched by `fetch_panredu_metadata()` from `https://redu.gnps2.org/...`; cached locally |
 | `MTBLS*_i_Investigation.txt` | MetaboLights ISA-Tab | auto-fetched from EBI FTP on first `mtbls_inv_assay_names()` call |
 | `a_MTBLS*_*.txt` | MetaboLights ISA-Tab assay file | auto-fetched on first `fetch_assay_table()` call |
