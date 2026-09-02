@@ -34,8 +34,8 @@ compose into a turnkey pipeline that:
   `MsQuality`, and produces a uniform per-file readout
   (`detection_tier`, `log2_ratio`, FWHM-outlier flag) across every
   dataset (`dataset-report.qmd`, `03`);
-- supports per-dataset within-study contrasts now and is structured
-  to accept a future cross-dataset meta-analysis layer (`04`).
+- supports per-dataset within-study contrasts and the cross-dataset
+  presence meta-analysis built on them (`05`).
 
 The pipeline is designed to be lifted onto **any
 parent–metabolite-pair question** that public MS/MS data can address —
@@ -135,8 +135,8 @@ flowchart TD
     D["SIRIUS confirmation<br>(per-repository notebooks)<br>formula + structure ranks → confidence tier"] --> E
     E["Confirmation summary + biological file selection<br>(02)<br>filter cascade · RT/mz diagnostics · per-dataset bio files"] --> F
     F["MS1 EIC → peak → ratio<br>(03 + per-dataset HTML reports)<br>per-file log2(par/met) + censored tiers · dataset-report.qmd"] --> G
-    G["Meta-analysis<br>(04)<br>pooled effect size · between-cohort heterogeneity · Chagas HILIC↔RP calibration"] --> H
-    H["CYP2C19 ground-truth<br>(05)<br>ratio vs genotyped phenotype · Jarmusch/Tsunoda probe cohort"]
+    G["CYP2C19 ground-truth<br>(04)<br>per-subject AUC ratio vs genotyped phenotype · Jarmusch/Tsunoda probe cohort"] --> H
+    H["Meta-analysis<br>(05)<br>MS2 vs MS1 prevalence per cohort · per-deposit contrast scan · variance decomposition"]
 ```
 
 | stage | qmd | what it produces |
@@ -166,9 +166,9 @@ flowchart TD
 >   is a genuine validation of the pipeline. Limits: n = 14, one cohort, three
 >   classes have a single subject.
 > - **MS1 propagation gain** — measured against the MASST MS2 baseline over the same
->   4,668 metadata-carrying files (`05` Part A): omeprazole **280 → 526 (×1.88)**,
->   5-OH **367 → 542 (×1.48)**, and files supporting a **usable ratio 223 → 470
->   (×2.11)**. The gain is largest where DDA under-sampled (MSV000094097 gains its
+>   4,668 metadata-carrying files (`05` Part A): omeprazole **280 → 419 (×1.50)**,
+>   5-OH **367 → 541 (×1.47)**, and files supporting a **usable ratio 223 → 367
+>   (×1.65)**. The gain is largest where DDA under-sampled (MSV000094097 gains its
 >   first usable ratio, 0 → 18) and smallest in the dosed cohort, where fragmentation
 >   already caught nearly everything. No deposit now goes backwards. **Do not quote
 >   the old "159 seeds → 626 (×3.9)"** (two different denominators) or the
@@ -201,7 +201,7 @@ flowchart TD
 | After SIRIUS confirmation (`02`) | **12 datasets** survive; 7,201 confirmed features after uncapping SIRIUS (the earlier 241 was a per-role cap, not a limit of the data). MSV000086975 and MSV000085256 rejected: SIRIUS calls their spectra fluorinated, sulfur-free formulas (e.g. `C17H16FN3O4`, `C14H16F3N4O3`), not omeprazole. Working as intended. |
 | All-datasets loop (`03`) | runs the per-dataset EIC → peak → ratio pipeline across every confirmed dataset; writes the deduped `sample_table_all.csv`, and the per-file `sample_table_perfile.csv`. Per-dataset detail lives in one HTML per dataset, rendered from `dataset-report.qmd` by re-rendering `03` with `-P render_reports:true` |
 | CYP2C19 ground-truth (`04`) | **validated.** The probe cohort (Jarmusch/Tsunoda, PMC7485946) is a two-period crossover in 14 healthy subjects dosed a CYP probe cocktail on days 1 and 9 with cefprozil in between; omeprazole is its CYP2C19 probe. Reconstructing the **per-subject AUC** of parent/metabolite across the serial PK timepoints (recovered from the submitter metadata) and correlating it against the genotyped phenotype gives **ρ = −0.756, p = 0.0018**, monotonic across all five phenotype classes, robust to leave-one-out (all p ≤ 0.0063). The genotype is external to the mass spec and the AUC is built mostly from MS1-propagated peaks, so this validates the pipeline end-to-end. The single-timepoint ratio on the same data was null (p = 0.51) — the AUC is what makes it work. Limits: n = 14, one cohort, and three phenotype classes (Poor / Rapid / Ultrarapid) have a single subject each, so it is a strong proof-of-concept, not a powered epidemiological result. |
-| Meta-analysis (`05`) | Part A expands the classic reverse-metabolomics prevalence analysis (MS2 vs MS1 detection rate per compound per cohort, presence-based so isomer-immune) and adds the per-deposit contrast scan: propagation takes testable contrasts 33 → 48 and survivors at FDR 0.05 from 5 → 11, losing none. Part B is the quantitative strand: no ratio contrast survives FDR in any deposit, and the variance decomposition shows the cross-deposit offset is body site (37.9%) far more than study (2.9%). It deliberately does not pool an absolute ratio into one estimate. |
+| Meta-analysis (`05`) | Part A expands the classic reverse-metabolomics prevalence analysis (MS2 vs MS1 detection rate per compound per cohort, presence-based so isomer-immune) and adds the per-deposit contrast scan: propagation takes testable contrasts 33 → 48 and survivors at FDR 0.05 from 5 → 11, losing none. Part B is the quantitative strand: no ratio contrast survives FDR in any deposit, and the variance decomposition puts the cross-deposit offset at body site 19.9% against study 5.2%, with 74.9% residual — body site dominates, but the bootstrap intervals over studies overlap, so the honest reading is that the study term is small rather than absent. It deliberately does not pool an absolute ratio into one estimate. |
 
 The audit trail for every curation decision is in git: the
 `other_exclusions` tibble in `01`, the inline citation comments on
@@ -265,7 +265,7 @@ files it needs.
 | `R/_setup.R` | `library()` calls for all packages; creates `artifacts/` |
 | `R/masst.R` | `infer_adduct()`, `ADDUCT_CANDIDATES`; `compound_spec` + `role_formula` (the probe pair — swap here for another parent/metabolite pair) and `PHENO`, the CYP2C19 activity order the validation regresses on |
 | `R/metadata.R` | metadata reconciliation + file selection: `fetch_panredu_metadata()`, `msv_native_sample_table()` (full outer join of Pan-ReDU + submitter, validated against `massive_list_files()`), `norm_file_key()` / `to_bare_name()` (cross-source name matching), `load_metadata()`, `select_bio_files_massive()`, `is_missing_val()` |
-| `R/ms1.R` | MS1 pipeline: `load_spectra_ms1()`, `derive_extraction_config()`, `extract_eics()`, the peak picker (`pick()`, `detected_new()`, `new_win()`, `is_dropped()`), `process_eics()`, `build_sample_table()`, `run_ms1_for_dataset()`, `count_peaks()`, `flag_fwhm()`, `within_dataset_stats()`, `plot_fwhm_outliers()`; and `ablation_setup()` / `ablation_variant()` / `ablation_isobars()`, which re-run the extraction from the cached EICs with one choice changed so `03` can price each decision |
+| `R/ms1.R` | MS1 pipeline: `load_spectra_ms1()`, `derive_extraction_config()`, `extract_eics()`, the peak picker (`pick()`, `accept_peak()`, `acceptance_window()`, `is_dropped()`), `resolve_isobars()`, `process_eics()`, `build_sample_table()`, `run_ms1_for_dataset()`, `count_peaks()`, `flag_fwhm()`, `plot_fwhm_outliers()`; and `ablation_setup()` / `ablation_variant()` / `ablation_isobars()`, which re-run the extraction from the cached EICs with one choice changed so `03` can price each decision |
 | `R/peak_review_panels.R` | manual-audit tool (run standalone): re-picks from the cached wide EICs and writes per-dataset review panels + the single-threaded extraction-timing log `peaks_review_v2/_extract_times.csv` that `03`'s runtime table reads |
 
 ### bench/
@@ -372,11 +372,12 @@ stratify or weight by tier in the meta-analysis layer.
 | `metab_only` | no | yes | left-censored (poor-metaboliser absent) |
 | `neither` | no | no | sample contributes nothing |
 
-The Fisher tests in `within_dataset_stats()` use `parent_only` and
-`metab_only` as detected for the relevant role (no imputation, no
-forced-ratio fallback). The Kruskal-Wallis ratio test uses `both`
-only. Proper joint modelling of the censored cases is the
-meta-analysis layer's job.
+`R/ms1.R::describe_by_group()` only describes these tiers — a detection
+table and per-group ratio medians, no testing. The presence tests live in
+`05` and count `parent_only` / `metab_only` as detected for the relevant
+role (no imputation, no forced-ratio fallback); ratio comparisons use
+`both` only. Proper joint modelling of the censored cases is not
+attempted anywhere, and `05` Part B says why.
 
 **Exclusion vocabulary** (in `other_exclusions` in `01`):
 
@@ -426,8 +427,8 @@ the current corpus.
 >    them) or because they are a *collision* (MSV000092754 HILIC vs
 >    MSV000092757 RP: same names, different data — keep apart). Only comparing
 >    extracted values tells the two cases apart. See
->    `msv_native_sample_table()` and the "One study, two accessions" section of
->    `04`.
+>    `msv_native_sample_table()` and the "one study, two accessions" appendix of
+>    `05`.
 >
 > That a public-data pipeline must reconcile three independent, individually
 > incomplete things — spectral hits, the file inventory, and every metadata
@@ -496,7 +497,7 @@ submitter is **gap-fill** for per-subject metadata. Joining is done by
 
 ### The trade-off, made explicit
 
-- **Wins.** No silent sync failures (MSV000095143 now actually runs). Correct extensions everywhere. Pan-ReDU SampleType column gives a uniform QC filter. The Chagas HILIC ↔ RP calibration in `04` §3b is tractable because the 79 codigo-tagged subjects per deposit are correctly identified.
+- **Wins.** No silent sync failures (MSV000095143 now actually runs). Correct extensions everywhere. Pan-ReDU SampleType column gives a uniform QC filter. The Chagas pair is correctly identified down to its 79 codigo-tagged subjects per deposit. (The HILIC ↔ RP calibration those subjects were meant to support was tried and abandoned: only five subjects carry a ratio on both methods, r = 0.23, p = 0.71. `05` Part B records it as underpowered rather than testing it.)
 - **Losses.** For deposits where the submitter is more populated than Pan-ReDU on a given canonical column (e.g. MSV000094097's `AgeInYears`), we lose some submitter information when the join conflicts on a shared column name. For Chagas, the ~85 codigo-untagged bio files per deposit don't get `sero_final` and can't be stratified by infection status — they contribute to the dataset's overall ratio distribution but not to the group-comparison statistics.
 - **Mitigation path (not yet implemented).** Where filenames embed identifiers (the Chagas pattern `pos_inf_non_<codigo>_<Sex>_<Age>_<batch>` is the canonical example), a per-deposit regex extractor would rescue the missing subject info for the untagged files. This is study-specific code; it would belong in `R/metadata.R` as a per-deposit hook, invoked from `msv_native_sample_table()` after the stem join.
 
