@@ -63,21 +63,24 @@ _*_tmp.R
 *.mzML
 *.mzXML
 *.raw
-docs/TODO.md
-/docs
 
-# ── LaTeX build products (thesis/preview.pdf is the only kept output) ────
-thesis/*.aux
-thesis/*.bbl
-thesis/*.bcf
-thesis/*.blg
-thesis/*.fdb_latexmk
-thesis/*.fls
-thesis/*.log
-thesis/*.run.xml
-thesis/*-SAVE-ERROR
-# page previews rendered for visual checks; the PDF is the kept output
-thesis/*.jpg
-thesis/*.png
+# ── LaTeX build products ─────────────────────────────────────────────────
+# Unanchored, so they are caught wherever latexmk drops them: run it from the
+# repo root rather than from thesis/ and it writes these beside the notebooks,
+# where /thesis below does not reach.
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.run.xml
+*-SAVE-ERROR
+
+# ── Kept outside this repo entirely ──────────────────────────────────────
+# The chapter and the working notes are authored elsewhere; the per-dataset
+# HTML reports are re-rendered on demand from 03 with render_reports:true.
+# Blanket rules, so no build-product patterns are needed under them.
 /thesis
+/docs
 /results

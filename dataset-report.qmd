@@ -11,8 +11,6 @@ format:
     embed-resources: true
     df-print: paged
 execute:
-  warning: false
-  message: false
   echo: false
 ---
 
@@ -63,12 +61,11 @@ cat("```\n")
 
 # Extraction config
 
-The m/z and RT windows below come from `derive_extraction_config()`
-applied to this dataset's SIRIUS-confirmed features. The window uses the
-median observed precursor m/z (not the theoretical mass) to absorb
-per-instrument calibration offset and anchor to the adduct SIRIUS resolved.
-The RT window is the range of confirmed RTs ± 30 s, conservative against
-within-study gradient drift.
+The m/z and RT windows below come from `derive_extraction_config()` applied to
+this dataset's SIRIUS-confirmed features. The window uses the median observed
+precursor m/z (not the theoretical mass) to absorb per-instrument calibration
+offset and anchor to the adduct SIRIUS resolved. The RT window is the range of
+confirmed RTs ± 30 s, conservative against within-study gradient drift.
 
 ```{r config-table}
 #| results: asis
@@ -87,10 +84,10 @@ cat("| confirmed source files (positive controls) |",
 
 # EIC overlay
 
-`Chromatograms::chromExtract()` extracted EICs in a single pass: one
-trace per file, per role, at the m/z window above. The plots overlay all
-traces; a tight cluster at the configured RT is expected, while large
-vertical spread or shoulders indicate real biology or unresolved isobars.
+`Chromatograms::chromExtract()` extracted EICs in a single pass: one trace per
+file, per role, at the m/z window above. The plots overlay all traces; a tight
+cluster at the configured RT is expected, while large vertical spread or
+shoulders indicate real biology or unresolved isobars.
 
 ```{r eic-overlay, fig.width = 9, fig.height = 6}
 op <- par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
@@ -107,10 +104,9 @@ par(op)
 
 # Peak detection
 
-`MsCoreUtils::localMaxima` looks for a local maximum within a half-
-window of scans, above a fraction of the trace maximum. The summary
-below reports how many files produced at least one detected peak per
-role.
+`MsCoreUtils::localMaxima` looks for a local maximum within a half- window of
+scans, above a fraction of the trace maximum. The summary below reports how many
+files produced at least one detected peak per role.
 
 ```{r peak-summary}
 #| results: asis
@@ -123,9 +119,9 @@ cat("- **Parent**     EICs with ≥1 peak: ",
 
 ## Positive-control check
 
-SIRIUS-confirmed files are positive controls: the EIC pipeline **must**
-detect a peak there. A failure flags a settings problem (PPM tolerance,
-RT window, or adduct choice), not a biology result.
+SIRIUS-confirmed files are positive controls: the EIC pipeline **must** detect a
+peak there. A failure flags a settings problem (PPM tolerance, RT window, or
+adduct choice), not a biology result.
 
 ```{r positive-control}
 par_files_all <- basename(dataOrigin(res$chr_par))
@@ -139,11 +135,11 @@ check_confirmed(met_files_all, res$peaks_met,
 # "Neither" EIC inspection
 
 Files with zero peaks for **both** roles are either genuinely missing the
-compound or had a misplaced detection window. We re-extract a wider RT
-window (±60 s) and drop the EICs empty at the target m/z. What remains,
-files with *some* signal at the target mass that still failed the peak
-threshold, is the informative subset to inspect. The shaded band marks
-the configured detection window.
+compound or had a misplaced detection window. We re-extract a wider RT window
+(±60 s) and drop the EICs empty at the target m/z. What remains, files with
+*some* signal at the target mass that still failed the peak threshold, is the
+informative subset to inspect. The shaded band marks the configured detection
+window.
 
 ```{r neither-eics, fig.width = 11, fig.height = 4}
 files_par_ok <- basename(dataOrigin(res$chr_par))[res$peaks_par > 0]
@@ -230,11 +226,11 @@ if (length(neither_files)) {
 
 # FWHM outliers
 
-Within one dataset peak width should be roughly constant (fixed gradient,
-same compound across injections). A file whose FWHM departs strongly from
-the median (> 3 × MAD) usually means the EIC integrates two fused peaks, a
-baseline-noise lump, or a co-eluting isobar; its AUC is suspect and
-flagged before entering the ratio.
+Within one dataset peak width should be roughly constant (fixed gradient, same
+compound across injections). A file whose FWHM departs strongly from the median
+(> 3 × MAD) usually means the EIC integrates two fused peaks, a baseline-noise
+lump, or a co-eluting isobar; its AUC is suspect and flagged before entering the
+ratio.
 
 ```{r fwhm-summary}
 #| results: asis
@@ -249,11 +245,11 @@ cat("- **Parent**     median FWHM = ",
     sep = "")
 ```
 
-Each flagged EIC is plotted against a reference EIC from the file closest
-to the median FWHM. A genuine outlier looks deformed (double apex,
-asymmetric tail, broad shoulder, noisy baseline); one that looks
-structurally similar to the reference is a false alarm from small FWHM
-variance and should stay in the ratio.
+Each flagged EIC is plotted against a reference EIC from the file closest to the
+median FWHM. A genuine outlier looks deformed (double apex, asymmetric tail,
+broad shoulder, noisy baseline); one that looks structurally similar to the
+reference is a false alarm from small FWHM variance and should stay in the
+ratio.
 
 ```{r fwhm-plots, fig.width = 10, fig.height = 5}
 plot_fwhm_outliers(res$chr_par_narrow, res$metrics_par, "par", "Parent")
@@ -263,10 +259,10 @@ plot_fwhm_outliers(res$chr_met_narrow, res$metrics_met, "met", "Metabolite")
 # PCA of EIC metrics
 
 An unsupervised view on the per-file metric matrix (`par_auc`, `met_auc`,
-`par_fwhm`, `met_fwhm`, `log2_ratio`), coloured by `health_status` and
-labelled by `subject_id`. A cluster split that does **not** track
-`health_status` is evidence of a latent covariate the deposit does not
-expose: a missing-metadata diagnostic, not just an exploratory plot.
+`par_fwhm`, `met_fwhm`, `log2_ratio`), coloured by `health_status` and labelled
+by `subject_id`. A cluster split that does **not** track `health_status` is
+evidence of a latent covariate the deposit does not expose: a missing-metadata
+diagnostic, not just an exploratory plot.
 
 ```{r pca, fig.width = 7, fig.height = 5}
 both_for_pca <- as.data.frame(sample_tbl[sample_tbl$detection_tier == "both", ])
@@ -325,8 +321,9 @@ if ("health_status" %in% names(sample_tbl) &&
 ```
 
 ```{r hs-stats}
-# Description only. The per-dataset p-values that used to appear here tested files rather
-# than subjects, so they estimated nothing; `05` runs the contrasts under the unit rule.
+# Description only. The per-dataset p-values that used to appear here tested
+# files rather than subjects, so they estimated nothing; `05` runs the contrasts
+# under the unit rule.
 ws <- describe_by_group(sample_tbl, group_col = "health_status")
 ws$detection_table
 ws$per_group_ratio
@@ -356,8 +353,8 @@ if (nrow(both) > 0 && "health_status" %in% names(both)) {
 
 # Additional stratifiers
 
-Sections below are generated only for canonical fields this dataset
-actually carries (≥2 levels, ≥3 samples each), beyond `health_status`.
+Sections below are generated only for canonical fields this dataset actually
+carries (≥2 levels, ≥3 samples each), beyond `health_status`.
 
 ```{r extra-stratifiers}
 #| results: asis

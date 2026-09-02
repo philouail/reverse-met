@@ -12,121 +12,74 @@ format:
     df-print: paged
 params:
   render_reports: false
-execute:
-  warning: false
-  message: false
 ---
 
 # Overview
 
-**Goal.** Notebooks `01` and `02` found and confirmed, per dataset, exactly
-where omeprazole (the parent drug) and 5-hydroxyomeprazole (its CYP2C19
-metabolite) sit in mass and retention time. This notebook takes those confirmed
-coordinates and goes back to *every* biological file in each dataset to measure
-the two compounds directly: it pulls out each compound's signal over time (its
-extracted-ion chromatogram, or EIC), detects the peak, integrates its area, and
-records a per-file `log2(parent / metabolite)` ratio. That ratio is the readout
-we carry into the downstream biological analyses (`04`, `05`): a high ratio means
-the drug is not being metabolised, a low ratio means it is.
+`01` and `02` established, per dataset, exactly where omeprazole and its CYP2C19
+metabolite 5-hydroxyomeprazole sit in mass and retention time. This notebook
+takes those coordinates back to every biological file in each dataset and
+measures the two compounds directly: it pulls each compound's extracted-ion
+chromatogram (EIC), detects and integrates the peak, and records a per-file
+`log2(parent / metabolite)`. A high ratio means the drug is not being
+metabolised and a low one means it is, and that read-out is what `04` and `05`
+work with.
 
-In other words: `01`/`02` establish that a dataset *contains* the drug pair;
-`03` propagates that detection to every file by MS1 (well beyond the MS2-confirmed
-subset) and quantifies the pair, so it can be compared across files, subjects, and
-cohorts.
+Put another way, `01` and `02` establish that a dataset *contains* the pair;
+`03` propagates that detection to every file by MS1, well beyond the
+MS2-confirmed subset, and quantifies it.
 
-## Why do this at all, rather than just use the MS2 matches?
+All compute goes through `run_ms1_for_dataset()` (`R/ms1.R`); this notebook
+holds the loop, the extraction settings and the cross-dataset summary.
+Single-dataset diagnostics -- EIC overlays, peak-width plots, PCA -- live in
+`dataset-report.qmd`, which section 7 renders once per dataset. Datasets are
+keyed by the combined `dataset_id` from `01`, and the loop pulls the bare
+`deposit_id` and `assay` per row so repository downloads see plain accessions.
 
-This is the central methodological claim of the project, so it is worth stating
-carefully.
+## Why not just use the MS2 matches?
 
-**A missing MS2 spectrum does not mean the compound is missing.** These deposits
-were acquired by data-dependent acquisition (DDA): during a run, the instrument
-decides *in real time* which ions to fragment, picking them mostly by intensity,
-within a limited duty cycle, and usually with dynamic exclusion and a cap on how
-many precursors it will chase per cycle. A compound can therefore be present in a
-sample, at a perfectly measurable level, and still receive **no MS2 scan at all**,
-purely because the instrument was busy with something else. Run the same sample
-twice and the set of fragmented precursors differs.
+A missing MS2 spectrum does not mean a missing compound. These deposits were
+acquired by data-dependent acquisition, in which the instrument decides in real
+time which ions to fragment, mostly by intensity and within a limited duty
+cycle. A compound can therefore be present at a perfectly measurable level and
+receive no MS2 scan at all, simply because the instrument was busy with
+something else; run the same sample twice and the set of fragmented precursors
+differs. A search resting on MS2 alone cannot separate absence from
+non-selection, and the failure is not random. Selection is intensity-driven, so
+the compounds most often missed are the low-abundance ones, which here means
+exactly the incidentally-dosed subject we are trying to find. MS2-only
+prevalence is a lower bound, and a biased one.
 
-So a search that relies on MS2 alone (MASST and relatives) cannot separate two
-very different situations:
+The two levels are complementary. MS2 gives identity, because fragments
+constrain the structure and SIRIUS can tell isomers apart; MS1 gives coverage,
+because it is recorded continuously with no selection step. Propagation uses
+each for what it is good at: confirm the compound by MS2 in the files where it
+happened to be fragmented, which pins both its mass and its retention time, then
+measure that mass at that retention time in every file, including the many where
+the instrument never fragmented it.
 
-- the compound is genuinely absent, and
-- the compound is present but was never selected for fragmentation.
+Proteomics met the same problem and solved it the same way. Match-between-runs
+identifies a peptide by MS2 in the run where it was fragmented, then transfers
+that identification to other runs by accurate mass and aligned retention time,
+quantifying at MS1 where the precursor was never selected. It became standard
+practice because DDA under-samples exactly as described above. Metabolomics
+repository reanalysis has largely not adopted the equivalent step, and this
+notebook is that step.
 
-Worse, the failure is not random. Selection is intensity-driven, so the compounds
-most likely to be missed are the **low-abundance** ones, which in this project
-means exactly the incidentally-dosed subject we are trying to find. MS2-only
-prevalence is therefore a **lower bound**, and a biased one.
+The trade is sensitivity for specificity, and it is real. MS2 can distinguish
+compounds that share a mass and MS1 cannot, so propagation extends coverage only
+as far as the chromatography preserves identity. That is not hypothetical here:
+5-hydroxyomeprazole has an exact isobaric twin, and a retention-time window set
+too wide silently measures the wrong molecule. The method is only as good as
+that window, which is why so much of this notebook is about it.
 
-**The two levels have complementary strengths.** MS2 gives *identity*: fragments
-constrain the structure, and SIRIUS can tell isomers apart. MS1 gives *coverage*:
-it is recorded continuously for everything, with no selection step. Propagation
-combines them, using MS2 once to establish identity, then MS1 everywhere to
-measure it:
-
-> Confirm the compound by MS2 in the files where it happened to be fragmented,
-> which pins its mass **and** its retention time. Then look at that mass and
-> retention time in **every** file, including the many where the instrument never
-> fragmented it.
-
-**There is a direct precedent in proteomics.** This is the same problem, and the
-same solution, as *match-between-runs* (as popularised by MaxQuant, and now
-standard practice): identify a peptide by MS2 in the run where it was fragmented,
-then transfer that identification to other runs by accurate mass and aligned
-retention time, quantifying at MS1 in runs where the precursor was never selected.
-Proteomics adopted this because DDA under-samples in exactly the way described
-above, and match-between-runs recovers a large fraction of the missing
-measurements. Metabolomics repository reanalysis has largely not adopted the
-equivalent step. This notebook is that step.
-
-**The trade we are making is sensitivity for specificity, and it is real.** MS2
-can distinguish compounds that share a mass; MS1 cannot. Propagation therefore
-extends coverage only as far as the chromatography preserves identity. That is
-not hypothetical here: 5-hydroxyomeprazole has an exact isobaric twin, and getting
-the retention-time window wrong silently measures the wrong molecule (see the
-extraction-settings section). The method is only as good as that window, which is
-why so much of this notebook is about it.
-
-**This also makes the cross-repository comparison fairer.** If we compared deposits
-by their MS2 detection rates, we would substantially be comparing instruments and
-acquisition settings: a deposit run with a faster instrument and a deeper precursor
-list fragments more, so it "detects" more, which looks like higher prevalence but is
-an artifact of the method. MS1 is acquired regardless of what the instrument chose to
-fragment, so propagating detection to MS1 removes that DDA-selection confound. It does
-not make every deposit comparable (instrument sensitivity, matrix and chromatography
-still differ), but it removes the confound that most distorts a raw MS2 detection-rate
-comparison.
-
-All compute goes through `run_ms1_for_dataset()` (`R/ms1.R`); this notebook holds
-only the loop, the extraction settings, and the cross-dataset summary. Deep
-diagnostics for a single dataset (EIC overlays, peak-width plots, PCA) live in
-`dataset-report.qmd`, a parameterised template that takes one `dataset_id`, reads
-that dataset's cached result, and renders a per-dataset HTML report. Section 7
-below renders it once per dataset.
-
-Datasets are keyed by the combined `dataset_id` from `01`; the loop pulls the
-bare `deposit_id` and `assay` per row so repository downloads see plain
-accessions.
-
-**Reads:**
-
-- `artifacts/hits-confirmed-all.csv` (from `02`)
-- `artifacts/bio_files_per_ds.rds` (from `02`)
-- `artifacts/bio_assays_per_ds.rds` (from `02`)
-- `artifacts/dataset_metadata_table.csv` (from `01`)
-
-**Writes:**
-
-- `artifacts/sample_table_all.csv`: cross-dataset sample table, de-duplicated to one
-  row per subject where a subject identifier exists
-- `artifacts/sample_table_perfile.csv`: the same measurements one row per file, which
-  is what every per-file analysis downstream reads
-
-The full `run_ms1_for_dataset()` output for each dataset (chromatograms,
-metrics, per-dataset sample table) is already cached at
-`artifacts/per_dataset/<dataset_id>.rds` by the extraction step;
-`dataset-report.qmd` reads those directly.
+There is a second benefit, less obvious. Comparing deposits by their MS2
+detection rates would substantially be comparing instruments: a deposit run on a
+faster instrument with a deeper precursor list fragments more, so it looks more
+prevalent. MS1 is acquired whatever the instrument chose to fragment, so
+propagating to MS1 removes that confound. It does not make deposits fully
+comparable, since sensitivity, matrix and chromatography still differ, but it
+removes the one that most distorts a raw detection-rate comparison.
 
 ```{r setup}
 source("R/_setup.R")
@@ -158,19 +111,18 @@ ds_meta_tbl       <- read.csv("artifacts/dataset_metadata_table.csv",
 
 # Extraction settings
 
-The extraction is governed by two numbers. Each says how tightly we look for
-the compound's signal:
+The extraction is governed by two numbers. Each says how tightly we look for the
+compound's signal:
 
 - **`PPM = 20`**: the mass tolerance, in parts-per-million. When we go looking
   for a compound at its known mass, real instruments are slightly off, so we
   accept anything within ±20 ppm (about ±0.007 Da at the omeprazole mass).
-- **`RT_PAD_S = 5`**: seconds of retention-time padding added on each side of
-  a dataset's confirmed-RT span. This one is load-bearing rather than cosmetic,
+- **`RT_PAD_S = 5`**: seconds of retention-time padding added on each side of a
+  dataset's confirmed-RT span. This one is load-bearing rather than cosmetic,
   for reasons the section below explains.
 
-(There is no peak-edge padding: the picker integrates each peak valley-to-valley,
-so the integration extent is set by the peak's own shape, not a fixed margin.
-See "How the peaks are picked and filtered" below.)
+There is no peak-edge padding: the picker integrates valley to valley, so how
+far it reaches is set by the peak's own shape rather than by a fixed margin.
 
 ```{r extraction-settings}
 DATASETS_TO_RUN <- names(bio_files_per_ds)
@@ -182,84 +134,95 @@ RT_PAD_S       <- 5    # seconds padded on each side of the confirmed-RT span
 
 ## How the peaks are picked and filtered
 
-The picker lives in `R/ms1.R` (stage 0). Its gates were tuned by auditing a handful of
-peaks in one RP and one HILIC dataset (each plotted and labelled by eye as signal, noise,
-or interferent). Run across the corpus, the gates then flagged **1,304 detected peaks with
-no MS2 confirmation of their own** (the MS1-propagated detections); these were reviewed
-against the panels saved under `peaks_review_v2/`, with ~20 rejected to the drop-list below.
-It has four parts:
+The picker lives in `R/ms1.R` and runs in five stages, in this order.
 
-- **Acceptance window (`acceptance_window`).** Rather than a fixed window, each confirmed MS2 hit is
-  snapped to its nearest MS1 apex and the window brackets the robust consensus of those apexes
-  (± `APEX_PAD` = 5 s). The window only has to *contain* each file's apex; the integration
-  extent is set by the peak itself.
-- **Integration (`pick`).** For each local maximum, the peak is integrated valley-to-valley
-  (walking out from the apex until the trace returns to baseline or a deep valley), merging
-  shallow shoulders and sub-4 s doublets, stopping at dead gaps where the EIC dropped out. Area
-  is trapezoidal above the local baseline line; prominence, SNR and the nearest-taller-neighbour
-  ratio are computed on the whole peak.
-- **Peak metrics (`add_msquality`).** The picker chooses the peak and its boundaries;
-  **MsQuality** then measures it, so the reported width, FWHM and shape are the mzQC
-  controlled-vocabulary quantities rather than local re-implementations. Handed our
-  boundaries, `peakWidth()` is bit-identical to the local `pkwidth` on every trace tested and
-  `xicFwhm()` is bit-identical to the local FWHM on reverse phase; on HILIC the two differ,
-  because ours takes the outermost half-maximum crossings of a merged cluster while MsQuality
-  takes 50% of the maximum inside the region. `gaussianSimilarity()` is recorded per peak but
-  never gated on: it needs ≥ 5 points in the peak region and is NA on the sparsest.
-  `maxIntensity` and `signalToNoiseRatio` stay local — both describe *the peak the picker
-  selected*, and MsQuality has no way of being told which of several peaks in the window that
-  is (its SNR is also NA on a tight acceptance window, where the MAD noise estimate is 0).
-- **On-RT selection.** When several peaks fall in the window, the dominant one is chosen by AUC
-  **weighted by a gaussian in its distance from the expected RT** (`RT_SIGMA` = 4 s). This is
-  the sulfone defence *at the selection level*: a larger-area interferent elsewhere in the
-  window loses to the on-RT peak. (HILIC keeps pure area-select; its windows were audited
-  peak-by-peak.)
-- **Accept gate (`accept_peak`), chromatography-conditional.** Shared: ≥ 3 points (HILIC ≥ 4),
-  apex ≥ 500, SNR ≥ 12 (RP) / ≥ 3 (HILIC), an FWHM band ([1, 30] s RP, [1.3, ∞) s HILIC), and a
-  slope check. HILIC also requires return-to-baseline and no much-taller neighbour; RP drops
-  those two (they killed sharp truncated-flank peaks and real peaks beside the sulfone) but
-  still requires a 3-point peak to clear its own baseline. The RP floors are corpus-set: real RP
-  peaks all clear SNR 20 and top out ~24 s FWHM.
+- **Set the window** (`acceptance_window`). Rather than a fixed span, each
+  confirmed MS2 hit is snapped to its nearest MS1 apex and the window brackets
+  the robust consensus of those apexes, padded by `APEX_PAD` = 5 s. The window
+  only has to *contain* each file's apex; how far the integration then reaches
+  is set by the peak.
+- **Integrate** (`pick`). Each local maximum is integrated valley to valley,
+  walking out from the apex until the trace returns to baseline or meets a deep
+  valley, merging shallow shoulders and sub-4 s doublets and stopping at dead
+  gaps where the EIC dropped out. Area is trapezoidal above the local baseline;
+  prominence, SNR and the nearest-taller-neighbour ratio are computed on the
+  whole peak.
+- **Choose which peak.** Where several fall inside the window, the dominant one
+  is chosen by area weighted by a gaussian in its distance from the expected RT
+  (`RT_SIGMA` = 4 s). This is the isomer defence at the selection level: a
+  larger interferent elsewhere in the window loses to the on-RT peak. HILIC
+  keeps pure area-selection, its windows having been audited peak by peak.
+- **Accept or reject** (`accept_peak`), conditional on chromatography. Both
+  modes require at least 3 points (HILIC 4), an apex of 500 counts, an SNR of 12
+  on reverse phase or 3 on HILIC, an FWHM inside [1, 30] s on reverse phase or
+  [1.3, ∞) s on HILIC, and a slope check. HILIC also requires return-to-baseline
+  and no much-taller neighbour; reverse phase drops both, because they killed
+  sharp truncated-flank peaks and real peaks sitting beside the sulfone, and
+  instead requires a 3-point peak to clear its own baseline. The reverse-phase
+  floors are corpus-set: real peaks there all clear SNR 20 and top out around 24
+  s FWHM.
+- **Measure** (`add_msquality`). The picker chooses the peak and its boundaries;
+  **MsQuality** then measures it, so the reported width, FWHM and shape are mzQC
+  controlled-vocabulary quantities rather than local re-implementations. Handed
+  our boundaries, its `peakWidth()` and `xicFwhm()` reproduce the local values
+  exactly on reverse phase; on HILIC the two FWHMs differ, because ours takes
+  the outermost half-maximum crossings of a merged cluster while MsQuality takes
+  50% of the maximum inside the region. `gaussianSimilarity()` is recorded per
+  peak but never gated on, since it needs at least 5 points and is NA on the
+  sparsest. Apex intensity and SNR stay local: both describe *which* peak was
+  selected, and MsQuality has no way of being told that.
 
-A handful of dirty-matrix peaks survive every rule: jagged stool/saliva EICs where noise and
-signal overlap on *every* shape metric. Those are removed by a small, documented **manual
-drop-list** (`curation/ms1_drop_list.csv`, ~20 peaks, each with a stated reason), keyed
-by `(dataset, role, file)`. This is deliberate: for a handful of genuinely ambiguous peaks a
-transparent per-peak removal is more honest than a gate no one can fully reason about.
+One further rejection happens after the picker, once both channels exist.
+`resolve_isobars()` drops a peak sitting at the *other* compound's confirmed
+retention time: both masses carry an isobar, and the parent's ---
+hydroxyomeprazole sulfide --- yields omeprazole's own product ion, so it passes
+spectral confirmation too. Where a channel's confirmed spectra split into two
+retention clusters, nothing is asserted for that channel.
 
-The gate thresholds are inspection-backed calibration, not a formal benchmark, but every
-decision is auditable from the saved panels.
+The gates were tuned by auditing peaks in one reverse-phase and one HILIC
+dataset, each plotted and labelled by eye as signal, noise or interferent. Run
+across the corpus they flagged 1,304 detected peaks carrying no MS2 confirmation
+of their own, which were reviewed against the panels saved under
+`peaks_review_v2/`. About twenty of those survive every rule while still being
+wrong -- jagged stool and saliva traces where noise and signal overlap on every
+shape metric -- and are removed by a manual drop-list
+(`curation/ms1_drop_list.csv`) keyed by dataset, role and file, each entry
+carrying a stated reason. For a handful of genuinely ambiguous peaks a
+transparent per-peak removal is more honest than a gate no one can fully reason
+about. This is inspection-backed calibration rather than a formal benchmark, but
+every decision is auditable from the saved panels.
 
-## The retention-time window is set per dataset, and the isobaric sulfone
+## The retention-time window, and the isomer it has to avoid
 
 Retention time (RT) is *when* a compound comes off the chromatography column. We
-only integrate signal inside an RT window, so the window has to sit over the peak.
-`derive_extraction_config()` builds it per dataset from that dataset's own
+only integrate signal inside an RT window, so the window has to sit over the
+peak. `derive_extraction_config()` builds it per dataset from that dataset's own
 SIRIUS-confirmed peaks: the window spans their RTs (earliest to latest), padded
 each side by `RT_PAD_S`. The confirmed span already absorbs cross-file drift,
-because it is the spread of MS2 detections across many files; the pad only has to
-cover drift in files that carry no confirmed hit of their own.
+because it is the spread of MS2 detections across many files; the pad only has
+to cover drift in files that carry no confirmed hit of their own.
 
 *Why the isomer matters.* 5-hydroxyomeprazole is not the only thing at its mass.
 Omeprazole sulfone, the compound CYP3A4 makes from omeprazole, has the identical
-formula (`C17H19N3O4S`) and therefore the identical m/z (362.1169). MS1 cannot tell
-the two apart. Only chromatography separates them, and the consequences of losing
-that separation are severe: the sulfone reports CYP3A4 activity, not the CYP2C19
-activity we are trying to measure, and in a poor CYP2C19 metaboliser the drug shunts
-to CYP3A4, so the sulfone is *larger* than the real 5-OH peak. The proximity-weighted
-selection described above is the primary defence; the window is a second, softer one,
-kept modest so the sulfone rarely even enters it.
+formula (`C17H19N3O4S`) and therefore the identical m/z (362.1169). MS1 cannot
+tell the two apart. Only chromatography separates them, and the consequences of
+losing that separation are severe: the sulfone reports CYP3A4 activity, not the
+CYP2C19 activity we are trying to measure, and in a poor CYP2C19 metaboliser the
+drug shunts to CYP3A4, so the sulfone is *larger* than the real 5-OH peak. The
+proximity-weighted selection described above is the primary defence; the window
+is a second, softer one, kept modest so the sulfone rarely even enters it.
 
-The margin is narrower than it looks. In MSV000084008 the confirmed 5-OH peaks span
-3.4 s (154.9 to 158.3), while the sulfone sits at ~181 s. A ±5 s pad gives [150, 163]
-and is safe. A ±30 s pad gives [125, 188], which reaches the sulfone.
+The margin is narrower than it looks. In MSV000084008 the confirmed 5-OH peaks
+span 3.4 s (154.9 to 158.3), while the sulfone sits at ~181 s. A ±5 s pad gives
+[150, 163] and is safe. A ±30 s pad gives [125, 188], which reaches the sulfone.
 
 *This is measured, not assumed.* That deposit's metadata records each subject's
-genotyped CYP2C19 phenotype (`PharmGeno_Phenotype_2C19`), which the pipeline never
-uses during extraction, so it is an independent target. Re-integrating the same
-cached chromatograms of MSV000084008 at a range of metabolite acceptance-window
-half-widths (parent fixed at ±5 s; metabolite centre ~156 s, sulfone ~181 s) and
-correlating the subject-level AUC ratio against that genotyped phenotype gives:
+genotyped CYP2C19 phenotype (`PharmGeno_Phenotype_2C19`), which the pipeline
+never uses during extraction, so it is an independent target. Re-integrating the
+same cached chromatograms of MSV000084008 at a range of metabolite
+acceptance-window half-widths (parent fixed at ±5 s; metabolite centre ~156 s,
+sulfone ~181 s) and correlating the subject-level AUC ratio against that
+genotyped phenotype gives:
 
 ```{r}
 #| echo: false
@@ -274,7 +237,7 @@ if (file.exists(sweep_cache) && file.exists(sweep_meta)) {
   # PHENO (CYP2C19 activity order) comes from R/masst.R.
   cache <- readRDS(sweep_cache)
   ta <- read.delim(sweep_meta, check.names = FALSE, stringsAsFactors = FALSE)
-  ta$tmin <- suppressWarnings(as.numeric(ta$ATTRIBUTE_Time_Point_Mins))
+  ta$tmin <- as.numeric(ta$ATTRIBUTE_Time_Point_Mins)
   ta <- ta[ta$MS_SampleType == "sample" & !is.na(ta$tmin), ]
   ta$k <- norm_file_key(ta$filename)
   fb   <- basename(as.character(bio_files_per_ds[["MSV000084008"]]))
@@ -286,7 +249,8 @@ if (file.exists(sweep_cache) && file.exists(sweep_meta)) {
   ctr  <- function(role, cr) mean(acceptance_window("MSV000084008", role, cr, bare,
                                                     cr$win, conf_final, ov_sweep))
   par_ctr <- ctr("parent", cache$par); met_ctr <- ctr("metabolite", cache$met)
-  # hilic = TRUE gives pure area-select, so it doubles as the "no proximity" control.
+  # hilic = TRUE gives pure area-select, so it doubles as the "no proximity"
+  # control.
   auc_of <- function(cr, centre, W, proximity) {
     data.frame(k = norm_file_key(cr$files),
                auc = vapply(cr$traces, function(tr) {
@@ -305,7 +269,7 @@ if (file.exists(sweep_cache) && file.exists(sweep_meta)) {
                              lr = log2(trap(d$tmin, d$par_auc) / trap(d$tmin, d$met_auc)),
                              subject = d$ATTRIBUTE_Subject[1])))
     a <- a[is.finite(a$lr), ]; s <- aggregate(lr ~ subject + rank, a, mean)
-    suppressWarnings(cor.test(s$rank, s$lr, method = "spearman"))$estimate
+    cor.test(s$rank, s$lr, method = "spearman", exact = FALSE)$estimate
   }
   pa <- auc_of(cache$par, par_ctr, 5, TRUE)          # parent fixed at +/-5 s throughout
   sweep <- do.call(rbind, lapply(c(5, 10, 15, 20, 30), function(W) data.frame(
@@ -321,17 +285,18 @@ if (file.exists(sweep_cache) && file.exists(sweep_meta)) {
 }
 ```
 
-With the proximity weighting the correlation is unchanged at every width; without it,
-the ratio collapses once the window admits the sulfone. So the isomer defence is the
-on-RT selection, not a tight window; the ±5 s pad only buys drift tolerance.
+With the proximity weighting the correlation is unchanged at every width;
+without it, the ratio collapses once the window admits the sulfone. So the
+isomer defence is the on-RT selection, not a tight window; the ±5 s pad only
+buys drift tolerance.
 
 # Per-dataset extraction
 
 For each dataset, `run_ms1_for_dataset()` loads the MS1 spectra, pulls each
 compound's extracted-ion chromatogram (EIC) at the confirmed mass and (widened)
-retention-time window, then **picks and integrates the on-RT peak per file** (the
-picker described above), applies the manual drop-list, flags files whose peak
-width is an outlier, joins the sample metadata, and emits a per-file table
+retention-time window, then **picks and integrates the on-RT peak per file**
+(the picker described above), applies the manual drop-list, flags files whose
+peak width is an outlier, joins the sample metadata, and emits a per-file table
 (`sample_tbl`) carrying the `detection_tier` (which of the two compounds were
 seen) and the `log2_ratio`. The deep per-dataset diagnostics (EIC overlays,
 peak-width plots, principal-component analysis) stay in `dataset-report.qmd`;
@@ -339,11 +304,11 @@ this notebook reports only what generalises across the whole cohort.
 
 ```{r run-all}
 #| echo: false
-# Cached per dataset; delete a dataset's RDS to force a re-run.
-# The cache is keyed on the extraction window, not merely on the file existing: re-running
-# confirmation moves the confirmed RTs and therefore the window, and a file.exists() check
-# would serve detections picked from the old one. Deriving the config extracts nothing, so
-# it is cheap to verify on every render.
+# Cached per dataset; delete a dataset's RDS to force a re-run. The cache is
+# keyed on the extraction window, not merely on the file existing: re-running
+# confirmation moves the confirmed RTs and therefore the window, and a
+# file.exists() check would serve detections picked from the old one. Deriving
+# the config extracts nothing, so it is cheap to verify on every render.
 CACHE_DIR <- "artifacts/per_dataset"
 dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
 
@@ -404,7 +369,8 @@ if (length(SKIPPED_DATASETS))
 
 ```{r}
 #| echo: false
-# Timing log written by R/peak_review_panels.R; git-ignored, so tolerate its absence.
+# Timing log written by R/peak_review_panels.R; git-ignored, so tolerate its
+# absence.
 et_path <- "peaks_review_v2/_extract_times.csv"
 et <- if (file.exists(et_path)) {
   x <- read.csv(et_path, stringsAsFactors = FALSE)
@@ -418,17 +384,17 @@ et_files <- if (is.null(et)) NA else format(sum(et$n_files), big.mark = ",")
 chr_ver  <- as.character(utils::packageVersion("Chromatograms"))
 ```
 
-Loading each file's spectra and pulling its two EICs is the pipeline's dominant compute
-cost, and it runs single-threaded. That is measured rather than assumed: parallel
-backends gave no gain once the files are read, because the cost is disk I/O rather than
-CPU. Cost tracks file count and file size, not the number of detections, and the timings
-are compute-only on cached files (raw-file FTP download is excluded). The corpus takes
-about **`r et_hours` hours** over `r if (is.null(et)) NA else nrow(et)` datasets
-(`r et_files` files).
+Loading each file's spectra and pulling its two EICs is the pipeline's dominant
+compute cost, and it runs single-threaded. That is measured rather than assumed:
+parallel backends gave no gain once the files are read, because the cost is disk
+I/O rather than CPU. Cost tracks file count and file size, not the number of
+detections, and the timings are compute-only on cached files (raw-file FTP
+download is excluded). The corpus takes about **`r et_hours` hours** over
+`r if (is.null(et)) NA else nrow(et)` datasets (`r et_files` files).
 
-These numbers were measured with **Chromatograms `r chr_ver`**. Extraction performance is
-strongly version-dependent, so treat the table as valid only for that version and
-re-measure after any upgrade of the extraction stack.
+These numbers were measured with **Chromatograms `r chr_ver`**. Extraction
+performance is strongly version-dependent, so treat the table as valid only for
+that version and re-measure after any upgrade of the extraction stack.
 
 ```{r}
 #| echo: false
@@ -445,49 +411,407 @@ if (is.null(et)) {
 
 # Checks that can catch us being wrong
 
-The window problem described above went unnoticed for a long time, and the reason
-is worth naming: **nothing in the pipeline was capable of contradicting it.** The
-numbers looked plausible, and no check existed that would fail if they were wrong.
-Robustness, in practice, means deliberately building the things that can catch us.
-Four of them, in increasing order of how hard they are to argue with.
+A pipeline is only as trustworthy as the things that could contradict it, and
+plausible numbers are not evidence if nothing in the design would fail when they
+are wrong. Six checks are built in on purpose, in increasing order of how hard
+they are to argue with.
 
-**1. The confirmed-file positive control.** In the files where MS2 already proved
-the compound is present, MS1 extraction must find it. If it does not, propagation
-is losing real signal, and every prevalence number is an underestimate.
-`run_ms1_for_dataset()` reports this as `Confirmed files loaded N / with >=1 peak
-M`: **M should equal N**, and any shortfall is a bug rather than biology. This is
-the cheapest hard check in the pipeline and it needs no external data.
+**1. The confirmed-file positive control.** Where MS2 has already proved the
+compound is present, MS1 extraction must find it; if it does not, propagation is
+losing real signal and every prevalence number is an underestimate.
+`run_ms1_for_dataset()` reports this as `Confirmed files loaded N / with >=1
+peak M`, where M should equal N and any shortfall is a bug rather than biology.
+It is the cheapest hard check here and needs no external data.
 
-**2. A known-negative control.** The complement of the check above: run the
-identical pipeline on files that *cannot* contain the compound and confirm it finds
-nothing. The pre-dose plasma draws of the probe study are exactly that — real
-matrix, true m/z, true retention window, drug absent by design — and `05` reports
-them. A synthetic decoy mass is deliberately **not** used: an untargeted file has
-real compounds at arbitrary masses, so a hit at a decoy mass is usually the picker
-correctly finding something else, which bounds the false-positive rate from above
-without estimating it.
+**2. A known-negative control.** The complement: run the identical pipeline on
+files that *cannot* contain the compound and confirm it finds nothing. The
+pre-dose plasma draws of the probe study are exactly that --- real matrix, true
+m/z, true retention window, drug absent by design --- and `05` reports them. A
+synthetic decoy mass is deliberately not used: an untargeted file carries real
+compounds at arbitrary masses, so a hit at a decoy mass is usually the picker
+correctly finding something else, which bounds the false-positive rate from
+above without estimating it.
 
-**3. Report the surface, not the best cell.** Every parameter here (`PPM`,
-`RT_PAD_S`, `BOUND_PAD_S`, the signal-to-noise cutoff, how below-detection samples
-are treated) is a choice, and a conclusion that survives only one setting is not a
-conclusion. The retention-time table above is the pattern to follow: a broad
-a plateau where the answer is stable, and a cliff with a mechanism that
-explains exactly where and why it breaks. A single lucky optimum would not be
-evidence.
+**3. Report the surface, not the best cell.** Every parameter here is a choice,
+and a conclusion that survives only one setting is not a conclusion. The
+retention-time sweep above is the pattern to follow: a broad plateau where the
+answer is stable, and a cliff with a mechanism that explains exactly where and
+why it breaks. A single lucky optimum would not be evidence.
 
-**4. External ground truth, which beats every internal check.** Parameters can be
-tuned until an internal check passes; an outside number cannot be. `04` uses the
-one deposit where truth exists independently of us: a cohort in which every
-subject was deliberately dosed, with pre-dose samples that are known negatives,
-and a published pharmacokinetic value per subject that the pipeline never sees.
+**4. External ground truth, which beats every internal check.** Parameters can
+be tuned until an internal check passes; an outside number cannot be. `04` uses
+the one deposit where truth exists independently of us: a cohort in which every
+subject was deliberately dosed, with pre-dose samples that are known negatives
+and a published pharmacokinetic value per subject the pipeline never sees.
 
-A methodological warning that applies to all of this: **do not choose a parameter
-by maximising agreement with the thing you then cite as validation.** That is
-circular, and it is how the earlier over-wide window justified itself. Where a
-parameter must be tuned, tune it against something structurally independent of the
-validation target. The parent compound is useful here precisely because it has no
-isobaric twin, so its retention-time drift can be measured without reference to
-any downstream result.
+**5. The apex-snap shown rather than asserted.** The retention time a confirmed
+hit carries is when the instrument fired, not when the compound eluted, and the
+whole window design rests on the second being stable where the first is not.
+MSV000088255 is where that is easiest to see, so it is plotted: every confirmed
+metabolite scan in the deposit, on the EIC of the file it fired in.
+
+```{r fig-dda-offset, fig.width = 9, fig.height = 5.6}
+#| echo: false
+.r <- results[["MSV000088255"]]
+.h <- conf_final[conf_final$dataset_id == "MSV000088255" &
+                 conf_final$role == "metabolite", ]
+.h$bn <- basename(.h$source_file)
+.org <- basename(chartr(rawToChar(as.raw(92)), "/",
+                        chromData(.r$chr_met)$dataOrigin))
+.ix  <- which(.org %in% unique(.h$bn))
+
+.tr <- dplyr::bind_rows(lapply(.ix, function(i) data.frame(
+  file = sub("^MSV[0-9]+_Urine_", "", sub("_FragPos.mzML$", "", .org[i])),
+  rt = rtime(.r$chr_met[i])[[1]], int = intensity(.r$chr_met[i])[[1]])))
+.tr <- .tr[is.finite(.tr$int), ]
+.ap <- .tr |> dplyr::group_by(file) |>
+  dplyr::slice_max(int, n = 1, with_ties = FALSE) |> dplyr::ungroup()
+.ms2 <- .h |> dplyr::transmute(
+  file = sub("^MSV[0-9]+_Urine_", "", sub("_FragPos.mzML$", "", bn)), ms2 = rt)
+
+ggplot(.tr, aes(rt, int)) +
+  geom_line(colour = "grey35", linewidth = 0.4) +
+  geom_vline(data = .ms2, aes(xintercept = ms2), colour = "#D6604D",
+             linewidth = 0.4, alpha = 0.85) +
+  geom_point(data = .ap, aes(rt, int), colour = "#2166AC", size = 1.8) +
+  facet_wrap(~ file, scales = "free_y", ncol = 5) +
+  coord_cartesian(xlim = c(230, 350)) +   # zoom, not a filter: nothing is dropped
+  labs(x = "Retention time (s)", y = "Intensity",
+       title = "MSV000088255 metabolite: MS2 trigger times (red) against the MS1 apex (blue)",
+       subtitle = "one panel per file carrying a confirmed metabolite scan") +
+  theme_bw(base_size = 10) +
+  theme(strip.background = element_rect(fill = "grey92"),
+        panel.grid.minor = element_blank())
+```
+
+```{r dda-offset-numbers}
+#| echo: false
+.j <- dplyr::left_join(.ms2, dplyr::select(.ap, file, apex = rt), by = "file")
+cat("files with a confirmed metabolite scan:", nrow(.ap),
+    "| confirmed scans:", nrow(.j), "
+")
+cat("apex span:", sprintf("%.1f-%.1f s (%.1f s)", min(.ap$rt), max(.ap$rt),
+                          diff(range(.ap$rt))), "
+")
+cat("trigger span:", sprintf("%.1f-%.1f s (%.1f s)", min(.j$ms2), max(.j$ms2),
+                             diff(range(.j$ms2))), "
+")
+cat("trigger minus apex:", sprintf("%+.1f to %+.1f s", min(.j$ms2 - .j$apex),
+                                   max(.j$ms2 - .j$apex)), "
+")
+```
+
+The apexes sit in a band a fraction of the width of the triggers, and the
+largest offsets are not scattered files but single intense peaks re-fragmented
+on the way down: one file contributes four confirmed scans, spread over fifty
+seconds, all belonging to one apex. Centring a window on the trigger times would
+force it to span the union of those tails; centring on the apexes does not. This
+is what the window derivation is for, and the figure is the check that it is
+warranted.
+
+**6. Which of the two isobars is actually in the parent channel.** The window
+argument above says the compounds are chromatographically resolved; this asks
+the harder question of whether the peak we integrate is the right molecule.
+Omeprazole is a sulfoxide, so it cannot lose $\cdot$SH; hydroxyomeprazole
+sulfide, which shares its formula, gives m/z $313.1422$ on exactly that loss.
+The share of confirmed parent MS2 carrying that ion therefore reads directly on
+how much of the channel is the isobar, and the probe cohort supplies its own
+control: the cluster where omeprazole is confirmed should be near zero.
+
+```{r isobar-fragment}
+#| echo: false
+.ifc <- "artifacts/isobar_fragment_check.csv"
+# The only computation in this notebook that reads raw MS2 rather than the
+# cached EICs, so it takes about ten minutes and its result is cached beside the
+# other artifacts. Delete that CSV to force a recompute; nothing here notices on
+# its own if the confirmed set changes underneath it.
+if (!file.exists(.ifc)) {
+  SULFIDE_MZ <- 313.1422   # [M+H-SH]+, impossible for a sulfoxide
+  SHARED_MZ  <- 198.0581   # substituted pyridine ring, given by both
+  TOL <- 0.02; PREC_TOL <- 0.05
+  .pc <- function(x) if (!length(x)) NA_real_ else round(100 * mean(x))
+  .rows <- list()
+  for (ds in names(results)) {
+    r <- results[[ds]]
+    # only files carrying a confirmed parent hit: reading the whole corpus
+    # costs hours and the question is what the CONFIRMED spectra are
+    want <- unique(basename(as.character(conf_final$source_file[
+      conf_final$dataset_id == ds & conf_final$role == "parent"])))
+    if (!length(want)) next
+    fs <- unique(chartr(rawToChar(as.raw(92)), "/", chromData(r$chr_par)$dataOrigin))
+    fs <- fs[basename(fs) %in% want & file.exists(fs)]
+    if (!length(fs)) next
+    sp <- tryCatch(filterMsLevel(Spectra(fs), 2L), error = function(e) NULL)
+    if (is.null(sp) || !length(sp)) next
+    pmz <- precursorMz(sp)
+    k <- which(!is.na(pmz) & abs(pmz - compound_spec$mz[compound_spec$role == "parent"]) < PREC_TOL)
+    if (!length(k)) next
+    sp <- sp[k]; pk <- peaksData(sp); rt <- rtime(sp)
+    hasfrag <- function(t) vapply(pk, function(m) any(abs(m[, 1] - t) < TOL), logical(1))
+    s313 <- hasfrag(SULFIDE_MZ)
+    # the same two centres, and the same stand-down condition, resolve_isobars() uses
+    ctr <- function(role) {
+      q <- as.numeric(conf_final$rt[conf_final$dataset_id == ds & conf_final$role == role])
+      q <- q[is.finite(q)]; if (length(q)) stats::median(q) else NA_real_
+    }
+    cp <- ctr("parent"); cm <- ctr("metabolite")
+    ok <- !isTRUE(r$rt_anchor$par$uncertain) && !isTRUE(r$rt_anchor$met$uncertain) &&
+      is.finite(cp) && is.finite(cm) && abs(cp - cm) >= CHAN_SEP
+    own <- if (ok) abs(rt - cp) < abs(rt - cm) else rep(NA, length(rt))
+    .rows[[length(.rows) + 1]] <- data.frame(
+      dataset_id = ds, spectra = length(pk),
+      pct_sulfide_313 = .pc(s313), pct_shared_198 = .pc(hasfrag(SHARED_MZ)),
+      resolved = ok,
+      n_integrated = if (ok) sum(own) else NA_integer_,
+      pct_sulfide_integrated = if (ok) .pc(s313[own]) else NA_real_,
+      n_rejected = if (ok) sum(!own) else NA_integer_,
+      pct_sulfide_rejected = if (ok) .pc(s313[!own]) else NA_real_,
+      stringsAsFactors = FALSE)
+  }
+  write.csv(do.call(rbind, .rows), .ifc, row.names = FALSE)
+}
+.z <- if (file.exists(.ifc)) read.csv(.ifc, stringsAsFactors = FALSE)
+# One cell out of the table, so no number in the prose below is typed twice.
+.iso <- function(ds, col) if (is.null(.z)) "--" else .z[[col]][.z$dataset_id == ds]
+{
+  .z$verdict <- ifelse(.z$pct_sulfide_313 >= 40, "largely the isobar",
+                ifelse(.z$pct_sulfide_313 >= 15, "mixed", "mostly omeprazole"))
+  .show <- .z[order(-.z$pct_sulfide_313),
+              c("dataset_id", "spectra", "pct_sulfide_313",
+                "pct_sulfide_integrated", "pct_sulfide_rejected", "verdict")]
+  knitr::kable(.show, row.names = FALSE,
+    col.names = c("dataset", "MS2 at the parent mass", "% with 313.14 (-SH)",
+                  "integrated cluster", "rejected cluster", "verdict"),
+    caption = paste("Sulfide-diagnostic fragment among confirmed parent spectra.",
+                    "The last two columns split that rate by retention cluster,",
+                    "classified by the same comparison resolve_isobars() makes;",
+                    "they are empty where the anchors are too close for the",
+                    "rule to apply."))
+}
+```
+
+Read the rates as a mixture, not a verdict on a whole deposit. The probe cohort
+sits at `r .iso("MSV000084008", "pct_sulfide_313")` per cent pooled, which on its
+own says little; split by retention cluster it is
+`r .iso("MSV000084008", "pct_sulfide_integrated")` per cent in the cluster the
+extraction integrates against
+`r .iso("MSV000084008", "pct_sulfide_rejected")` per cent in the one it rejects.
+That contrast is the whole case for `resolve_isobars()`: the rule is not
+discarding signal, it is discarding a different molecule. Two deposits are worth
+naming: MSV000088255, a urine cohort, runs at
+`r .iso("MSV000088255", "pct_sulfide_313")` per cent and its parent channel is
+dropped; MTBLS1866 runs at
+`r .iso("MTBLS1866_LC-MS_positive_reverse-phase_metabolite_profiling", "pct_sulfide_313")`
+per cent and is **not** gated, because its two anchors sit under $6$ s apart and
+the rule stands down where the channels are not resolved -- which is why its row
+has no split. Its parent contrast should be read with that attached.
+
+A methodological warning that applies to all of this: **do not choose a
+parameter by maximising agreement with the thing you then cite as validation.**
+That is circular, and it is how the earlier over-wide window justified itself.
+Where a parameter must be tuned, tune it against something structurally
+independent of the validation target. The parent compound is useful here
+precisely because it has no isobaric twin, so its retention-time drift can be
+measured without reference to any downstream result.
+
+**7. What each choice is actually worth.** The warning above is a rule for
+choosing parameters; this is the audit of the ones already chosen. Every
+decision in the extraction is defensible in prose, which is exactly the problem:
+a reader has no way to tell a defensible choice from a convenient one. So each
+is turned off in turn, one at a time with everything else left alone, and the
+genotype model is refitted from the peaks that survive. MSV000084008 is the only
+deposit carrying genotypes, so it is the only place the coefficient can be
+recomputed; MSV000082493 supplies the counter-check, its skin samples taken
+before the first dose being the one known-negative the intensity floor is
+answerable to.
+
+```{r ablations}
+#| echo: false
+rt_ov   <- read.csv("curation/rt_apex_overrides.csv", stringsAsFactors = FALSE)
+drop_all <- read.csv("curation/ms1_drop_list.csv", stringsAsFactors = FALSE)
+hits_curated <- read.csv("artifacts/hits_curated.csv", check.names = FALSE,
+                         stringsAsFactors = FALSE)
+
+E84 <- ablation_setup("MSV000084008", bio_files_per_ds[["MSV000084008"]])
+E82 <- ablation_setup("MSV000082493", bio_files_per_ds[["MSV000082493"]])
+vary <- function(e, conf = conf_final, ...)
+  ablation_variant(e, conf = conf, ov = rt_ov, drop_all = drop_all, ...)
+
+# The genotype refit: one trapezoidal AUC per subject per day, averaged over
+# days, regressed on the phenotype rank. The same path 04 takes.
+ta84 <- read.delim("dataset_metadata/MSV000084008_metadata.tsv",
+                   check.names = FALSE, stringsAsFactors = FALSE)
+ta84$k <- norm_file_key(ta84$filename)
+ta84$tmin <- as_num(ta84$ATTRIBUTE_Time_Point_Mins)
+ta84 <- ta84[ta84$MS_SampleType == "sample" & !is.na(ta84$tmin), ]
+
+trap <- function(x, y) {
+  o <- order(x); x <- x[o]; y <- y[o]; y[is.na(y)] <- 0
+  if (length(unique(x)) < 4) NA_real_ else
+    sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+refit <- function(v) {
+  d <- ta84
+  mp <- v$par; mm <- v$met
+  mp$k <- norm_file_key(mp$file); mm$k <- norm_file_key(mm$file)
+  i <- match(d$k, mp$k); j <- match(d$k, mm$k)
+  d$par_auc <- ifelse(mp$par_detected[i] %in% TRUE, mp$par_auc[i], NA_real_)
+  d$met_auc <- ifelse(mm$met_detected[j] %in% TRUE, mm$met_auc[j], NA_real_)
+  auc <- do.call(rbind, lapply(
+    split(d, list(d$ATTRIBUTE_Subject, d$ATTRIBUTE_Study_Day), drop = TRUE),
+    function(z) data.frame(
+      subject = z$ATTRIBUTE_Subject[1],
+      rank = match(z$PharmGeno_Phenotype_2C19[1], PHENO),
+      log2_ratio = log2(trap(z$tmin, z$par_auc) / trap(z$tmin, z$met_auc)))))
+  auc <- auc[is.finite(auc$log2_ratio) & !is.na(auc$rank), ]
+  s <- aggregate(log2_ratio ~ subject + rank, data = auc, FUN = mean)
+  co <- summary(lm(log2_ratio ~ rank, data = s))$coefficients
+  c(beta = co[2, 1], se = co[2, 2], p = co[2, 4], n = nrow(s))
+}
+
+# Skin sampled before the first dose: the drug had not been taken and skin has
+# no route to it, so anything called here is a false positive.
+sk <- read.delim("dataset_metadata/MSV000082493_metadata.tsv",
+                 check.names = FALSE, stringsAsFactors = FALSE)
+sk <- sk[sk$MS_SampleType == "sample" & sk$ATTRIBUTE_Body_Site == "L.forehead" &
+           (sk$ATTRIBUTE_Study_Day %in% "0" |
+            (sk$ATTRIBUTE_Study_Day %in% "1" &
+             sk$ATTRIBUTE_Time_Point_Mins %in% "0")), ]
+sk$k <- norm_file_key(sk$filename)
+skin_fp <- function(v) {
+  mp <- v$par; mp$k <- norm_file_key(mp$file)
+  sum(mp$par_detected[match(sk$k, mp$k)] %in% TRUE)
+}
+
+rows <- list()
+add <- function(choice, alternative, note, v84, v82) {
+  b <- refit(v84)
+  rows[[length(rows) + 1]] <<- data.frame(
+    choice = choice, alternative = alternative,
+    detections = as.integer(sum(v84$par$par_detected) + sum(v84$met$met_detected)),
+    note = note, skin_fp = as.integer(skin_fp(v82)),
+    beta = round(unname(b["beta"]), 3), se = round(unname(b["se"]), 3),
+    p = signif(unname(b["p"]), 2), subjects = as.integer(b["n"]),
+    stringsAsFactors = FALSE)
+}
+
+R84 <- vary(E84); R82 <- vary(E82)
+stopifnot(identical(R84$par$par_detected, E84$metrics$par$par_detected),
+          identical(R84$met$met_detected, E84$metrics$met$met_detected),
+          identical(R82$par$par_detected, E82$metrics$par$par_detected))
+V0 <- ablation_isobars(R84, conf_final); W0 <- ablation_isobars(R82, conf_final)
+add("pipeline as reported", "--", "", V0, W0)
+
+for (f in c(100, 250, 1000))
+  add(sprintf("apex floor %d counts", MIN_INT), sprintf("floor %d counts", f), "",
+      ablation_isobars(vary(E84, floor_val = f), conf_final),
+      ablation_isobars(vary(E82, floor_val = f), conf_final))
+
+for (tiers in list("strict", c("strict", "standard"))) {
+  cf <- conf_final[conf_final$confidence %in% tiers, ]
+  add("anchors at any confidence tier", sprintf("%s only", paste(tiers, collapse = "+")),
+      sprintf("%d of %d anchors", nrow(cf), nrow(conf_final)),
+      ablation_isobars(vary(E84, conf = cf), cf),
+      ablation_isobars(vary(E82, conf = cf), cf))
+}
+
+.vp <- ablation_isobars(vary(E84, per_hit = TRUE), conf_final)
+add("one RT anchor per file", "one anchor per confirmed hit",
+    sprintf("parent window %.0f-%.0f s, not %.0f-%.0f",
+            .vp$win$par$win[1], .vp$win$par$win[2],
+            V0$win$par$win[1], V0$win$par$win[2]),
+    .vp, ablation_isobars(vary(E82, per_hit = TRUE), conf_final))
+
+add("reject cross-channel isobars", "keep every in-window peak", "", R84, R82)
+
+# Adduct policy acts upstream of the window, on which MASST hits exist at all,
+# so it has no separate slope: this deposit's own hits are protonated either way.
+.ok <- hits_curated$adduct_inferred %in% "[M+H]+"
+rows[[length(rows) + 1]] <- data.frame(
+  choice = "any plausible adduct", alternative = "protonated only",
+  detections = NA_integer_,
+  note = sprintf("%d of %d curated hits, %d of %d deposits", sum(.ok),
+                 nrow(hits_curated), length(unique(hits_curated$dataset_id[.ok])),
+                 length(unique(hits_curated$dataset_id))),
+  skin_fp = NA_integer_, beta = NA_real_, se = NA_real_, p = NA_real_,
+  subjects = NA_integer_, stringsAsFactors = FALSE)
+
+.a <- do.call(rbind, rows)
+
+# Pull one cell out for the prose below, so no number here is typed twice.
+.ab <- function(alt, col) .a[[col]][.a$alternative == alt]
+.bmax <- sprintf("%.3f", max(abs(.a$beta - .a$beta[1]), na.rm = TRUE))
+.pmax <- sprintf("%.5f", max(.a$p, na.rm = TRUE))
+.se0  <- sprintf("%.3f", .a$se[1])
+.nsk  <- nrow(sk)
+
+.tbl <- .a
+# p is formatted here rather than left to kable: `digits` would round every one
+# of them to 0.001 and the column would say nothing.
+.tbl$p <- ifelse(is.na(.tbl$p), "", sprintf("%.5f", .tbl$p))
+knitr::kable(.tbl, row.names = FALSE, digits = 3,
+  col.names = c("choice", "alternative", "detections", "note",
+                "pre-dose skin", "slope", "SE", "p", "subjects"),
+  caption = paste("Each row changes one decision and refits. Detections are",
+                  "MSV000084008's; pre-dose skin counts false positives among",
+                  .nsk, "known negatives in MSV000082493."))
+```
+
+The first row is the pipeline as reported, and it reproduces the cached
+detection flags exactly -- the chunk asserts that before it computes anything
+else, so a variant that differs does so because of the change and not because
+the re-run drifted from the pipeline. Across every other row the slope stays
+within `r .bmax` of it, against a standard error on that slope of `r .se0`; the
+p-value never rises above `r .pmax`, and all fourteen subjects survive every
+variant. Nothing here is load-bearing for the
+validation, which is the point: the correlation is not an artefact of the
+processing, because the processing can be varied and it does not go away.
+
+The intensity floor is the one row that is not symmetric. Raising it costs
+plasma detections and buys nothing, while lowering it to $100$ admits
+`r .ab("floor 100 counts", "skin_fp")` pre-dose skin samples that cannot
+contain the drug. That asymmetry, not a tuned optimum, is why the floor sits
+where it does, and the per-matrix breakdown says where its cost falls.
+
+```{r floor-by-matrix}
+#| echo: false
+mb <- read.delim("dataset_metadata/MSV000082493_metadata.tsv",
+                 check.names = FALSE, stringsAsFactors = FALSE)
+mb <- mb[mb$MS_SampleType == "sample", ]
+mb$k <- norm_file_key(mb$filename)
+.mp <- R82$par; .mp$k <- norm_file_key(.mp$file)
+.lo <- vary(E82, floor_val = 100)$par
+.fb <- do.call(rbind, lapply(split(mb, mb$ATTRIBUTE_Body_Site), function(g) {
+  i <- match(g$k, .mp$k); i <- i[!is.na(i)]
+  data.frame(body_site = g$ATTRIBUTE_Body_Site[1], files = nrow(g),
+             with_peak_in_window = length(i),
+             accepted_at_500 = sum(.mp$par_detected[i]),
+             accepted_at_100 = sum(.lo$par_detected[i]),
+             stringsAsFactors = FALSE)
+}))
+.fb$rejected_at_500 <- .fb$with_peak_in_window - .fb$accepted_at_500
+.fb$floor_only <- .fb$accepted_at_100 - .fb$accepted_at_500
+.fm <- function(site, col) .fb[[col]][.fb$body_site == site]
+knitr::kable(.fb, row.names = FALSE,
+  col.names = c("body site", "files", "peak in window", "accepted at 500",
+                "accepted at 100", "rejected at 500", "floor-only"),
+  caption = paste("MSV000082493, parent channel, before the isobar rule.",
+                  "Floor-only rejections are those a lower threshold would",
+                  "rescue; the rest fail another criterion and cannot be."))
+```
+
+The gate is a conjunction, so a peak failing any criterion other than the apex
+height cannot be rescued by a lower threshold, and the split matters. In faeces
+only `r .fm("fecal", "floor_only")` of `r .fm("fecal", "rejected_at_500")`
+rejections are the floor's doing: most of that matrix's shortfall is peaks that
+do not have the shape of a peak, and lowering the threshold would not recover
+them. In skin the proportions invert, `r .fm("L.forehead", "floor_only")` of
+`r .fm("L.forehead", "rejected_at_500")`, so the same change admits that many
+detections in the one matrix with no plausible route of exposure. The prevalence
+figures downstream are lower bounds, most conspicuously in faeces and on skin;
+no known-negative exists for those matrices to justify a lower floor, and the
+one that does exist argues against it.
 
 # Cross-dataset sample table
 
@@ -495,24 +819,28 @@ any downstream result.
 #| echo: false
 all_samples <- do.call(rbind, lapply(names(results), function(ds) {
   # Rebuild rather than trust the cached sample_tbl: it is fully derivable from
-  # metrics_* and costs nothing, so a cache written by an older build_sample_table
-  # cannot carry a stale detection_tier into the corpus tables. (It did: an
-  # exact-name merge silently demoted 19 detected MetaboLights files to "neither".)
+  # metrics_* and costs nothing, so a cache written by an older
+  # build_sample_table cannot carry a stale detection_tier into the corpus
+  # tables. (It did: an exact-name merge silently demoted 19 detected
+  # MetaboLights files to "neither".)
   meta <- tryCatch(load_metadata(ds),
                    error = function(e) data.frame(file = basename(bio_files_per_ds[[ds]])))
-  st <- build_sample_table(results[[ds]]$metrics_par, results[[ds]]$metrics_met,
+  .m <- resolve_isobars(results[[ds]]$metrics_par, results[[ds]]$metrics_met,
+                        conf_final, ds, results[[ds]]$rt_anchor)
+  st <- build_sample_table(.m$par, .m$met,
                            basename(bio_files_per_ds[[ds]]), meta, dedup = TRUE)
-  # Keep only files still in the current bio_files. A cached extraction can hold rows for
-  # files a later QC rule removed (MSV000091520 kept 247 blank_QC files after bio_files went
-  # 2391 -> 2144), and without this filter the two sample tables disagree. All of them are
-  # detection_tier "neither", so nothing measured is dropped.
+  # Keep only files still in the current bio_files. A cached extraction can hold
+  # rows for files a later QC rule removed (MSV000091520 kept 247 blank_QC files
+  # after bio_files went 2391 -> 2144), and without this filter the two sample
+  # tables disagree. All of them are detection_tier "neither", so nothing
+  # measured is dropped.
   keep <- norm_file_key(st$file) %in% norm_file_key(bio_files_per_ds[[ds]])
   cbind(dataset_id = ds, assay = results[[ds]]$assay, st[keep, , drop = FALSE],
         stringsAsFactors = FALSE)
 }))
 
-# Files with no metadata are kept for the presence record but excluded from every
-# stratified analysis below.
+# Files with no metadata are kept for the presence record but excluded from
+# every stratified analysis below.
 all_samples$has_metadata <- {
   key <- paste0(all_samples$dataset_id, "|",
                 basename(as.character(all_samples$file)))
@@ -540,21 +868,21 @@ knitr::kable(tier_tab, align = "r")
 ```
 
 Every analysis after this point restricts to `has_metadata == TRUE`. The
-record-only rows (a confirmed hit on a file the metadata layer does not cover, so
-we cannot say which subject or group it belongs to) stay in `sample_table_all.csv`
-for the presence record and the propagation counts below, but they carry no
-stratum and never enter a contrast.
+record-only rows (a confirmed hit on a file the metadata layer does not cover,
+so we cannot say which subject or group it belongs to) stay in
+`sample_table_all.csv` for the presence record and the propagation counts below,
+but they carry no stratum and never enter a contrast.
 
 ```{r analysis-set}
 #| echo: false
 analysis_samples <- all_samples[all_samples$has_metadata %in% TRUE, ]
 ```
 
-`sample_table_all.csv` is one row per subject (the `build_sample_table()` dedup).
-Genotype / longitudinal analyses (`04`) need the rows *before* that dedup, so we
-also write a per-file table, keeping `subject_id` (+ a `subject_key` fallback) so
-those analyses aggregate to one-per-subject themselves; the rows are not
-independent.
+`sample_table_all.csv` is one row per subject (the `build_sample_table()`
+dedup). Genotype / longitudinal analyses (`04`) need the rows *before* that
+dedup, so we also write a per-file table, keeping `subject_id` (+ a
+`subject_key` fallback) so those analyses aggregate to one-per-subject
+themselves; the rows are not independent.
 
 ```{r combine-tables-perfile}
 #| echo: false
@@ -565,7 +893,8 @@ all_samples_perfile <- dplyr::bind_rows(lapply(names(results), function(ds) {
   r    <- results[[ds]]
   meta <- tryCatch(load_metadata(ds),
                    error = function(e) data.frame(file = basename(bio_files_per_ds[[ds]])))
-  st   <- build_sample_table(r$metrics_par, r$metrics_met,
+  .m   <- resolve_isobars(r$metrics_par, r$metrics_met, conf_final, ds, r$rt_anchor)
+  st   <- build_sample_table(.m$par, .m$met,
                              basename(bio_files_per_ds[[ds]]), meta, dedup = FALSE)
   st$subject_key <- dplyr::coalesce(getcol(st, "subject_id"),
                                     getcol(st, "sample_name"), as.character(st$file))
@@ -576,23 +905,7 @@ cat("One row per raw file:", nrow(all_samples_perfile),
     "| one row per subject-sample after collapsing repeat files:", nrow(all_samples), "\n")
 ```
 
-# Per-dataset contrasts live in `05`
-
-This notebook used to run its own per-dataset Fisher and Kruskal tests here, with a
-Benjamini-Hochberg correction, and report the survivors as findings. They are removed.
-
-They tested the **file** as the unit, and a file is not an independent observation: the
-probe cohort is 1,137 files from 14 people, so one person could enter a contingency table
-as 27 observations. A p-value computed that way does not estimate anything, and no
-footnote repairs it. The presence definition was wrong too -- it counted any integrated
-peak rather than one that passed the gate -- which inflated every rate.
-
-`05` asks the same questions properly, under the analysis-unit rule (one row per subject
-per level of the contrast), records which deposits can support a subject-level unit at
-all, and flags the rest as design-unknown rather than testing them anyway. What this
-notebook produces is the per-file measurement table; the contrasts belong downstream.
-
-# Per-dataset HTML reports
+## Per-dataset HTML reports
 
 `dataset-report.qmd` is a parameterised template: given one `dataset_id`, it
 produces a deep dive into that dataset alone. The loop below renders it once per
@@ -623,65 +936,13 @@ message("Done: ", length(results), " report(s) in reports/")
 
 ## Ratio distribution per dataset
 
-### Why only the comparison *inside* a dataset is meaningful
-
-A mass spectrometer does not measure concentration. It counts ions, and how many
-ions a compound yields depends on how readily that particular molecule ionises,
-which is a property of the molecule **and** of the method: the instrument, the
-ion source settings, the mobile phase, and the sample matrix all shift it.
-Omeprazole and 5-hydroxyomeprazole are different molecules, so they ionise with
-different efficiency. What we measure is therefore not the true molar ratio but
-
-```
-measured log2(parent / metabolite) = true log2(parent / metabolite) + offset
-```
-
-where `offset` is the log ratio of the two compounds' response factors. That offset
-is unknown, and it differs for every dataset, because every dataset used a different
-instrument and method. The standard way to remove it is to spike an isotope-labelled
-internal standard of each compound into every sample, and no public deposit in this
-corpus did that, so we cannot calibrate it away.
-
-This is not our assumption; it is measured, established analytical chemistry. Oss et
-al. built an experimental electrospray ionization-efficiency scale for 62 organic
-compounds and found it spans roughly **six orders of magnitude** between compounds
-under identical conditions ([Anal. Chem. 2010, 82(7), 2865-2872](https://doi.org/10.1021/ac902856t)).
-Two different molecules therefore do not give comparable signal for equal
-concentration, which is exactly the `offset` term. Follow-up work from the same group
-shows that scale is also condition- and instrument-dependent (mobile phase, source,
-analyser), which is why the offset cannot be assumed constant across deposits
-([Rapid Commun. Mass Spectrom. 2021, 35, e9178](https://doi.org/10.1002/rcm.9178)).
-
-Does that six-orders-of-magnitude figure sink the ratio? No, for two reasons. It is
-the spread across 62 *unrelated* compounds; for our single fixed pair the offset is
-one unknown constant, not a wide range. And the ratio is itself the normalization: it
-cancels everything the two compounds share in a sample (injected amount, dilution,
-most matrix suppression), leaving only that one constant, which the within-dataset
-comparison below then removes.
-
-That drives how the plot below must be read:
-
-- *Within one dataset*, every file went through the same method, so the offset is the
-  same constant for all of them. Comparing groups inside a dataset subtracts two
-  numbers that share that constant, so it cancels and what remains is real biology.
-  This is why the within-dataset tests above, and the per-dataset contrasts `05`
-  computes, are legitimate; a rank test like the genotype validation in `04` is
-  invariant to the offset entirely, and the HILIC-vs-RP agreement `05` reports (the
-  same ratio recovered from two columns whose absolute areas differ up to 117x) is the
-  empirical version of the same statement.
-- *Between datasets*, the offsets differ by an unknown amount. A dataset whose box
-  sits a full unit higher than another's may simply have used a method that ionises
-  the parent more efficiently. Reading that gap as biology would be measuring the
-  instrument, not the patient.
-
-So compare the spread and the sign within each box; do not rank the datasets by their
-vertical position. Each box uses only files where both compounds were cleanly detected
-(a peak in both, neither flagged as a peak-width outlier), and the file count is in
-each label.
+Each box uses only files where both compounds were cleanly detected -- a peak in
+both, neither flagged as a peak-width outlier -- and the file count is in each
+label.
 
 ```{r plot-ratio-by-ds, fig.width = 8, fig.height = 5.5}
 # Alphabetical on purpose: sorting by median would invite exactly the
-# cross-dataset ranking the text above says is meaningless. (short_ds defined above.)
+# cross-dataset ranking the note below this plot says is meaningless.
 both_all <- analysis_samples |>
   dplyr::filter(detection_tier == "both",
                 !par_fwhm_outlier %in% TRUE,
@@ -702,11 +963,20 @@ ggplot(both_lab, aes(x = ds_label, y = log2_ratio)) +
   theme_bw()
 ```
 
+A mass spectrometer counts ions, not molecules, and omeprazole and
+5-hydroxyomeprazole ionise with different efficiency, so each box shows the true
+ratio plus an unknown per-method offset. Compare the spread and the sign
+*within* a box; do not rank the deposits by vertical position, since a box
+sitting a unit higher may simply have used a method that ionises the parent more
+readily. `05` sets out the offset model, the two designs in the corpus that let
+it be probed rather than asserted, and the variance decomposition that measures
+what the between-deposit spread is actually made of.
+
 ## Per-dataset detection-tier composition
 
 Every file lands in one of four tiers: **both** compounds detected,
-`parent_only`, `metab_only`, or `neither`. This plot shows the share of
-each dataset's files in each tier, which is the clearest picture of what kind of
+`parent_only`, `metab_only`, or `neither`. This plot shows the share of each
+dataset's files in each tier, which is the clearest picture of what kind of
 cohort each deposit actually is.
 
 ```{r plot-tier-composition, fig.width = 8, fig.height = 4.5}
@@ -724,9 +994,9 @@ analysis_samples |>
   theme(legend.position = "bottom")
 ```
 
-The share plot is dominated by "neither", which hides how much usable signal each
-dataset actually contributes. The second plot drops "neither" and shows the counts
-behind the detected files, with the per-dataset total on the right.
+The share plot is dominated by "neither", which hides how much usable signal
+each dataset actually contributes. The second plot drops "neither" and shows the
+counts behind the detected files, with the per-dataset total on the right.
 
 ```{r plot-tier-counts, fig.width = 8, fig.height = 4.5}
 det_counts <- analysis_samples |>
@@ -753,35 +1023,17 @@ ggplot(det_counts, aes(x = ds_label, y = n, fill = detection_tier)) +
   theme(legend.position = "bottom")
 ```
 
-### What the composition tells us
-
-**Most files are "neither", and that is the expected result, not a failure.**
-These are mostly general-population or disease cohorts, not drug trials: the vast
+Most files are "neither", which is the expected result rather than a failure.
+These are general-population and disease cohorts, not drug trials: the great
 majority of subjects were never prescribed omeprazole, so there is genuinely
-nothing in their files to find. A high "neither" share describes the cohort, not
-the pipeline. The deposits where "both" dominates are the drug-probe cohorts
-(MSV000082493 and MSV000084008, where every subject was dosed by design), and the
-contrast between those two shapes is the clearest illustration of what
-reverse-metabolomics is doing: finding the handful of incidentally-dosed people
-inside cohorts assembled for entirely unrelated reasons.
+nothing in their files to find, and a high "neither" share describes the cohort
+rather than the pipeline. The deposits where "both" dominates are the drug-probe
+cohorts, MSV000082493 and MSV000084008, where every subject was dosed by design.
+The contrast between the two shapes is the clearest picture of what reverse
+metabolomics is doing: finding the handful of incidentally-dosed people inside
+cohorts assembled for entirely unrelated reasons.
 
-**The split between `parent_only` and `metab_only` is informative, not noise.**
-A `parent_only` file means we saw the drug but not its metabolite; `metab_only`
-is the reverse. Neither is simply a miss. They are **censored** ratio
-observations: we know the ratio is very high (parent_only) or very low
-(metab_only), we just cannot say by how much, because one of the two peaks fell
-below the detection threshold.
-
-**That censoring is why the ratio analysis cannot simply keep the "both" files
-and forget the rest.** Restricting to "both" discards precisely the files with
-the most extreme ratios, which pulls any estimate toward the middle and
-understates real differences. Using them properly means treating them as bounds
-rather than pretending the missing peaks are missing at random, which is one of
-the open methodological questions `05` sets out.
-
-Taken together with the ratio plot above, the two figures frame the honest
-position of this layer: the ratio is only interpretable **within** a dataset, and
-within most datasets only a few files support it. Neither figure is meant to rank
-the deposits. They exist to show how much signal each cohort contributes and how
-much of it is censored, which is what any cross-cohort analysis would have to
-account for.
+`parent_only` and `metab_only` are not misses. Each is a censored ratio
+observation -- the ratio is known to be very high or very low, but not by how
+much, because one of the two peaks fell below detection. `05` takes up what that
+costs an estimate that keeps only the "both" files.

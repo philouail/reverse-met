@@ -263,10 +263,19 @@ files it needs.
 | file | contents |
 |---|---|
 | `R/_setup.R` | `library()` calls for all packages; creates `artifacts/` |
-| `R/masst.R` | `read_masst()`, `infer_adduct()`, `ADDUCT_CANDIDATES`; `compound_spec` + `role_formula` (the probe pair — swap here for another parent/metabolite pair) |
+| `R/masst.R` | `infer_adduct()`, `ADDUCT_CANDIDATES`; `compound_spec` + `role_formula` (the probe pair — swap here for another parent/metabolite pair) and `PHENO`, the CYP2C19 activity order the validation regresses on |
 | `R/metadata.R` | metadata reconciliation + file selection: `fetch_panredu_metadata()`, `msv_native_sample_table()` (full outer join of Pan-ReDU + submitter, validated against `massive_list_files()`), `norm_file_key()` / `to_bare_name()` (cross-source name matching), `load_metadata()`, `select_bio_files_massive()`, `is_missing_val()` |
-| `R/ms1.R` | MS1 pipeline: `load_spectra_ms1()`, `derive_extraction_config()`, `extract_eics()`, the peak picker (`pick()`, `detected_new()`, `new_win()`, `is_dropped()`), `process_eics()`, `build_sample_table()`, `run_ms1_for_dataset()`, `count_peaks()`, `flag_fwhm()`, `within_dataset_stats()`, `plot_fwhm_outliers()` |
+| `R/ms1.R` | MS1 pipeline: `load_spectra_ms1()`, `derive_extraction_config()`, `extract_eics()`, the peak picker (`pick()`, `detected_new()`, `new_win()`, `is_dropped()`), `process_eics()`, `build_sample_table()`, `run_ms1_for_dataset()`, `count_peaks()`, `flag_fwhm()`, `within_dataset_stats()`, `plot_fwhm_outliers()`; and `ablation_setup()` / `ablation_variant()` / `ablation_isobars()`, which re-run the extraction from the cached EICs with one choice changed so `03` can price each decision |
 | `R/peak_review_panels.R` | manual-audit tool (run standalone): re-picks from the cached wide EICs and writes per-dataset review panels + the single-threaded extraction-timing log `peaks_review_v2/_extract_times.csv` that `03`'s runtime table reads |
+
+### bench/
+
+Operational tooling only. Every analysis lives in the notebooks.
+
+| script | what it answers |
+|---|---|
+| `bench/rerun.sh` | re-render the five notebooks in order, logging each to `bench/rerun-<name>.log` |
+| `bench/time-pipeline.sh`, `bench/timing-report.R` | wall-clock timing of a full re-run, for `docs/pipeline-timing.md` |
 
 ### artifacts/
 
@@ -284,6 +293,7 @@ All intermediate files go here; nothing writes to the repo root.
 | `bio_assays_per_ds.rds` | `02` | `03` |
 | `sample_table_all.csv` | `03` | `04` |
 | `per_dataset/<dataset_id>.rds` | extraction step | `dataset-report.qmd`, `05` |
+| `isobar_fragment_check.csv` | `03` (cached; it reads raw MS2 and takes ~10 min, so delete it to force a recompute) | `03` |
 
 ### curation/
 

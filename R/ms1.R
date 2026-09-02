@@ -30,6 +30,8 @@ RT_SIGMA   <- 4       # RP selection: gaussian down-weight of AUC by distance fr
 SNAP_W     <- 20      # acceptance_window: snap a confirmed MS2 rt to the most intense MS1 apex within +/- this
 CLUST_TOL  <- 12      # acceptance_window: keep snapped apexes within this of their median (robust consensus)
 COHERE_S   <- 1       # acceptance_window: extend the window over peaks this close to its edge (cluster cohesion)
+CHAN_SEP   <- 6       # below this the two channels are not chromatographically resolved and
+                      #   resolve_isobars() cannot tell them apart, so it stands down
 
 # Walk one flank from the apex: descend to a valley, then merge the shoulder beyond it when that
 # shoulder sits < PROX_S from the apex OR the saddle is shallow (valley > MERGE_FRAC of the shoulder);
@@ -207,7 +209,7 @@ acceptance_window <- function(ds, role_full, cache_role, bare, old_win, conf, ov
                               hilic = FALSE) {
   hh <- conf[conf$dataset_id == ds & conf$role == role_full, ]
   if (!nrow(hh)) return(old_win)
-  fk <- bare(cache_role$files); ms2 <- suppressWarnings(as.numeric(hh$rt))
+  fk <- bare(cache_role$files); ms2 <- as.numeric(hh$rt)
   ovr <- ov[ov$dataset_id == ds & ov$role == role_full, ]
   apex <- vapply(seq_len(nrow(hh)), function(i) {
     j <- match(bare(hh$source_file[i]), fk); if (is.na(j)) return(NA_real_)
@@ -516,6 +518,126 @@ process_eics <- function(chr_par, chr_met, chr_all, dataset_id, cfg, conf, ov, d
 
 # NOTE: to_bare_name() lives in R/metadata.R next to norm_file_key() (which calls it); several scripts
 # source metadata.R alone, so it can't depend on ms1.R.
+
+# Reject a peak that is at the WRONG COMPOUND'S retention time.
+#
+# Both target masses carry a known isobar. The metabolite shares 362.1169 with
+# omeprazole sulfone, and -- less obviously -- the parent shares 346.1220 with
+# hydroxyomeprazole sulfide, which the source study annotates in these very samples
+# and which yields the same product ion (m/z 198.0571) as omeprazole, so it also
+# passes spectral confirmation. MS1 cannot separate either pair; only retention can.
+#
+# The two compounds are chromatographically resolved by construction, so a peak in
+# one channel sitting nearer the OTHER channel's confirmed retention time is not the
+# compound that channel is for. Two situations are handled:
+#
+# It fires only where both channels' anchors are resolved and far enough apart to
+# tell one from the other. Where either is `uncertain` -- its confirmed spectra
+# split into two retention clusters -- there is no trustworthy centre to compare
+# against, so nothing is rejected and the ambiguity is reported instead.
+#
+# Applied post hoc on stored apex times, so it costs no re-extraction.
+resolve_isobars <- function(metrics_par, metrics_met, conf, dataset_id,
+                            rt_anchor = NULL) {
+  centre <- function(role_full) {
+    q <- as.numeric(
+      conf$rt[conf$dataset_id == dataset_id & conf$role == role_full])
+    q <- q[is.finite(q)]
+    if (length(q)) stats::median(q) else NA_real_
+  }
+  cp <- centre("parent"); cm <- centre("metabolite")
+  # The rule needs BOTH anchors to be real. Where either channel's confirmed
+  # spectra split into two retention clusters, its median is a point between two
+  # peaks rather than a retention time, and comparing against it rejects peaks
+  # that sit exactly where the compound elutes -- which is what it did: it
+  # discarded every confirmed-file detection in MSV000088255 and ST002722,
+  # including peaks within 4 s of their own anchor. An unresolved anchor is a
+  # reason to withhold judgement, not to reject.
+  resolved <- !isTRUE(rt_anchor$par$uncertain) && !isTRUE(rt_anchor$met$uncertain) &&
+    is.finite(cp) && is.finite(cm) && abs(cp - cm) >= CHAN_SEP
+  drop <- function(m, role) {
+    col <- paste0(role, "_apex_rt"); det <- paste0(role, "_detected")
+    if (!resolved || !all(c(col, det) %in% names(m))) return(m)
+    own <- if (role == "par") cp else cm
+    oth <- if (role == "par") cm else cp
+    bad <- m[[det]] %in% TRUE & is.finite(m[[col]]) &
+      abs(m[[col]] - own) >= abs(m[[col]] - oth)
+    m[[det]][bad] <- FALSE
+    m
+  }
+  list(par = drop(metrics_par, "par"), met = drop(metrics_met, "met"))
+}
+
+# ---- ablations: re-run the extraction with one choice changed ---------------
+# `role_metrics()` above is the pipeline; these re-run it from the cached EICs
+# with a single parameter moved, so a notebook can ask what any one decision is
+# worth. Same picker, same gate, same drop-list -- only the named argument
+# differs, and ablation_variant() with no arguments must reproduce the cached
+# detection flags exactly.
+
+ROLE_FULL <- c(par = "parent", met = "metabolite")
+
+ablation_setup <- function(ds, bio_files) {
+  r  <- readRDS(sprintf("artifacts/per_dataset/%s.rds", ds))
+  fb <- basename(as.character(bio_files))
+  ch <- list(par = r$chr_par_narrow, met = r$chr_met_narrow)
+  list(ds = ds, cfg = r$cfg, ch = ch,
+       metrics = list(par = r$metrics_par, met = r$metrics_met),
+       tr = lapply(ch, function(c0) lapply(Chromatograms::peaksData(c0),
+              function(pd) list(rt = pd[, "rtime"], it = pd[, "intensity"]))),
+       fl = lapply(ch, function(c0) basename(dataOrigin(c0))),
+       bare = function(x) norm_file_key(to_bare_name(basename(as.character(x)), fb)))
+}
+
+# The consensus the pipeline does NOT use: every confirmed hit votes, so a file
+# fragmented fifteen times outweighs one fragmented five.
+ablation_window_per_hit <- function(e, role, conf, old_win) {
+  hh <- conf[conf$dataset_id == e$ds & conf$role == ROLE_FULL[[role]], ]
+  a  <- suppressWarnings(as.numeric(hh$rt)); a <- a[is.finite(a)]
+  if (!length(a)) return(old_win)
+  nbrs <- vapply(a, function(z) sum(abs(a - z) <= CLUST_TOL), integer(1))
+  top  <- a[nbrs == max(nbrs)]
+  inl  <- a[abs(a - stats::median(top)) <= CLUST_TOL]
+  w <- c(min(inl) - APEX_PAD, max(inl) + APEX_PAD)
+  attr(w, "uncertain") <- diff(range(top)) > CLUST_TOL
+  w
+}
+
+# Stops where role_metrics() stops, before the isobar rule; ablation_isobars()
+# is that step, kept separate so the baseline can be checked against the cache.
+ablation_variant <- function(e, conf, floor_val = MIN_INT, per_hit = FALSE,
+                             ov, drop_all) {
+  anchor <- list(); mets <- list()
+  for (role in c("par", "met")) {
+    old_win <- e$cfg[[paste0("rt_", role, "_win")]]
+    win <- if (per_hit) ablation_window_per_hit(e, role, conf, old_win) else
+      acceptance_window(e$ds, ROLE_FULL[[role]],
+                        list(files = e$fl[[role]], traces = e$tr[[role]]),
+                        e$bare, old_win, conf, ov, FALSE)
+    anchor[[role]] <- list(win = as.numeric(win),
+                           uncertain = isTRUE(attr(win, "uncertain")))
+    picks <- lapply(e$tr[[role]], function(t) pick(t$rt, t$it, win[1], win[2], FALSE))
+    picks <- add_msquality(e$ch[[role]], picks)
+    keep  <- which(!vapply(picks, is.null, logical(1)))
+    pk <- picks[keep]; fl <- e$fl[[role]][keep]
+    old_floor <- MIN_INT; MIN_INT <<- floor_val
+    det <- vapply(seq_along(pk), function(i) accept_peak(pk[[i]], FALSE) &&
+                    !is_dropped(e$ds, ROLE_FULL[[role]], fl[i], drop_all), logical(1))
+    MIN_INT <<- old_floor
+    mets[[role]] <- stats::setNames(
+      data.frame(file = fl,
+                 auc = vapply(pk, function(p) p$auc, numeric(1)),
+                 apex_rt = vapply(pk, function(p) p$apex_rt, numeric(1)),
+                 detected = det, stringsAsFactors = FALSE),
+      c("file", paste0(role, c("_auc", "_apex_rt", "_detected"))))
+  }
+  list(ds = e$ds, win = anchor, par = mets$par, met = mets$met)
+}
+
+ablation_isobars <- function(v, conf) {
+  mr <- resolve_isobars(v$par, v$met, conf, v$ds, v$win)
+  modifyList(v, list(par = as.data.frame(mr$par), met = as.data.frame(mr$met)))
+}
 
 build_sample_table <- function(metrics_par, metrics_met, files_base, meta,
                                dedup = TRUE) {

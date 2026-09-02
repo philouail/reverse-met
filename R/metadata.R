@@ -101,8 +101,13 @@ match_candidate <- function(native_cols, patterns) {
 
 native_sample_table <- function(deposit_id) {
   if (startsWith(deposit_id, "MTBLS")) {
-    as.data.frame(MsBackendMetaboLights::mtbls_sample_data(deposit_id),
-                  check.names = FALSE)
+    # Cached ISA-Tab study table first, same as the assay table in
+    # expand_files_mtbls(): a render must not depend on EBI being reachable.
+    cache <- file.path(META_DIR, paste0("s_", deposit_id, ".txt"))
+    if (file.exists(cache)) read.delim(cache, check.names = FALSE,
+                                       stringsAsFactors = FALSE) else
+      as.data.frame(MsBackendMetaboLights::mtbls_sample_data(deposit_id),
+                    check.names = FALSE)
   } else if (startsWith(deposit_id, "ST")) {
     MsBackendMetabolomicsWorkbench::mwb_metadata(deposit_id)$sample_annotation
   } else if (startsWith(deposit_id, "MSV")) {
@@ -281,13 +286,25 @@ load_metadata <- function(dataset_id,
            stop("Unknown deposit_id prefix: ", deposit_id)
 
   for (k in CANONICAL_COLS) if (!k %in% names(out)) out[[k]] <- NA
+  # `age` and `timepoint` are numeric by intent but come from free-text cells, and
+  # deposited metadata puts non-numbers in them (MSV000082493 carries a literal
+  # "FALSE" in ATTRIBUTE_Time_Point_Mins). Normalise here so every consumer sees a
+  # number or NA, rather than each one re-deciding and a stray string reaching a CSV.
+  for (k in c("age", "timepoint")) out[[k]] <- as_num(out[[k]])
   out[, CANONICAL_COLS]
 }
 
 expand_files_mtbls <- function(deposit_id, assay, native, s_canon, spec) {
   if (is.null(assay) || !nzchar(assay))
     stop("MTBLS load_metadata() requires `assay` (the a_*.txt file name).")
-  a_tbl <- MsBackendMetaboLights::mtbls_assay_data(deposit_id, assayName = assay)
+  # Prefer the copy `01` already cached in dataset_metadata/. Re-fetching here
+  # made every render depend on EBI being reachable, and when its FTP timed out
+  # the caller's tryCatch silently swapped a 35-column table for a 25-column
+  # stub -- which surfaced two chunks later as an rbind column mismatch, not as
+  # a network error. Downloads still go through the MsBackend package.
+  cache <- file.path(META_DIR, assay)
+  a_tbl <- if (file.exists(cache)) read.delim(cache, check.names = FALSE) else
+    MsBackendMetaboLights::mtbls_assay_data(deposit_id, assayName = assay)
   fcol <- if ("Derived Spectral Data File" %in% names(a_tbl) &&
               any(nzchar(trimws(as.character(
                 a_tbl[["Derived Spectral Data File"]])))))
@@ -487,6 +504,21 @@ select_bio_files_massive <- function(deposit_id, meta_keys = character(),
 REDU_MISSING <- c("missing value", "not applicable", "not collected",
                   "not provided", "restricted access", "na", "n/a", "",
                   "-", "unknown", "no data")
+
+# Numeric where the text is a number, NA where it is not.
+#
+# as.numeric() answers "is this numeric?" by raising a warning, which then has to
+# be hidden -- and hiding it is how a corrupt cell stays invisible. Deposited
+# metadata is full of non-numeric entries in numeric columns (MSV000082493 carries
+# a literal "FALSE" in ATTRIBUTE_Time_Point_Mins), so decide with a predicate and
+# convert only what passes.
+as_num <- function(x) {
+  x <- as.character(x)
+  ok <- !is.na(x) & grepl("^ *[-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)? *$", x)
+  out <- rep(NA_real_, length(x))
+  out[ok] <- as.numeric(x[ok])
+  out
+}
 
 is_missing_val <- function(x) {
   is.na(x) | tolower(trimws(as.character(x))) %in% REDU_MISSING

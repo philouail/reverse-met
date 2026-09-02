@@ -10,17 +10,13 @@ format:
     number-sections: true
     code-fold: show
     df-print: paged
-execute:
-  warning: false
-  message: false
 ---
 
 # Overview
 
 This document takes the curated MASST hit table produced by
-`01-masst-curation.qmd` (DIA datasets and datasets without metadata
-already removed) and runs SIRIUS annotation for every remaining
-MassIVE dataset.
+`01-masst-curation.qmd` (DIA datasets and datasets without metadata already
+removed) and runs SIRIUS annotation for every remaining MassIVE dataset.
 
 For each dataset two SIRIUS projects are created:
 
@@ -59,8 +55,9 @@ library(MetaboCoreUtils)
 library(RuSirius)
 library(dplyr)
 library(tidyr)
-# load_metadata(): the harmonised per-file metadata built in 01. Needed to label each hit
-# with its biofluid, which is what the (now disabled) cap stratified on.
+# load_metadata(): the harmonised per-file metadata built in 01. Needed to label
+# each hit with its biofluid, which is what the (now disabled) cap stratified
+# on.
 source("R/metadata.R")
 ```
 
@@ -68,14 +65,15 @@ source("R/metadata.R")
 
 ```{r compound-spec}
 # compound_spec is defined once in R/masst.R, sourced below. The local copy that
-# used to sit here named its InChIKey column `ikey1` while the shared one names it
-# `inchikey_block1`, so sourcing silently replaced it and every lookup returned NULL.
+# used to sit here named its InChIKey column `ikey1` while the shared one names
+# it `inchikey_block1`, so sourcing silently replaced it and every lookup
+# returned NULL.
 ```
 
 # Load curated hits
 
-`artifacts/hits_curated.csv` is written by `01-masst-curation.qmd`
-after the DIA and no-metadata filters have been applied.
+`artifacts/hits_curated.csv` is written by `01-masst-curation.qmd` after the DIA
+and no-metadata filters have been applied.
 
 ```{r load-hits}
 hits_curated <- read.csv("artifacts/hits_curated.csv", check.names = FALSE)
@@ -88,10 +86,11 @@ hits_massive <- hits_curated[
   startsWith(hits_curated$ATTRIBUTE_DatasetAccession, "MSV"), ]
 
 massive_datasets <- unique(hits_massive$ATTRIBUTE_DatasetAccession)
-# Overridable for a targeted re-run: CONFIRM_ONLY="MSV000082493,MSV000084008" restricts
-# the loop to those deposits. Empty (the default) processes all of them, as before.
-# NOTE: a restricted run also restricts the combined artifact written at the end of this
-# notebook, so the other deposits' confirmations must be merged back afterwards.
+# Overridable for a targeted re-run: CONFIRM_ONLY="MSV000082493,MSV000084008"
+# restricts the loop to those deposits. Empty (the default) processes all of
+# them, as before. NOTE: a restricted run also restricts the combined artifact
+# written at the end of this notebook, so the other deposits' confirmations must
+# be merged back afterwards.
 .only <- trimws(unlist(strsplit(Sys.getenv("CONFIRM_ONLY", ""), ",")))
 .only <- .only[nzchar(.only)]
 if (length(.only)) {
@@ -104,8 +103,8 @@ cat(length(massive_datasets), "MassIVE datasets to process\n")
 # Helper functions
 
 ```{r helpers}
-# ADDUCT_CANDIDATES and the ppm tolerance are defined once in R/masst.R; a local copy
-# here drifted out of step with it, so the list is taken from there.
+# ADDUCT_CANDIDATES and the ppm tolerance are defined once in R/masst.R; a local
+# copy here drifted out of step with it, so the list is taken from there.
 source("R/masst.R")
 PPM <- 25
 RT_TOL <- 3
@@ -124,26 +123,25 @@ RT_TOL <- 3
 # 0 plasma for the metabolite, purely because urine spectra score higher. The
 # biofluids it dropped then looked like "the compound is absent here", which is
 # an artifact of our own selection rather than a fact about the data.
-#
 # Capping per (role x biofluid) guarantees every biofluid gets an attempt, so a
 # biofluid that still ends up with no confirmation is genuine evidence and its
-# samples can be excluded on principle rather than by accident.
-# THE CAP IS NOW OFF by default (CONFIRM_CAP=Inf). It was capping the evidence, not just
-# the compute: the confirmed set is what anchors the RT window AND what the downstream
-# presence analysis counts, so a top-N by cosine was deciding which hits existed. Uncapping
-# took the confirmed set from 241 features to 7,201 and the positive control from a
-# capped subset to 768 of 771 files. Set CONFIRM_CAP to a number to restore a per-stratum
-# top-N; the stratified logic below is kept because it is the right shape if a cap is ever
-# needed again.
+# samples can be excluded on principle rather than by accident. THE CAP IS NOW
+# OFF by default (CONFIRM_CAP=Inf). It was capping the evidence, not just the
+# compute: the confirmed set is what anchors the RT window AND what the
+# downstream presence analysis counts, so a top-N by cosine was deciding which
+# hits existed. Uncapping took the confirmed set from 241 features to 7,201 and
+# the positive control from a capped subset to 768 of 771 files. Set CONFIRM_CAP
+# to a number to restore a per-stratum top-N; the stratified logic below is kept
+# because it is the right shape if a cap is ever needed again.
 CAP_PER_ROLE_BIOFLUID <- {
   .v <- Sys.getenv("CONFIRM_CAP", "Inf")
   if (identical(tolower(.v), "inf")) Inf else as.numeric(.v)
 }
 
 # Biofluid label for each hit, taken from the harmonised per-file metadata that
-# `01` built (col_body_site -> body_site). Never parsed from filenames. Hits whose
-# file has no body_site fall into an explicit "unknown" stratum, which still gets
-# its own allocation rather than being silently dropped.
+# `01` built (col_body_site -> body_site). Never parsed from filenames. Hits
+# whose file has no body_site fall into an explicit "unknown" stratum, which
+# still gets its own allocation rather than being silently dropped.
 hit_biofluid <- function(hits_ds, ds) {
   meta <- tryCatch(load_metadata(ds), error = function(e) NULL)
   if (is.null(meta) || !"body_site" %in% names(meta))
@@ -304,7 +302,8 @@ for (ds in massive_datasets) {
   }
 
   # Cap per (role x biofluid): top-cosine within each stratum, so every biofluid
-  # present in the hits gets its own shot at an anchor. See CAP_PER_ROLE_BIOFLUID.
+  # present in the hits gets its own shot at an anchor. See
+  # CAP_PER_ROLE_BIOFLUID.
   if (nrow(hits_ds) && is.finite(CAP_PER_ROLE_BIOFLUID)) {
     hits_ds$biofluid <- hit_biofluid(hits_ds, ds)
     before <- table(hits_ds$role, hits_ds$biofluid)
@@ -442,8 +441,8 @@ message("All datasets processed.")
 
 ## Helper functions
 
-Each SIRIUS feature is assigned a **confidence level** based on where the
-target formula and structure rank in the SIRIUS output:
+Each SIRIUS feature is assigned a **confidence level** based on where the target
+formula and structure rank in the SIRIUS output:
 
 | Confidence | Formula rank | Structure rank |
 |------------|-------------|----------------|
@@ -674,9 +673,9 @@ features |>
 
 # Write confirmed hits
 
-Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept
-as MassIVE-confirmed; the `confidence` and `rt` (seconds) columns are
-preserved for downstream stratification and RT-window alignment.
+Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept as
+MassIVE-confirmed; the `confidence` and `rt` (seconds) columns are preserved for
+downstream stratification and RT-window alignment.
 
 ```{r write-confirmed}
 hits_confirmed_massive <- features |>

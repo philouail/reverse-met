@@ -1,21 +1,9 @@
-# R/masst.R — read and pre-process StructureMASST exports
+# R/masst.R — adduct inference and the probe-pair constants
 
 ADDUCT_CANDIDATES <- c(
   "[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+", "[M+H-H2O]+",
   "[M-H]-", "[M+Cl]-"
 )
-
-# Read one MASST CSV, label its role, and split the USI into file_path/scan_str.
-read_masst <- function(path, role) {
-  x <- read.csv(path, check.names = FALSE)
-  for (j in seq_along(x))
-    if (is.character(x[[j]])) x[[j]][is_missing_val(x[[j]])] <- NA
-  parts       <- strsplit(x$USI, ":", fixed = TRUE)
-  x$file_path <- vapply(parts, `[`, character(1), 3)
-  x$scan_str  <- vapply(parts, \(p) p[length(p)], character(1))
-  x$role      <- role
-  x
-}
 
 # Infer the adduct: match observed precursor m/z to theoretical adduct m/z,
 # returning the closest within ppm tolerance (else NA).

@@ -10,14 +10,11 @@ format:
     number-sections: true
     code-fold: show
     df-print: paged
-execute:
-  warning: false
-  message: false
 ---
 
 # Overview
 
-Identical pipeline to `masst-hit-confirmation.qmd`, but restricted to
+Identical pipeline to `massIVE-hit-confirmation.qmd`, but restricted to
 Metabolomics Workbench datasets (`ST*` accessions) and using
 `MsBackendMetabolomicsWorkbench` for raw file access.
 
@@ -44,8 +41,9 @@ library(ggplot2)
 
 ```{r compound-spec}
 # compound_spec is defined once in R/masst.R, sourced below. The local copy that
-# used to sit here named its InChIKey column `ikey1` while the shared one names it
-# `inchikey_block1`, so sourcing silently replaced it and every lookup returned NULL.
+# used to sit here named its InChIKey column `ikey1` while the shared one names
+# it `inchikey_block1`, so sourcing silently replaced it and every lookup
+# returned NULL.
 ```
 
 # Load curated hits
@@ -67,17 +65,18 @@ cat(length(mwb_datasets), "Metabolomics Workbench datasets to process\n")
 # Helper functions
 
 ```{r helpers}
-# ADDUCT_CANDIDATES is defined once in R/masst.R; the local copy here had drifted.
+# ADDUCT_CANDIDATES is defined once in R/masst.R; the local copy here had
+# drifted.
 source("R/masst.R")
 PPM    <- 25
 RT_TOL <- 3   # seconds around hit RT
 
 # Cap the number of hits per role sent to SIRIUS. The confirmed features are
 # used downstream (05, derive_extraction_config) only to compute the per-
-# (dataset, role) MEDIAN m/z + RT that anchors the MS1 extraction window. The cap is
-# OFF: a capped subset is enough to anchor, but the confirmed set is also the
-# downstream evidence of presence, and capping by cosine silently decided which hits
-# counted. The is.finite() guard below is what switches it off.
+# (dataset, role) MEDIAN m/z + RT that anchors the MS1 extraction window. The
+# cap is OFF: a capped subset is enough to anchor, but the confirmed set is also
+# the downstream evidence of presence, and capping by cosine silently decided
+# which hits counted. The is.finite() guard below is what switches it off.
 CAP_PER_ROLE <- Inf
 
 infer_adduct <- function(obs_mz, formula,
@@ -539,9 +538,9 @@ features |>
 
 # Write confirmed hits
 
-Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept
-as Metabolomics Workbench-confirmed; the `confidence` and `rt` (seconds)
-columns are preserved for downstream stratification and RT-window alignment.
+Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept as
+Metabolomics Workbench-confirmed; the `confidence` and `rt` (seconds) columns
+are preserved for downstream stratification and RT-window alignment.
 
 ```{r write-confirmed}
 hits_confirmed_mwb <- features |>
