@@ -12,20 +12,17 @@ format:
     df-print: paged
 params:
   run_confirmations: false
-execute:
-  warning: false
-  message: false
 ---
 
 # Overview
 
-First step of the pipeline: load the StructureMASST hit set for omeprazole
-and its CYP2C19 metabolite (5-hydroxyomeprazole), keep datasets where both
-compounds appear, and curate that intersection down to the (dataset, assay)
-combinations suitable for a parent/metabolite ratio analysis.
+First step of the pipeline: load the StructureMASST hit set for omeprazole and
+its CYP2C19 metabolite (5-hydroxyomeprazole), keep datasets where both compounds
+appear, and curate that intersection down to the (dataset, assay) combinations
+suitable for a parent/metabolite ratio analysis.
 
-A *dataset* means **one assay of one deposit**; every downstream step joins
-on `dataset_id`, which encodes the deposit + assay pair.
+A *dataset* means **one assay of one deposit**; every downstream step joins on
+`dataset_id`, which encodes the deposit + assay pair.
 
 The search:
 
@@ -47,12 +44,12 @@ scripted and pinned rather than a one-off web query.
 
 **Writes:**
 
-- `artifacts/hits_curated.csv` - MASST hits restricted to curated keeps,
-  with `dataset_id`, `deposit_id`, `assay` and `adduct_inferred` columns
-  populated. Read by the three SIRIUS confirmation notebooks.
-- `artifacts/dataset_metadata_table.csv` - one row per kept (deposit,
-  assay) with repository, chromatography, paper-derived constants and
-  the col_/const_ mappings consumed by `load_metadata()`.
+- `artifacts/hits_curated.csv` - MASST hits restricted to curated keeps, with
+  `dataset_id`, `deposit_id`, `assay` and `adduct_inferred` columns populated.
+  Read by the three SIRIUS confirmation notebooks.
+- `artifacts/dataset_metadata_table.csv` - one row per kept (deposit, assay)
+  with repository, chromatography, paper-derived constants and the col_/const_
+  mappings consumed by `load_metadata()`.
 
 ```{r setup}
 source("R/_setup.R")
@@ -67,9 +64,9 @@ The omeprazole / 5-hydroxyomeprazole pair is a CYP2C19 phenotyping readout:
 CYP2C19 hydroxylates omeprazole at the 5-position, so the parent/5-OH ratio
 reflects CYP2C19 metaboliser status.
 
-Both compounds were queried in both polarities; downstream code picks the
-adduct with the most confirmed hits per dataset and collapses adducts to one
-feature per compound per sample.
+Both compounds were queried in both polarities; downstream code picks the adduct
+with the most confirmed hits per dataset and collapses adducts to one feature
+per compound per sample.
 
 ```{r compound-spec}
 compound_spec
@@ -79,31 +76,35 @@ compound_spec
 
 **Provenance and reproduction.** FASSTrecords is a repository-scale snapshot of
 public MASST annotations (a ~1.2-billion-row SQLite of every GNPS/MASST spectrum
-match), archived on Zenodo at **DOI 10.5281/zenodo.18199544**
-(sha256 `95a11bbe…`). We downloaded that archive and extracted the hit set on
-**2026-07-10**. To reproduce, download the Zenodo archive to the `FASST_DB` path in
-the discovery chunk below and delete `StructureMASST_output/fasstrecords_hits.csv`;
-the chunk then resolves each compound to its GNPS library spectra by InChIKey first
-block (omeprazole `SUBDBMMJDZJVOS`, 5-OH `CMZHQFXXAAIBKE`), pulls every `masst_table`
-match at cosine ≥ 0.7 and ≥ 3 matched peaks, joins the per-file ReDU fields, and
-writes `StructureMASST_output/fasstrecords_hits.csv`.
+match), archived on Zenodo at **DOI 10.5281/zenodo.18199544** (sha256
+`95a11bbe…`). We downloaded that archive and extracted the hit set on
+**2026-07-10**. To reproduce, download the Zenodo archive to the `FASST_DB` path
+in the discovery chunk below and delete
+`StructureMASST_output/fasstrecords_hits.csv`; the chunk then resolves each
+compound to its GNPS library spectra by InChIKey first block (omeprazole
+`SUBDBMMJDZJVOS`, 5-OH `CMZHQFXXAAIBKE`), pulls every `masst_table` match at
+cosine ≥ 0.7 and ≥ 3 matched peaks, joins the per-file ReDU fields, and writes
+`StructureMASST_output/fasstrecords_hits.csv`.
 
 Because the archive is immutable (DOI + checksum), this discovery step is fully
 pinned. The chunk **skips itself** when the ~1.2B-row DB is absent or the CSV
-already exists, so a fresh clone — and every normal re-render — uses the committed
+already exists, so a fresh clone (and every normal re-render) uses the committed
 output unchanged. Each row of the hit table carries:
 
 - `ATTRIBUTE_DatasetAccession`, `file_path`, `scan_id`, `role` (parent /
-  metabolite) — where the hit is;
-- `Precursor_MZ` and the inferred `Adduct` — what was matched;
+  metabolite): where the hit is;
+- `Precursor_MZ` and the inferred `Adduct`: what was matched;
 - the per-file ReDU fields the hard stops key on: `ChromatographyAndPhase`,
   `IonizationSourceAndPolarity`, `NCBITaxonomy`, `SampleType`.
 
+One class of row is dropped as the set is built rather than downstream. Some
+mzML converters write the scan number `4294967295`, the maximum 32-bit unsigned
+integer, when the scan index is unresolved; such a hit cannot locate a spectrum,
+so `INVALID_SCAN` removes it below. The committed CSV therefore contains none,
+and nothing further down needs to check again.
+
 ```{r discovery-fasstrecords}
-# Resolve the probe pair to its GNPS library spectra and pull every StructureMASST match
-# from the FASSTrecords DB. That ~1.2B-row SQLite (Zenodo DOI 10.5281/zenodo.18199544,
-# immutable) is NOT in the repo, so this runs ONLY where the DB is present AND the output is
-# missing; otherwise the committed CSV is used unchanged. Delete the CSV to force a rebuild.
+# Delete the CSV to force a rebuild.
 FASST_DB  <- "D:/FASSTrecords/db/masst_records.sqlite"
 FASST_OUT <- "StructureMASST_output/fasstrecords_hits.csv"
 if (file.exists(FASST_DB) && !file.exists(FASST_OUT)) {
@@ -177,31 +178,12 @@ cat("  parent    :", sum(all_hits$role == "parent"), "\n")
 cat("  metabolite:", sum(all_hits$role == "metabolite"), "\n")
 ```
 
-## Remove corrupted USIs
-
-The scan number `4294967295` (max 32-bit unsigned int) is written by some
-mzML converters when the scan index is unresolved; such hits can't locate a
-spectrum, so we drop them.
-
-```{r filter-corrupt-usi}
-INVALID_SCAN <- 4294967295   # 32-bit uint sentinel; > .Machine$integer.max, so keep numeric
-n_corrupt <- sum(all_hits$scan_id == INVALID_SCAN, na.rm = TRUE)
-all_hits  <- all_hits[is.na(all_hits$scan_id) | all_hits$scan_id != INVALID_SCAN, ]
-```
-
-```{r filter-corrupt-usi-summary}
-#| echo: false
-cat("Corrupted USIs removed:", n_corrupt,
-    "(", round(100 * n_corrupt / (nrow(all_hits) + n_corrupt), 1),
-    "% of all hits)\n")
-```
-
 # Dataset selection
 
 ## D_both: datasets where both compounds appear
 
-We restrict to the intersection of datasets containing at least one MASST
-hit for each compound. Datasets with only one compound cannot provide a
+We restrict to the intersection of datasets containing at least one MASST hit
+for each compound. Datasets with only one compound cannot provide a
 parent/metabolite ratio and are out of scope.
 
 ```{r d-both}
@@ -217,78 +199,255 @@ cat("parent datasets:", length(D_parent),
     "| intersection:", length(D_both), "\n")
 ```
 
-## Hard-stop exclusions
+# Per-deposit metadata
 
-Reusable safety filter, derived from columns in the MASST export itself (no
-network calls). A dataset is dropped only if **all** its hits fail the rule — one
-LC hit in a mixed GC/LC deposit keeps it.
+A deposit that contains the drug pair is only useful if its files can be tied to
+the people they came from, and that information is not in the spectra. It sits
+in whatever the depositor and the repository happened to record, in whatever
+format each repository uses, at whatever level of completeness the submitter
+chose. Reconciling that is the single largest piece of manual work in this
+project, and it is worth being explicit about the cost rather than presenting
+the harmonised table as though it fell out of an API.
 
-On *this* corpus these rules remove **nothing**, and that is expected: a
-FASSTrecords hit set is already restricted to the GNPS ecosystem
-(`MSV`/`MTBLS`/`ST`) and to LC/ESI acquisition. The rules earn their place when
-the pipeline is pointed at a different, less pre-filtered query. Non-human
-deposits whose taxonomy is missing from the export are caught in the manual
-exclusions below instead.
+Four sources are consulted, and none of them is currently sufficient : the
+pinned per-deposit metadata directory, Pan-ReDU, the MetaboLights ISA-Tab, and
+the Metabolomics Workbench mwTab. Where all four fail, the metadata has to be
+found by hand. Six deposits needed that, and the sections below are the record
+of it --- `MSV000085256` and `MSV000082433` from Pan-ReDU after the deposit
+itself came up short, `MSV000086975` from a submitter TSV inside the deposit,
+`MTBLS12231` from the ISA-Tab assay files, and the probe cohort (`MSV000082493`
+/ `MSV000084008`) from **a GitHub repository belonging to the original
+authors**, at a pinned commit. That last one is not a footnote: the CYP2C19
+genotypes the entire validation rests on are in that repository and in no
+metadata catalogue, so without someone reading the paper, finding the repository
+and pinning a commit, the central result of this work does not exist.
 
-| rule | source column | reason |
-|---|---|---|
-| repository prefix | `ATTRIBUTE_DatasetAccession` | The pipeline only supports direct raw-file download from MetaboLights (`MTBLS*`), Metabolomics Workbench (`ST*`) and MassIVE (`MSV*`). |
-| GC-only chromatography | `ChromatographyAndPhase` | The pipeline targets LC-MS for omeprazole; GC ionisation profiles and retention behaviour are incompatible. |
-| imaging MS (MALDI / DESI / SIMS) | `IonizationSourceAndPolarity` | No LC dimension, no per-file retention time to match against. |
-| non-human taxa | `NCBITaxonomy` | Optional. The ratio analysis is a CYP2C19 phenotyping readout in humans. Flip `drop_non_human <- FALSE` to disable. |
+The mapping is per deposit because there is no shared schema to map to. Each
+block below translates one deposit's own column names into the fields the
+pipeline needs, and each was written by reading that deposit's documentation.
+That is the bottleneck: not compute, not storage, but a person working out what
+`#SampleID` means in one study and `SubjectIdentifierAsRecorded` in another, and
+whether either identifies a person. Efforts such as MetabolomicsHub are
+addressing exactly this, and until something like it is universal, corpus-scale
+reuse will keep paying this cost per deposit.
 
-```{r hard-stops}
-#| code-fold: true
-drop_non_human <- TRUE
-
-hits_by_ds <- split(all_hits, all_hits$ATTRIBUTE_DatasetAccession)
-
-all_match <- function(d, col, pattern) {
-  v <- hits_by_ds[[d]][[col]]
-  v <- v[!is.na(v) & v != "missing value"]
-  length(v) > 0 && all(grepl(pattern, v, perl = TRUE, ignore.case = TRUE))
+```{r metadata-setup}
+MD <- "dataset_metadata"
+miss <- function(x) {
+  x[x %in% c("", "missing value", "not applicable", "not collected")] <- NA
+  x
 }
-
-fail_prefix  <- D_both[!grepl("^(MSV|MTBLS|ST)[0-9]", D_both)]
-fail_gc      <- D_both[vapply(D_both, all_match, logical(1),
-                              "ChromatographyAndPhase", "gas chromatography|^GC")]
-fail_imaging <- D_both[vapply(D_both, all_match, logical(1),
-                              "IonizationSourceAndPolarity",
-                              "MALDI|DESI|SIMS|imaging")]
-fail_taxa    <- if (drop_non_human) {
-  bad <- vapply(D_both, function(d) {
-    tx <- hits_by_ds[[d]]$NCBITaxonomy
-    tx <- tx[!is.na(tx) & tx != "missing value"]
-    length(tx) > 0 && !any(grepl("Homo sapiens|\\b9606\\b", tx))
-  }, logical(1))
-  D_both[bad]
-} else character(0)
-
-hard_stops <- list(
-  repo_prefix = fail_prefix,
-  gc_only     = fail_gc,
-  imaging_ms  = fail_imaging,
-  non_human   = fail_taxa
-)
-D_both <- setdiff(D_both, unlist(hard_stops, use.names = FALSE))
 ```
 
-```{r hard-stops-summary}
+
+## Where each deposit's metadata came from
+
+Six deposits needed their metadata found by hand, and each block below
+translates one deposit's own column names into the fields the pipeline needs.
+The source and the reading behind it, per deposit:
+
+- **`MSV000082493` and `MSV000084008`** --- the omeprazole probe cohort
+  (Jarmusch et al. 2020, *Clin Transl Sci*, PMC7485946). Healthy volunteers
+  given a modified Cooperstown CYP-probe cocktail on study days 1 and 9 with a
+  7-day cefprozil course in between; plasma, urine, feces and skin. The metadata
+  is in neither deposit and in no catalogue --- it is in the authors' GitHub
+  repository, `Materials/Metadata.txt` at commit `95586620`, and it carries the
+  genotyped CYP2C19 phenotype per subject that `04` validates against. The two
+  accessions share one table: plasma rows onboard under 084008, the rest under
+  082493.
+- **`MSV000086975`** --- schizophrenia (PMID 34741130). A submitter TSV inside
+  the deposit.
+- **`MSV000085256`** --- Alzheimer's (PMID 34244695). Pan-ReDU JSON, the deposit
+  itself having come up short.
+- **`MSV000082433`** --- Amerindian communities. Pan-ReDU JSON. The one deposit
+  whose recorded country describes participant origin rather than a study site.
+- **`MTBLS12231`** --- COVID (PMC12019401). MetaboLights ISA-Tab, the `s_`
+  sample file joined to the two `a_` assay files. ISA-Tab permits duplicate
+  column names, so the first occurrence of each is selected by index.
+
+The probe cohort is fetched first because everything else reads from
+`dataset_metadata/`, and its file is not in the repository until this runs.
+
+```{r fetch-82493}
+SRC_COMMIT <- "95586620ead4ac5241dc1e99a98e047c1f99b17b"
+SRC_URL <- sprintf(paste0("https://raw.githubusercontent.com/alan-jarmusch/",
+                          "UntargetedMS-DrugMetabolism/%s/Materials/Metadata.txt"),
+                   SRC_COMMIT)
+LOCAL <- "dataset_metadata/MSV000082493_metadata.tsv"
+if (!file.exists(LOCAL))
+  utils::download.file(SRC_URL, LOCAL, quiet = TRUE, mode = "wb")
+
+jm <- read.delim(LOCAL, check.names = FALSE, stringsAsFactors = FALSE,
+                na.strings = c("", "not applicable"))
+```
+
+## One schema for all of them
+
+The blocks below write one row per file with the same columns whatever the
+source, so the deposits can be combined. Three of those columns exist only
+because the probe cohort has them: `timepoint` is its study day,
+`timepoint_mins` the minutes post-dose within that day, and
+`pharmkinetics_cyp2c19` the source study's own published per-subject CYP2C19
+value. Every field is taken from a declared metadata attribute; nothing is
+parsed out of a filename. The combined table is written to
+`artifacts/rescue_samples.csv`.
+
+```{r std-schema}
+std_cols <- c("deposit_id","file","subject_id","sex","age","health_status",
+              "specimen","timepoint","timepoint_mins","pharmkinetics_cyp2c19",
+              "cyp2c19_phenotype","cyp2c19_genotype","include")
+num_cols <- c("age", "timepoint_mins", "pharmkinetics_cyp2c19")
+blank <- function(n) setNames(as.data.frame(matrix(NA_character_, n, length(std_cols))), std_cols)
+```
+
+```{r jarmusch}
+jm_std <- data.frame(
+  file = jm$filename, subject_id = jm$ATTRIBUTE_Subject, sex = jm$ATTRIBUTE_sex,
+  age = as_num(jm$age), health_status = "healthy",
+  specimen = dplyr::case_when(grepl("plasma", jm$ATTRIBUTE_Body_Site, TRUE) ~ "plasma",
+                              grepl("^UA", jm$ATTRIBUTE_Body_Site) ~ "urine",
+                              grepl("fecal", jm$ATTRIBUTE_Body_Site, TRUE) ~ "feces",
+                              grepl("forehead|skin", jm$ATTRIBUTE_Body_Site, TRUE) ~ "skin",
+                              TRUE ~ NA_character_),
+  timepoint = jm$ATTRIBUTE_Study_Day,
+  timepoint_mins = as_num(jm$ATTRIBUTE_Time_Point_Mins),
+  pharmkinetics_cyp2c19 = as_num(jm$PharmKinetics_CYP2C19),
+  cyp2c19_phenotype = jm$PharmGeno_Phenotype_2C19,
+  cyp2c19_genotype = jm$PharmGeno_CYP2C19, include = jm$Include_Exclude,
+  stringsAsFactors = FALSE)
+jm_std <- jm_std[jm_std$include %in% "include" & !is.na(jm_std$specimen), ]
+d84008 <- cbind(deposit_id = "MSV000084008", jm_std[jm_std$specimen == "plasma", std_cols[-1]])
+d82493 <- cbind(deposit_id = "MSV000082493", jm_std[jm_std$specimen != "plasma", std_cols[-1]])
+```
+
+```{r probe-summary}
 #| echo: false
-cat("Hard-stop exclusions:\n")
-for (nm in names(hard_stops)) {
-  n <- length(hard_stops[[nm]])
-  cat(sprintf("  %-12s: %2d", nm, n))
-  if (n) cat("  ->  ", paste(hard_stops[[nm]], collapse = ", "), sep = "")
-  cat("\n")
-}
-cat("\nSurviving:", length(D_both), "datasets\n")
+cat("MSV000082493 + 084008:", nrow(jm_std), "biological samples of", nrow(jm), "files
+")
+cat("
+specimen x study day:
+");       print(table(jm_std$specimen, jm_std$timepoint, useNA = "ifany"))
+cat("
+CYP2C19 genotyped phenotype:
+"); print(table(jm_std$cyp2c19_phenotype, useNA = "ifany"))
+cat("
+subjects:", length(unique(jm_std$subject_id)), "
+")
 ```
 
-## Other manual exclusions
+MSV000084008 has no Pan-ReDU record and its hit files are all blood plasma, so
+its metadata is written as the plasma subset of the shared table. Files hosted
+under 082493 simply fail to sync under 084008 and are skipped, so nothing is
+double counted.
 
-Datasets that survive the hard stops but still have to go for repository- or
-study-specific reasons. The `reason` vocabulary:
+```{r derive-84008}
+is_plasma <- grepl("plasma", jm$ATTRIBUTE_Body_Site, ignore.case = TRUE)
+plasma <- jm[is_plasma, , drop = FALSE]
+write.table(plasma, "dataset_metadata/MSV000084008_metadata.tsv",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+cat("MSV000084008_metadata.tsv <- plasma rows:", nrow(plasma), "of", nrow(jm), "\n")
+cat("body sites kept:", paste(sort(unique(plasma$ATTRIBUTE_Body_Site)), collapse = ", "), "\n")
+```
+
+```{r sz}
+sz <- read.delim(file.path(MD, "MSV000086975_metadata.tsv"), check.names = FALSE, stringsAsFactors = FALSE)
+sid <- strsplit(sz$`#SampleID`, "_", fixed = TRUE)
+d86975 <- blank(nrow(sz)); d86975$deposit_id <- "MSV000086975"
+d86975$file <- sz$Metabolomics_FileName; d86975$subject_id <- sz$`#SampleID`
+d86975$sex <- vapply(sid, function(p) if (length(p) >= 2) p[2] else NA_character_, character(1))
+d86975$age <- as_num(sz$AGE)
+d86975$health_status <- sz$Metadata          # HC / SZ
+d86975$specimen <- "plasma"; d86975$include <- "include"
+```
+
+```{r az}
+pj <- function(f) {
+  txt <- paste(readLines(file.path(MD, f), warn = FALSE), collapse = "")
+  objs <- regmatches(txt, gregexpr("\\{[^{}]*\\}", txt))[[1]]
+  g <- function(o, k) { m <- regmatches(o, regexpr(sprintf('"%s": "[^"]*"', k), o))
+    if (length(m)) sub('.*: "', "", sub('"$', "", m)) else NA_character_ }
+  data.frame(file = miss(vapply(objs, g, character(1), "filename")),
+             subject_id = miss(vapply(objs, g, character(1), "SubjectIdentifierAsRecorded")),
+             sex = miss(vapply(objs, g, character(1), "BiologicalSex")),
+             age = as_num(miss(vapply(objs, g, character(1), "AgeInYears"))),
+             health_status = miss(vapply(objs, g, character(1), "HealthStatus")),
+             specimen = miss(vapply(objs, g, character(1), "UBERONBodyPartName")),
+             row.names = NULL, stringsAsFactors = FALSE) }
+a <- pj("MSV000085256_panredu.json"); d85256 <- blank(nrow(a)); d85256$deposit_id <- "MSV000085256"
+d85256[names(a)] <- a; d85256$specimen <- ifelse(grepl("plasma", d85256$specimen, TRUE), "plasma",
+                                          ifelse(grepl("cerebro|CSF", d85256$specimen, TRUE), "CSF", d85256$specimen))
+d85256$include <- "include"
+```
+
+```{r amerindians}
+b <- pj("MSV000082433_panredu.json"); d82433 <- blank(nrow(b)); d82433$deposit_id <- "MSV000082433"
+d82433[names(b)] <- b; d82433$include <- "include"
+```
+
+```{r covid}
+col1 <- function(d, nm) d[[ which(names(d) == nm)[1] ]]
+s <- read.delim(file.path(MD, "s_MTBLS12231.txt"), check.names = FALSE, stringsAsFactors = FALSE)
+read_a <- function(p) { d <- read.delim(
+    file.path(MD, sprintf("a_MTBLS12231_LC-MS_%s_reverse-phase_metabolite_profiling.txt", p)),
+    check.names = FALSE, stringsAsFactors = FALSE)
+  # the raw column is empty here; pick whichever *Spectral Data File column is
+  # populated
+  fcols <- grep("Spectral Data File", names(d))
+  fcol  <- fcols[which.max(vapply(fcols, function(i)
+             sum(grepl("\\.(mzML|mzXML|raw|d|wiff)$", d[[i]])), integer(1)))]
+  data.frame(sample = col1(d, "Sample Name"), raw = basename(d[[fcol]]),
+             stringsAsFactors = FALSE) }
+amap <- rbind(read_a("positive"), read_a("negative"))
+sref <- data.frame(sample = col1(s, "Sample Name"),
+                   genetype = col1(s, "Factor Value[genetype]"),
+                   part = col1(s, "Characteristics[Organism part]"), stringsAsFactors = FALSE)
+mm <- dplyr::left_join(amap, sref, by = "sample")
+d12231 <- blank(nrow(mm)); d12231$deposit_id <- "MTBLS12231"
+d12231$file <- basename(mm$raw); d12231$subject_id <- mm$sample
+d12231$health_status <- mm$genetype; d12231$specimen <- mm$part
+d12231$include <- "include"
+```
+
+```{r combine}
+frames <- lapply(list(d82493, d84008, d86975, d85256, d82433, d12231), function(f) {
+  f$timepoint <- as.character(f$timepoint)
+  for (cc in setdiff(std_cols, num_cols)) f[[cc]] <- as.character(f[[cc]])
+  for (cc in num_cols) f[[cc]] <- as_num(f[[cc]])
+  f[, std_cols]
+})
+all_std <- dplyr::bind_rows(frames)
+write.csv(all_std, "artifacts/rescue_samples.csv", row.names = FALSE)
+
+cat("Rescue samples per deposit x specimen:\n"); print(table(all_std$deposit_id, all_std$specimen, useNA = "ifany"))
+cat("\nHealth stratifier availability per deposit:\n")
+for (d in unique(all_std$deposit_id)) {
+  x <- all_std[all_std$deposit_id == d, ]
+  cat(sprintf("  %-14s n=%-4d sex=%-3s age=%-3s health={%s}\n", d, nrow(x),
+      ifelse(any(!is.na(x$sex)),"Y","-"), ifelse(any(!is.na(x$age)),"Y","-"),
+      paste(sort(unique(na.omit(x$health_status))), collapse="/")))
+}
+```
+
+
+## Manual exclusions
+
+Nothing about the acquisition removes a deposit at this point. All 44 come from
+the three repositories the pipeline can download from (36 MassIVE, 4
+MetaboLights, 4 Metabolomics Workbench), and every hit was acquired by liquid
+chromatography with electrospray ionisation: reverse phase C18, HILIC or reverse
+phase unspecified, positive or negative mode. No GC, no MALDI, no DESI. Species
+is recorded properly where it is recorded at all --- `NCBITaxonomy` carries
+`9606|Homo sapiens` throughout --- and the gap is coverage rather than content,
+unevenly by repository: both MetaboLights and both Workbench deposits populate
+it on every hit, only 6 of 8 MassIVE deposits populate it at all, and at this
+stage it is present for 25 of the 44. The wider corpus is not all human, since
+across the 128 deposits with a hit the same column also carries mouse, bacteria
+and three *Banisteriopsis* species, and two accessions are NORMAN identifiers
+the pipeline cannot download --- but those leave at the both-roles filter, so no
+taxonomic gate is load-bearing here. It would be, on a query that returned them.
+
+What does remove deposits is repository- or study-specific and decided by hand.
+The `reason` vocabulary:
 
 | reason | what it means |
 |---|---|
@@ -345,30 +504,30 @@ cat("\nSurviving after manual exclusions:", length(D_both), "datasets\n")
 
 ## Auto-derived dataset metadata
 
-For each surviving deposit we harvest **technical** metadata (per-assay:
-chromatography, ionisation, instrument) and **biological** metadata
-(per-deposit: which native columns hold subject_id, sex, age). Sources and
-cache locations are repository-specific:
+The rescue above covers the six deposits no automated route reaches. This step
+is the automated route, run over every surviving deposit --- including those
+six, whose files it can now read because the blocks above wrote them into
+`dataset_metadata/`. For each deposit we harvest **technical** metadata
+(per-assay: chromatography, ionisation, instrument) and **biological** metadata
+(per-deposit: which native columns hold subject_id, sex, age). Sources and cache
+locations are repository-specific:
 
-- **MetaboLights (`MTBLS*`)**: technical via
-  `mtbls_assay_data()` (the assay `a_*.txt`
-  files); biological via `mtbls_sample_data()` (the `s_*.txt` sample
+- **MetaboLights (`MTBLS*`)**: technical via `mtbls_assay_data()` (the assay
+  `a_*.txt` files); biological via `mtbls_sample_data()` (the `s_*.txt` sample
   file). Both auto-cached from EBI FTP at render time and stored as
   `dataset_metadata/{a_,s_}*.txt`.
-- **Metabolomics Workbench (`ST*`)**: technical via
-  `mwb_metadata()$MS_run`; biological
-  via `mwb_metadata()$sample_annotation`. Both auto-cached from the
+- **Metabolomics Workbench (`ST*`)**: technical via `mwb_metadata()$MS_run`;
+  biological via `mwb_metadata()$sample_annotation`. Both auto-cached from the
   Workbench API into `dataset_metadata/{ds}_AN*.txt`.
 - **MassIVE (`MSV*`)**: technical from the submitter deposit TSV/CSV
   (`dataset_metadata/{ds}_metadata.*`) first, with Pan-ReDU
   (`fetch_panredu_metadata()` from `redu.gnps2.org`, cached as
-  `dataset_metadata/{ds}_panredu.tsv`) as per-field fallback.
-  Biological metadata comes from the same two sources, in the same
-  order.
+  `dataset_metadata/{ds}_panredu.tsv`) as per-field fallback. Biological
+  metadata comes from the same two sources, in the same order.
 
-ReDU / MIxS missing-value placeholders (`"missing value"`,
-`"not applicable"`, …) are normalised to NA everywhere via the shared
-`is_missing_val()` helper in `R/metadata.R`.
+ReDU / MIxS missing-value placeholders (`"missing value"`, `"not applicable"`,
+…) are normalised to NA everywhere via the shared `is_missing_val()` helper in
+`R/metadata.R`.
 
 ```{r auto-assess}
 #| code-fold: true
@@ -389,10 +548,10 @@ coverage[, c("dataset_id", "n_samples", "n_canonical_mapped",
 
 MetaboLights and Workbench deposits often package several assays under one
 accession (MTBLS1866: LC-MS pos, LC-MS neg, GCxGC-MS pos; ST002044: four
-HILIC/RP analyses). Since the ratio needs **both** compounds in the same
-assay, we treat each `(deposit, assay)` pair as a separate entity and keep
-only entities with at least one parent AND one metabolite hit. A deposit
-whose every assay fails is appended to `other_exclusions` with reason
+HILIC/RP analyses). Since the ratio needs **both** compounds in the same assay,
+we treat each `(deposit, assay)` pair as a separate entity and keep only
+entities with at least one parent AND one metabolite hit. A deposit whose every
+assay fails is appended to `other_exclusions` with reason
 `no_assay_with_both_roles`.
 
 MassIVE deposits have no assay concept and stay at deposit granularity.
@@ -458,23 +617,23 @@ entity_coverage
 
 ## Paper-derived constants
 
-Dataset-wide values from the linked publication or deposit description
-(country of recruitment, body site, chromatography). Not an exclusion
-mechanism; provenance lives in the inline code-comment citation. `constants`
-is keyed by deposit_id and broadcast to every kept assay; `custom_col_map`
-overrides the auto-mapping where native column names miss the
-`DRAFT_CANDIDATES` heuristic.
+Dataset-wide values from the linked publication or deposit description (country
+of recruitment, body site, chromatography). Not an exclusion mechanism;
+provenance lives in the inline code-comment citation. `constants` is keyed by
+deposit_id and broadcast to every kept assay; `custom_col_map` overrides the
+auto-mapping where native column names miss the `DRAFT_CANDIDATES` heuristic.
 
-**Location semantics.** `location_type` marks whether `country` is a
-*study site* (where the study ran, population origin unverified) or a
-*participant origin* (the population itself is the subject). Only
-**MSV000082433** (Venezuelan Amerindian communities) is participant-origin;
-every other `country` is a study site and must be read as a recruitment
-covariate, **not** participant ethnicity.
+**Location semantics.** `location_type` marks whether `country` is a *study
+site* (where the study ran, population origin unverified) or a *participant
+origin* (the population itself is the subject). Only **MSV000082433**
+(Venezuelan Amerindian communities) is participant-origin; every other `country`
+is a study site and must be read as a recruitment covariate, **not** participant
+ethnicity.
 
 ```{r manual-annotations}
 constants <- list(
-  # --- study-site cohorts: `country` = recruitment location, NOT participant origin ---
+  # --- study-site cohorts: `country` = recruitment location, not participant
+  # origin ---
   MTBLS1866    = list(country = "Italy",          location_type = "study_site"),   # Barberis et al. 2020
   MTBLS11656   = list(country = "China", body_site = "blood plasma",
                       location_type = "study_site"),                                # Xinxiang/Zhengzhou 2017 (PMC11823611)
@@ -488,7 +647,8 @@ constants <- list(
   MSV000092754 = list(chromatography = "HILIC"),                                    # HILIC companion of 092757
   MSV000092757 = list(chromatography = "RP"),                                       # RP companion of 092754
 
-  # 082493/084008: omeprazole CYP2C19-probe cohort; genotype in rescue_samples.csv
+  # 082493/084008: omeprazole CYP2C19-probe cohort; genotype in
+  # rescue_samples.csv
   MSV000082493 = list(country = "United States of America", location_type = "study_site",
                       chromatography = "RP", health_status = "healthy"),
   MSV000084008 = list(country = "United States of America", location_type = "study_site",
@@ -514,16 +674,17 @@ custom_col_map <- list(
     sex           = "sex",
     age           = "age_at_earliest_visit",
     health_status = "sero_final"),
-  # native columns the DRAFT_CANDIDATES heuristic misses (082493/084008 need none)
+  # native columns the DRAFT_CANDIDATES heuristic misses (082493/084008 need
+  # none)
   MSV000086975 = list(subject_id = "#SampleID", age = "AGE", health_status = "Metadata")
 )
 ```
 
 ## Consolidate and write the metadata table
 
-`dataset_metadata` is the single source of truth for downstream code:
-one row per kept `(deposit, assay)` entity, with all repository, paper,
-and column-mapping information attached.
+`dataset_metadata` is the single source of truth for downstream code: one row
+per kept `(deposit, assay)` entity, with all repository, paper, and
+column-mapping information attached.
 
 ```{r build-metadata-table}
 #| code-fold: true
@@ -598,12 +759,17 @@ dataset. Instead we recompute the adduct ourselves:
 
 - compute the theoretical m/z of each candidate adduct
   (`r paste(ADDUCT_CANDIDATES, collapse = ", ")`) and assign the one closest to
-  the observed `Precursor_MZ`, within 20 ppm;
-- in practice this is almost always `[M+H]+` for both compounds (the summary
-  table below);
-- keep an entity only if parent and metabolite share at least one adduct (they
-  must ionise the same way for the ratio to mean anything), and drop any hit
-  whose adduct is not in that shared set.
+  the observed `Precursor_MZ`, within 25 ppm;
+- keep any hit that resolves to a candidate adduct, and drop the rest.
+
+No requirement is placed on parent and metabolite sharing an adduct. The
+metabolite is only ever seen as `[M+H]+`, so such a rule would reduce to
+`[M+H]+` alone and discard every parent hit at another adduct --- `[M+Na]+`,
+`[M-H]-` and the in-source water loss `[M+H-H2O]+` --- producing a parent-only
+shortfall with nothing to do with the data: a file in which omeprazole was
+fragmented as its sodium adduct still contains omeprazole. The shared-adduct
+argument belongs to the *ratio*, where the two compounds must ionise comparably,
+and it is enforced there rather than by deleting evidence of presence.
 
 ```{r infer-adduct}
 role_formula <- setNames(compound_spec$formula, compound_spec$role)
@@ -630,11 +796,7 @@ shared_lookup <- setNames(shared_per_entity$shared,
 entities_with_shared <- shared_per_entity$dataset_id[
   vapply(shared_per_entity$shared, length, integer(1)) > 0]
 
-kept_mask <- !is.na(all_hits$adduct_inferred) &
-             all_hits$dataset_id %in% entities_with_shared &
-             mapply(function(ds, ad) ad %in% shared_lookup[[ds]],
-                    all_hits$dataset_id, all_hits$adduct_inferred,
-                    USE.NAMES = FALSE)
+kept_mask <- !is.na(all_hits$adduct_inferred)
 
 dropped_entities <- setdiff(unique(all_hits$dataset_id),
                             entities_with_shared)
@@ -649,7 +811,7 @@ print(table(role   = all_hits$role,
             adduct = all_hits$adduct_inferred,
             useNA  = "ifany"))
 if (length(dropped_entities)) {
-  cat("\nEntities dropped (no shared adduct between parent and metabolite):\n  ",
+  cat("\nEntities with no shared parent/metabolite adduct (kept; reported only):\n  ",
       paste(dropped_entities, collapse = "\n  "), "\n", sep = "")
 }
 cat("\nSurviving entities:", length(unique(all_hits$dataset_id)),
@@ -676,19 +838,20 @@ cat("artifacts/hits_curated.csv           :",
 
 # Confirmation (opt-in)
 
-The three confirmation notebooks in `confirmation/` (`massIVE-hit-confirmation.qmd`,
-`metaboLights-confirmation.qmd`, `metabolomics-workbench-confirmation.qmd`, one per
-repository) decide which curated candidates are *really* omeprazole / 5-OH. For
-each (dataset, assay, compound) they pull the MS2 scans behind the MASST hits, run
-**SIRIUS** for the molecular formula and **CSI:FingerID** for the structure, and
-assign a confidence tier (strict / standard / liberal / not_confirmed) from how
-well formula and structure match the target. Only passing features reach the
-`hits-confirmed-*` artifacts that `02` merges. This confirmation is the step that
-removes isobaric look-alikes such as MSV000086975 and MSV000085256.
+The three confirmation notebooks in `confirmation/`
+(`massIVE-hit-confirmation.qmd`, `metaboLights-confirmation.qmd`,
+`metabolomics-workbench-confirmation.qmd`, one per repository) decide which
+curated candidates are *really* omeprazole / 5-OH. For each (dataset, assay,
+compound) they pull the MS2 scans behind the MASST hits, run SIRIUS for the
+molecular formula and CSI:FingerID for the structure, and assign a confidence
+tier (strict / standard / liberal / not_confirmed) from how well formula and
+structure match the target. Only passing features reach the `hits-confirmed-*`
+artifacts that `02` merges. This confirmation is the step that removes isobaric
+look-alikes such as MSV000086975 and MSV000085256.
 
 They run SIRIUS (slow, CSI:FingerID-queued, one shared instance), so they are
-skipped on a normal render. Render with `-P run_confirmations:true` to chain them
-here; each runs in a fresh quarto process, sequentially, so SIRIUS is never
+skipped on a normal render. Render with `-P run_confirmations:true` to chain
+them here; each runs in a fresh quarto process, sequentially, so SIRIUS is never
 concurrent.
 
 ```{r trigger-confirmations, eval=params$run_confirmations}
@@ -700,41 +863,55 @@ for (q in c("confirmation/massIVE-hit-confirmation.qmd",
 }
 ```
 
-# Appendix: dataset-specific notes
+# Appendix: related deposits
 
-Quirks recorded as data so downstream layers can act on them; not part of the
-main curation flow.
-
-## Related deposits: what is not independent
-
-A deposit accession is not the same thing as a study. Two of the accessions we
-keep come from a single study, and any analysis that treats each dataset as its
-own cohort (pooling, meta-analysis, counting subjects, weighting by precision)
-would silently pseudo-replicate it.
+A deposit accession is not the same thing as a study. Two pairs of the
+accessions we keep are related, in opposite ways, and both would corrupt an
+analysis that treated each accession as its own cohort. They are recorded here
+as data so downstream layers can act on them rather than as part of the main
+curation flow, and the distinction between them matters: one pair must be
+collapsed, the other must not.
 
 **`MSV000082493` and `MSV000084008` are two accessions of one study** (the same
 14-subject crossover, Jarmusch / Tsunoda, PMC7485946): a cytochrome P450 probe
-cocktail including omeprazole was dosed on days 1 and 9, with cefprozil in between.
-The same physical files appear under both accessions, with different paths and
-extensions:
+cocktail including omeprazole was dosed on days 1 and 9, with cefprozil in
+between. The same physical files appear under both accessions, with different
+paths and extensions:
 
 ```
 mzspec:MSV000082493:updates/2019-03-27_alan_jarmusch_6d15f636/peak/blood/DM003_1_360_RG10_01_43808.mzXML
 mzspec:MSV000084008:ccms_peak/blood/DM013_1_360_RD1_01_43865.mzML
 ```
 
-We keep both accessions but must never treat them as independent cohorts. The
-de-duplication rule is applied downstream in `04` (collapse on chromatography +
-file name); here we only record the relationship so those layers can act on it.
+We keep both accessions but must never treat them as independent cohorts. Of
+their files, 333 are the same physical sample under both accessions.
+
+**`MSV000092754` and `MSV000092757` are the opposite case.** They share all 164
+file names and cover the same 79 subjects, but they are not duplicates: one is
+the HILIC run and the other reverse phase, so each file name refers to two
+genuinely different measurements of one specimen. Collapsing them on file name,
+which is the right move for the pair above, would here average two
+chromatographies and destroy the only within-subject comparison in the corpus
+that holds biology fixed while changing the method. They count as one study for
+pooling and as two measurements for everything else.
+
+The de-duplication rules are applied downstream in `05`; here we only record the
+relationships so those layers can act on them.
 
 ```{r related-deposits}
 related_deposits <- tibble::tribble(
   ~dataset_id,    ~related_to,     ~relation,                  ~notes,
   "MSV000084008", "MSV000082493",  "same_study_different_arm",
   paste("Same 14-subject study (PMC7485946). 084008 re-deposits 082493's blood",
-        "arm: 171 of 172 blood files are shared. 082493 contributes feces/skin/",
-        "urine here, 084008 blood. Do not treat as independent cohorts and do",
-        "not count the subjects twice.")
+        "arm: 333 files are shared. 082493 contributes feces/skin/urine here,",
+        "084008 blood. Do not treat as independent cohorts and do not count the",
+        "subjects twice: collapse on file name."),
+
+  "MSV000092757", "MSV000092754",  "same_subjects_two_chromatographies",
+  paste("Same 79-subject Chagas serum panel measured twice, HILIC (092754) and",
+        "reverse phase (092757). All 164 file names are shared but the files are",
+        "different measurements, not copies. One study for pooling; never merge",
+        "on file name.")
 )
 write.csv(related_deposits, "artifacts/related_deposits.csv", row.names = FALSE)
 related_deposits
@@ -743,8 +920,8 @@ related_deposits
 
 # Session info
 
-Recorded so the rendered HTML captures the exact package versions that
-produced the artifacts above.
+Recorded so the rendered HTML captures the exact package versions that produced
+the artifacts above.
 
 ```{r session-info}
 sessionInfo()

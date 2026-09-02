@@ -10,14 +10,11 @@ format:
     number-sections: true
     code-fold: show
     df-print: paged
-execute:
-  warning: false
-  message: false
 ---
 
 # Overview
 
-Identical pipeline to `masst-hit-confirmation.qmd`, but restricted to
+Identical pipeline to `massIVE-hit-confirmation.qmd`, but restricted to
 MetaboLights datasets (`MTBLS*` accessions) and using `MsBackendMetaboLights`
 for raw file access.
 
@@ -25,7 +22,7 @@ for raw file access.
 
 ```{r}
 #| include: false
-# This notebook lives in confirmation/ — run it from the repo root so
+# This notebook lives in confirmation/, so run it from the repo root and
 # source("R/...") and read("artifacts/...") paths resolve.
 knitr::opts_knit$set(root.dir = "..")
 ```
@@ -43,12 +40,10 @@ library(ggplot2)
 # Compound targets
 
 ```{r compound-spec}
-compound_spec <- data.frame(
-  role    = c("parent",         "metabolite"),
-  name    = c("omeprazole",     "5-hydroxyomeprazole"),
-  formula = c("C17H19N3O3S",    "C17H19N3O4S"),
-  ikey1   = c("SUBDBMMJDZJVOS", "CMZHQFXXAAIBKE")
-)
+# compound_spec is defined once in R/masst.R, sourced below. The local copy that
+# used to sit here named its InChIKey column `ikey1` while the shared one names
+# it `inchikey_block1`, so sourcing silently replaced it and every lookup
+# returned NULL.
 ```
 
 # Load curated hits
@@ -70,20 +65,19 @@ cat(length(mtbls_datasets), "MetaboLights datasets to process\n")
 # Helper functions
 
 ```{r helpers}
-ADDUCT_CANDIDATES <- c(
-  "[M+H]+", "[M+Na]+", "[M+K]+", "[M+NH4]+",
-  "[M-H]-", "[M+Cl]-"
-)
-PPM    <- 20
+# ADDUCT_CANDIDATES is defined once in R/masst.R; the local copy here had
+# drifted.
+source("R/masst.R")
+PPM    <- 25
 RT_TOL <- 3   # seconds around hit RT
 
 # Cap the number of hits per role sent to SIRIUS. The confirmed features are
 # used downstream (05, derive_extraction_config) only to compute the per-
-# (dataset, role) MEDIAN m/z + RT that anchors the MS1 extraction window; a
-# few dozen high-cosine confirmations give a robust median, while every hit's
-# RT + provenance stays in artifacts/hits_curated.csv. Set to Inf to confirm
-# every hit.
-CAP_PER_ROLE <- 50
+# (dataset, role) MEDIAN m/z + RT that anchors the MS1 extraction window. The
+# cap is OFF: a capped subset is enough to anchor, but the confirmed set is also
+# the downstream evidence of presence, and capping by cosine silently decided
+# which hits counted. The is.finite() guard below is what switches it off.
+CAP_PER_ROLE <- Inf
 
 infer_adduct <- function(obs_mz, formula,
                          ppm        = PPM,
@@ -227,9 +221,9 @@ for (ds in mtbls_datasets) {
   dir.create(dir_res, recursive = TRUE, showWarnings = FALSE)
 
   wanted <- unique(basename(hits_ds$file_path))
-  # Pass assayName so the correct assay's files load. MsBackendMetaboLights
-  # (>= 1.7.4, gabri branch) bakes the assay index into the cache filename, so
-  # a deposit's pos/neg files with identical basenames no longer collide.
+  # Pass assayName so the correct assay's files load. MsBackendMetaboLights (>=
+  # 1.7.4, gabri branch) bakes the assay index into the cache filename, which is
+  # what keeps a deposit's pos/neg files with identical basenames apart.
   assay <- unique(hits_ds$assay)
   mtbls_sync_data_files(mtblsId = ds, assayName = assay, fileName = wanted)
   sp <- Spectra(backendInitialize(MsBackendMetaboLights(),
@@ -405,7 +399,7 @@ resolve_all <- function(results_dir = "results", compound_spec) {
 
       resolve_features(res,
                        target_formula     = compound_spec$formula[i],
-                       target_ikey_prefix = compound_spec$ikey1[i]) |>
+                       target_ikey_prefix = compound_spec$inchikey_block1[i]) |>
         mutate(dataset_id = ds, role = role, .before = xcms_fts) ->
         all_rows[[paste(ds, role, sep = "::")]]
     }
@@ -554,8 +548,8 @@ features |>
 
 # Write confirmed hits
 
-Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept
-as MetaboLights-confirmed; the `confidence` and `rt` (seconds) columns are
+Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept as
+MetaboLights-confirmed; the `confidence` and `rt` (seconds) columns are
 preserved for downstream stratification and RT-window alignment.
 
 ```{r write-confirmed}

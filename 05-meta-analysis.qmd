@@ -1,0 +1,3033 @@
+---
+title: "05: Cross-dataset exploration"
+subtitle: "What each dataset contributes, what can be compared across them, and what a meta-analysis would still need."
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    df-print: paged
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(forcats)
+library(scales)
+library(ggrepel)
+source("R/_setup.R")
+# metadata.R holds norm_file_key()/to_bare_name(), the canonical filename rule.
+# Sourced here, at the top, so nothing below improvises its own key.
+source("R/metadata.R")
+# _setup.R attaches Bioconductor packages (S4Vectors via
+# Spectra/MetaboAnnotation) whose verbs `first`, `rename`, `filter`, etc. shadow
+# the dplyr ones. Re-attach dplyr / tidyr so the tidyverse verbs sit on top of
+# the search path again.
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+})
+```
+
+# What this notebook does
+
+`03` measured omeprazole and 5-hydroxyomeprazole in every biological file of
+every confirmed dataset. This notebook asks what the corpus as a whole supports,
+in two explicitly separated meta-analyses plus the context needed to read them.
+
+- **Context first** (kept from the exploratory pass): what each dataset is, how
+  much signal it contributes, and the one hard constraint that shapes
+  everything, that an absolute ratio is not comparable across datasets while a
+  within-study contrast is.
+- **Part A: expanding the classic reverse-metabolomics prevalence analysis.**
+  The field reports molecule-by-cohort *detection rates* from MS2 matches. We
+  run the same analysis with MS1 propagation and compare MS2 vs MS1 detection
+  per compound per cohort. This is presence-based, so it is isomer-immune, and
+  it is where the pipeline's value shows most cleanly.
+- **Part B: the quantitative strand, and where it stops.** The layer the field
+  does not have, built on the proteomics match-between-runs precedent:
+  known-negative and known-positive controls on the propagated detections, then
+  the within-study contrast as the poolable quantity. Its honest result is
+  negative — no ratio contrast survives FDR in any deposit — and the variance
+  decomposition says why: the cross-deposit offset is body site far more than
+  study, so the ratio is comparable within a matrix and not across them.
+
+**What it deliberately does not do: pool an absolute ratio into a single
+cross-cohort estimate.** Most datasets share only a `sex` contrast, so such a
+pool would average unlike things. Pooling is a real option but needs a shared,
+biologically meaningful contrast the corpus does not yet supply, so it is
+described rather than run (final section).
+
+# Load the inputs
+
+```{r load-inputs}
+samples  <- read_csv("artifacts/sample_table_all.csv",  show_col_types = FALSE)
+datasets <- read_csv("artifacts/datasets-confirmed.csv", show_col_types = FALSE)
+
+# Per-file table (not deduped to subjects) + the raw MASST hits: the prevalence
+# meta-analysis in Part A is a per-file rate, so it must compare like with like
+# (per-file MS1 detection vs per-file MS2/MASST detection).
+samples_perfile <- read_csv("artifacts/sample_table_perfile.csv", show_col_types = FALSE)
+masst_hits      <- read.csv("artifacts/hits_curated.csv", check.names = FALSE,
+                            stringsAsFactors = FALSE)
+
+# has_metadata flag from 02 (metadata resolved in 01): restrict every analysis
+# to files a metadata source covers; record-only files stay out of stratified
+# work.
+bio_meta_per_ds <- readRDS("artifacts/bio_meta_per_ds.rds")
+has_meta_lookup <- unlist(lapply(names(bio_meta_per_ds), function(ds) {
+  v <- bio_meta_per_ds[[ds]]
+  stats::setNames(as.logical(v), paste0(ds, "|", basename(names(v))))
+}))
+# Normalise a file name for matching across sources: drop accession prefix,
+# extension and case. Valid only where a name carries at most one prefix, which
+# the sample tables and hits_curated do. Confirmation output does not: its
+# source_file can carry an assay index and a doubled accession, and needs
+# norm_file_key(x, bio_files) instead.
+fkey <- function(x) tolower(sub("[.][^.]*$", "",
+          sub("^(MSV[0-9]+|MTBLS[0-9]+|ST[0-9]+)[_-]", "", basename(as.character(x)))))
+```
+
+`sample_table_all.csv` carries one row per subject (`03` de-duplicates files to
+subjects where subject metadata exists; where it does not, a row is a file).
+Throughout this notebook "sample" means one row of that table, except in Part A
+which is explicitly per-file.
+
+```{r short-labels}
+# The MetaboLights and Workbench ids carry an assay suffix that makes every axis
+# unreadable. Shorten for display only; dataset_id stays the join key.
+short_ds <- function(x) sub("_AN[0-9]+$", "", sub("_LC-MS_.*$", "", x))
+
+# Sex is deposited as F/M by three deposits and female/male by the rest, so it
+# is harmonised once here rather than per analysis.
+harmonise_sex <- function(x) {
+  s <- tolower(trimws(as.character(x)))
+  dplyr::case_when(startsWith(s, "f") ~ "female",
+                   startsWith(s, "m") ~ "male",
+                   TRUE ~ NA_character_)
+}
+
+# Healthy vs not is an explicit whitelist, never a grepl on "healthy|control":
+# that pattern also matches QC injections and inverts the Chagas arms. A label
+# in neither list stays NA and drops out of any healthy/not-healthy contrast.
+HEALTHY_LV <- c("uninfected", "healthy", "control", "healthy control")
+NOTHEAL_LV <- c("t. cruzi infected", "critical covid-19 recovered in icu",
+                "non-critical covid-19", "non-covid-19 in icu",
+                "non-covid-19 with symptoms", "covid-19")
+# Can this deposit's rows be collapsed to people? Two things have to hold, and
+# testing only one of them is how this went wrong twice. First, coverage: an id
+# on essentially every file can be collapsed on, and the odd unmatched file
+# (MSV000091520 has one) becomes its own unit downstream without disturbing
+# anything. Second, where coverage is partial, the id has to be corroborated --
+# MSV000092754 and 092757 label half their files and no id repeats inside either
+# deposit, but all 79 appear in BOTH, which only a person id does. The tempting
+# shortcut, "a real subject id repeats", fails on every cross-sectional study in
+# the corpus: MSV000091520 gives one id per file and records a distinct sex and
+# an age computed to the day behind each of them. It would discard six of the
+# nine real designs.
+subject_resolved <- function(sid, sibling_ids = NULL) {
+  ok <- !is.na(sid) & nzchar(trimws(as.character(sid)))
+  if (!any(ok)) return(FALSE)
+  if (mean(ok) > 0.9) return(TRUE)
+  u <- unique(trimws(as.character(sid[ok])))
+  length(u) < sum(ok) ||
+    (!is.null(sibling_ids) && length(intersect(u, sibling_ids)) >= 0.5 * length(u))
+}
+
+# Ids held by the OTHER deposit of a known same-study pair, keyed by dataset_id.
+# Built from related_deposits.csv so the pairing is declared in `01` rather than
+# hard-coded here.
+sibling_id_map <- local({
+  rel <- read.csv("artifacts/related_deposits.csv", stringsAsFactors = FALSE)
+  ids <- function(d) {
+    v <- samples_perfile$subject_id[samples_perfile$dataset_id == d]
+    unique(trimws(as.character(v[!is.na(v) & nzchar(trimws(as.character(v)))])))
+  }
+  out <- list()
+  for (i in seq_len(nrow(rel))) {
+    a <- rel$dataset_id[i]; b <- rel$related_to[i]
+    out[[a]] <- ids(b); out[[b]] <- ids(a)
+  }
+  out
+})
+
+harmonise_health <- function(x) {
+  cl <- tolower(trimws(as.character(x)))
+  dplyr::case_when(cl %in% HEALTHY_LV ~ "healthy",
+                   cl %in% NOTHEAL_LV ~ "not healthy",
+                   TRUE ~ NA_character_)
+}
+```
+
+# The datasets
+
+## Metadata is the binding constraint
+
+The measurement side of this project is not what limits it. Of 128 deposits
+carrying a hit, 12 survive to be measured, and of those only a handful can
+answer a question about a person. Every step of that attrition after the
+chemistry is a metadata step, and the figure below is the argument for treating
+metadata as the bottleneck rather than a preliminary.
+
+```{r fig-metadata-bottleneck, fig.width = 11, fig.height = 3.9}
+#| echo: false
+.f <- function(v) !is.na(v) & trimws(as.character(v)) != "" & v != "missing value"
+.hit <- read.csv("StructureMASST_output/fasstrecords_hits.csv", check.names = FALSE)
+.cf  <- read.csv("artifacts/hits-confirmed-all.csv", stringsAsFactors = FALSE)
+.sp  <- samples_perfile
+.sp$repo <- ifelse(startsWith(.sp$dataset_id, "MSV"), "MassIVE",
+            ifelse(startsWith(.sp$dataset_id, "MTBLS"), "MetaboLights", "Workbench"))
+
+# Panel A: attrition. The last step is the one that is not about chemistry.
+.n_hit  <- dplyr::n_distinct(.hit$ATTRIBUTE_DatasetAccession)
+.n_conf <- dplyr::n_distinct(.cf$dataset_id)
+.n_subj <- sum(vapply(split(.sp, .sp$dataset_id), function(z)
+  subject_resolved(z$subject_id,
+    sibling_ids = unlist(sibling_id_map[unique(z$dataset_id)], use.names = FALSE)),
+  logical(1)))
+.fun <- data.frame(
+  step = factor(c("deposits with a hit", "both compounds", "curated entities",
+                  "SIRIUS confirmed", "usable subject id"),
+                levels = rev(c("deposits with a hit", "both compounds", "curated entities",
+                               "SIRIUS confirmed", "usable subject id"))),
+  n = c(.n_hit, 44, 15, .n_conf, .n_subj),
+  why = c("", "one compound only", "metadata, DIA or in vitro",
+          "isobar, or one role only", "no subject recorded"))
+.pA <- ggplot(.fun, aes(n, step)) +
+  geom_col(width = 0.6, fill = "grey30") +
+  geom_text(aes(label = n), hjust = -0.25, size = 3.6, fontface = "bold") +
+  geom_text(aes(x = 0, label = why), hjust = -0.03, vjust = 3.1, size = 2.9, colour = "grey35") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(x = NULL, y = NULL, title = "A   Where the corpus is lost",
+       subtitle = "only the second step is about chemistry") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(), axis.text.x = element_blank(),
+        plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 8.5, colour = "grey35"))
+
+# Panel B: coverage by repository. Species lives in the search index, not the
+# per-file metadata, so it is a share of hits where the others are a share of
+# files.
+.cov <- .sp |> dplyr::group_by(repo) |> dplyr::summarise(
+  `subject id` = mean(.f(subject_id)), sex = mean(.f(sex)),
+  age = mean(is.finite(as_num(age))),
+  clinical = mean(.f(health_status)), `body site` = mean(.f(body_site)), .groups = "drop")
+.hit$repo <- ifelse(startsWith(.hit$ATTRIBUTE_DatasetAccession, "MSV"), "MassIVE",
+             ifelse(startsWith(.hit$ATTRIBUTE_DatasetAccession, "MTBLS"), "MetaboLights",
+             ifelse(startsWith(.hit$ATTRIBUTE_DatasetAccession, "ST"), "Workbench", NA)))
+.spc <- .hit[.hit$ATTRIBUTE_DatasetAccession %in% unique(.cf$deposit_id), ] |>
+  dplyr::group_by(repo) |> dplyr::summarise(species = mean(.f(NCBITaxonomy)), .groups = "drop")
+.cov <- dplyr::left_join(.cov, .spc, by = "repo") |>
+  tidyr::pivot_longer(-repo, names_to = "field", values_to = "cov")
+.cov$field <- factor(.cov$field,
+  levels = c("subject id", "species", "sex", "age", "clinical", "body site"))
+.pB <- ggplot(.cov, aes(field, repo, fill = cov)) +
+  geom_tile(colour = "white", linewidth = 1.1) +
+  geom_text(aes(label = sprintf("%.0f%%", 100 * cov), colour = cov > 0.5),
+            size = 3.2, show.legend = FALSE) +
+  scale_fill_gradient(low = "grey93", high = "grey25", guide = "none") +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey20")) +
+  labs(x = NULL, y = NULL, title = "B   No repository is adequate on its own, or together",
+       subtitle = "share of files carrying the field; species is a share of hits") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(), plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 8.5, colour = "grey35"),
+        axis.text.x = element_text(angle = 18, hjust = 1))
+
+.p_meta <- patchwork::wrap_plots(.pA, .pB, ncol = 2)
+dir.create("thesis/graphics", showWarnings = FALSE, recursive = TRUE)
+ggsave("thesis/graphics/flagship_metadata_bottleneck.png", .p_meta,
+       width = 11, height = 3.9, dpi = 200)
+.p_meta
+```
+
+Panel B is not an argument for pooling the repositories. Each is strong where
+another is empty --- MassIVE records species on a tenth of its hits and sex on
+almost all of them, MetaboLights the reverse --- but combining them does not
+produce a complete picture, because the gaps are not the same gaps and nothing
+fills them. What it shows is that the corpus a researcher can assemble is
+bounded by deposition practice, and that no amount of care at the analysis end
+recovers a field nobody wrote down.
+
+
+```{r fig-metadata-inventory, fig.width = 11, fig.height = 5.6}
+#| echo: false
+# Three states per cell, because "recorded" and "usable" differ: a field present
+# on every file but holding one value describes the cohort and supports no
+# contrast.
+.filled <- function(v) !is.na(v) & nzchar(as.character(v))
+.inv <- samples_perfile
+.inv$ds <- short_ds(.inv$dataset_id)
+.inv$clinical <- ifelse(.filled(.inv$health_status), .inv$health_status, .inv$group)
+.flds <- c(subject = "subject_id", sex = "sex", age = "age", `body site` = "body_site",
+           `clinical group` = "clinical", timepoint = "timepoint",
+           treatment = "treatment", country = "country")
+.gt <- if (file.exists("artifacts/rescue_samples.csv")) {
+  .rs <- read.csv("artifacts/rescue_samples.csv", stringsAsFactors = FALSE)
+  if ("cyp2c19_genotype" %in% names(.rs))
+    unique(short_ds(.rs$deposit_id[.filled(.rs$cyp2c19_genotype)])) else character(0)
+} else character(0)
+
+.long <- dplyr::bind_rows(lapply(names(.flds), function(nm) {
+  .inv |> dplyr::group_by(ds) |>
+    dplyr::summarise(field = nm, coverage = mean(.filled(.data[[.flds[[nm]]]])),
+                     levels = dplyr::n_distinct(.data[[.flds[[nm]]]][.filled(.data[[.flds[[nm]]]])]),
+                     .groups = "drop") }))
+.long <- dplyr::bind_rows(.long, .inv |> dplyr::group_by(ds) |>
+  dplyr::summarise(field = "CYP2C19 genotype",
+                   coverage = as.numeric(dplyr::first(ds) %in% .gt),
+                   levels = ifelse(dplyr::first(ds) %in% .gt, 5, 0), .groups = "drop"))
+# Partial coverage is a legend state, not a footnote symbol: an asterisk needs a
+# caption to mean anything, and this figure has to stand on its own.
+.long$state <- dplyr::case_when(
+  .long$levels == 0 | .long$coverage < 0.4 ~ "not recorded",
+  .long$levels == 1                        ~ "recorded, one value only",
+  .long$coverage < 0.8                     ~ "varies, but on under 80% of files",
+  TRUE                                     ~ "varies, on all files")
+.long$state <- factor(.long$state, levels = c(
+  "not recorded", "recorded, one value only",
+  "varies, but on under 80% of files", "varies, on all files"))
+.long$lab <- with(.long, dplyr::case_when(
+  state == "not recorded" ~ "", levels == 1 ~ "1",
+  levels > 20 ~ "20+", TRUE ~ as.character(levels)))
+.sz <- .inv |> dplyr::group_by(ds) |> dplyr::summarise(files = dplyr::n(), .groups = "drop")
+.long <- dplyr::left_join(.long, .sz, by = "ds")
+.long$row <- paste0(.long$ds, "   (", .long$files, " files)")
+.long$field <- factor(.long$field, levels = c(names(.flds), "CYP2C19 genotype"))
+
+# Written to thesis/graphics so the chapter figure IS this object. The earlier
+# PNGs came from scratch scripts that were later deleted, leaving the chapter
+# unable to regenerate.
+.p_inv <- ggplot(.long, aes(field, reorder(row, -rank(ds)), fill = state)) +
+  geom_tile(colour = "white", linewidth = 0.7) +
+  geom_text(aes(label = lab, colour = state %in% c("varies, but on under 80% of files",
+                                                   "varies, on all files")),
+            size = 3.1, fontface = "bold", show.legend = FALSE) +
+  scale_fill_manual(values = c("not recorded" = "grey95",
+                               "recorded, one value only" = "grey80",
+                               "varies, but on under 80% of files" = "grey52",
+                               "varies, on all files" = "grey20"), name = NULL) +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey15")) +
+  labs(x = NULL, y = NULL, title = "Metadata fields recorded per deposit, and the number of distinct values in each") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        plot.title = element_text(face = "bold", size = 13))
+dir.create("thesis/graphics", showWarnings = FALSE, recursive = TRUE)
+ggsave("thesis/graphics/flagship_metadata_inventory.png", .p_inv,
+       width = 11, height = 5.6, dpi = 200)
+.p_inv
+```
+
+Before any analysis, the cast. Each row is one confirmed (deposit, assay)
+entity: where it came from, what it is, how much usable signal it contributes,
+and which grouping variables it offers for a contrast.
+
+A dataset can only support a contrast on a variable with at least two levels
+carrying at least three samples each, the same rule `fit_within_study()` applies
+below.
+
+One trap is worth naming. A rule written for categorical fields silently
+discards continuous ones: a check that lists named categorical candidates
+reports `age` as absent everywhere, although it is continuous in five deposits
+and the most widely available stratifier in the corpus. Numeric and categorical
+fields are therefore judged separately below.
+
+```{r dataset-summary}
+#| echo: false
+usable_contrasts <- function(df) {
+  cand <- c("health_status", "group", "sex", "country", "body_site", "age", "treatment")
+  lab <- vapply(cand, function(v) {
+    if (!v %in% names(df)) return(NA_character_)
+    x <- df[[v]][!is.na(df[[v]])]
+    if (!length(x)) return(NA_character_)
+    # a predicate, not a coercion: as.numeric() on a categorical field answers the
+  # question by raising a warning, which is noise we would then have to hide
+  num <- all(grepl("^ *-?[0-9]+[.]?[0-9]*([eE][-+]?[0-9]+)? *$", as.character(x)))
+    if (num && dplyr::n_distinct(x) > 12)
+      return(sprintf("%s (%.0f-%.0f)", v, min(as.numeric(x)), max(as.numeric(x))))
+    tb <- table(x)
+    if (length(tb) >= 2 && sum(tb >= 3) >= 2)
+      sprintf("%s (%d)", v, length(tb)) else NA_character_
+  }, character(1))
+  lab <- lab[!is.na(lab)]
+  if (!length(lab)) "none" else paste(lab, collapse = ", ")
+}
+
+ds_table <- samples |>
+  group_by(dataset_id) |>
+  summarise(
+    n_samples = n(),
+    n_both    = sum(detection_tier == "both", na.rm = TRUE),
+    both_rate = n_both / n_samples,
+    contrasts = usable_contrasts(pick(everything())),
+    .groups   = "drop") |>
+  left_join(datasets |> select(dataset_id, repository, chromatography,
+                               const_country, const_body_site),
+            by = "dataset_id") |>
+  mutate(dataset = short_ds(dataset_id),
+         both_rate = percent(both_rate, accuracy = 0.1)) |>
+  select(dataset, repository, body_site = const_body_site,
+         country = const_country, chromatography,
+         n_samples, n_both, both_rate, contrasts) |>
+  arrange(desc(n_both))
+
+ds_table
+```
+
+## What each deposit can and cannot be asked
+
+The table above says what divides a deposit. This one adds what does *not*: a
+field present on every file but holding a single value describes the cohort and
+supports no contrast, and reporting it as "recorded" would overstate what the
+deposit can answer.
+
+```{r metadata-inventory-table}
+#| echo: false
+FIELDS <- c("sex", "age", "group", "health_status", "body_site", "country",
+            "treatment", "subject_id")
+describe <- function(x) {
+  x <- x[!is.na(x) & nzchar(trimws(as.character(x)))]
+  if (!length(x)) return(list(kind = "absent", lab = NA_character_))
+  n <- dplyr::n_distinct(x)
+  # a predicate, not a coercion: as.numeric() on a categorical field answers the
+  # question by raising a warning, which is noise we would then have to hide
+  num <- all(grepl("^ *-?[0-9]+[.]?[0-9]*([eE][-+]?[0-9]+)? *$", as.character(x)))
+  if (n == 1) return(list(kind = "constant", lab = as.character(x[1])))
+  if (num && n > 12)
+    return(list(kind = "divides",
+                lab = sprintf("%s (%.0f-%.0f)", "continuous", min(as.numeric(x)),
+                              max(as.numeric(x)))))
+  list(kind = "divides", lab = sprintf("%d levels", n))
+}
+inv <- do.call(rbind, lapply(split(samples, samples$dataset_id), function(d) {
+  r <- lapply(FIELDS, function(f) if (f %in% names(d)) describe(d[[f]]) else
+                                  list(kind = "absent", lab = NA_character_))
+  names(r) <- FIELDS
+  data.frame(
+    dataset  = short_ds(d$dataset_id[1]),
+    divides  = paste(vapply(FIELDS, function(f)
+                 if (r[[f]]$kind == "divides") sprintf("%s: %s", f, r[[f]]$lab) else "",
+                 character(1))[vapply(r, function(z) z$kind, "") == "divides"],
+                 collapse = ", "),
+    constant = paste(vapply(FIELDS, function(f)
+                 if (r[[f]]$kind == "constant") sprintf("%s=%s", f, r[[f]]$lab) else "",
+                 character(1))[vapply(r, function(z) z$kind, "") == "constant"],
+                 collapse = ", "),
+    stringsAsFactors = FALSE)
+}))
+inv$divides[inv$divides == ""] <- "nothing"
+inv$constant[inv$constant == ""] <- "-"
+knitr::kable(inv, row.names = FALSE,
+             caption = "What divides each deposit, and what merely describes it")
+```
+
+Two readings follow from this that matter downstream. Age is the most widely
+available stratifier in the corpus, not sex or clinical group, which is the
+opposite of what the earlier categorical-only check suggested. And a deposit can
+be fully annotated and still answer nothing: MSV000091520 carries sex, age,
+group, health status, body site and country on all 2,144 of its files, but every
+one of those except age holds a single value, and the compound is detected in 2
+files.
+
+Read this table as the corpus' honest capacity. Three things it makes obvious:
+
+- **`n_both` is what the ratio analysis actually runs on.** Everything else is a
+  sample where at least one of the two compounds was not detected, so no ratio
+  can be formed. Across the whole corpus this number is small, and it is
+  concentrated in a few deposits.
+- **The deposits are not the same kind of thing.** A couple are drug-probe
+  cohorts where every subject was dosed by design. Most are general-population
+  or disease cohorts where a handful of people happened to be on omeprazole.
+  Those two categories cannot be read the same way.
+- **`contrasts` shows what each dataset can be asked.** Note how few offer a
+  biologically meaningful grouping. That single column is the reason the last
+  section of this notebook exists.
+
+# Exploratory look at the corpus
+
+This section is descriptive on purpose. Before modelling anything, it is worth
+seeing what the data look like.
+
+## Detection-tier composition per dataset
+
+Counts on the left, the same thing proportionally on the right. The left panel
+shows where the signal actually is; the right panel shows what fraction of each
+cohort was exposed.
+
+```{r exp-tier-bars}
+#| fig-width: 6
+#| fig-height: 4.5
+#| layout-ncol: 2
+tier_levels  <- c("both", "parent_only", "metab_only", "neither")
+tier_palette <- c(both        = "#1b9e77",
+                  parent_only = "#7570b3",
+                  metab_only  = "#d95f02",
+                  neither     = "grey75")
+
+tier_long <- samples |>
+  mutate(detection_tier = factor(detection_tier, levels = tier_levels),
+         ds = short_ds(dataset_id)) |>
+  count(ds, detection_tier) |>
+  group_by(ds) |>
+  mutate(p = n / sum(n)) |>
+  ungroup()
+
+ggplot(tier_long,
+       aes(x = fct_reorder(ds, p * (detection_tier == "both"),
+                           .fun = sum, .desc = FALSE),
+           y = n, fill = detection_tier)) +
+  geom_col() + coord_flip() +
+  scale_fill_manual(values = tier_palette) +
+  labs(x = NULL, y = "samples", fill = "tier",
+       title = "Detection tier, counts") +
+  theme_bw() + theme(legend.position = "bottom")
+
+ggplot(tier_long,
+       aes(x = fct_reorder(ds, p * (detection_tier == "both"),
+                           .fun = sum, .desc = FALSE),
+           y = p, fill = detection_tier)) +
+  geom_col() + coord_flip() +
+  scale_fill_manual(values = tier_palette) +
+  scale_y_continuous(labels = percent) +
+  labs(x = NULL, y = "share of samples", fill = "tier",
+       title = "Detection tier, proportional") +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+The `parent_only` and `metab_only` slices are censored ratio observations, not
+failures: we know the ratio is very high or very low, but not by how much,
+because one peak fell below detection. Discarding them biases any ratio estimate
+toward the middle, which is a point the final section returns to.
+
+## Deposit size vs detection rate
+
+```{r exp-n-vs-both, fig.width = 6.5, fig.height = 5}
+ds_summary <- samples |>
+  group_by(dataset_id) |>
+  summarise(n_samples = n(),
+            n_both    = sum(detection_tier == "both"),
+            both_rate = n_both / n_samples,
+            .groups   = "drop") |>
+  left_join(datasets |> select(dataset_id, chromatography,
+                               const_country, const_body_site),
+            by = "dataset_id")
+
+ggplot(ds_summary, aes(x = n_samples, y = both_rate)) +
+  geom_point(aes(size = n_both, colour = chromatography), alpha = 0.85) +
+  geom_text_repel(aes(label = short_ds(dataset_id)), size = 3,
+                  min.segment.length = 0) +
+  scale_x_log10() + scale_y_continuous(labels = percent) +
+  scale_size_continuous(range = c(2, 8)) +
+  labs(x = "samples in deposit (log10)", y = "'both' detection rate",
+       size = "n with both",
+       title = "Deposit size vs detection rate") +
+  theme_bw()
+```
+
+The two axes trade off against each other. The drug-probe cohorts sit top-left
+(small but almost fully exposed); the large unselected cohorts sit bottom-right
+(many subjects, almost none on the drug). A large deposit with a low rate can
+still be worth having, but only if the absolute number of exposed subjects is
+large enough to matter, which is the `n_both` point size rather than the
+position.
+
+## Parent vs metabolite intensity
+
+```{r exp-auc-scatter, fig.width = 7.5, fig.height = 5.5}
+auc_df <- samples |>
+  filter(detection_tier == "both", par_auc > 0, met_auc > 0) |>
+  mutate(ds = short_ds(dataset_id))
+
+ggplot(auc_df, aes(x = par_auc, y = met_auc, colour = ds)) +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, colour = "grey60") +
+  geom_point(alpha = 0.7, size = 1.4) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "parent peak area (log10)", y = "metabolite peak area (log10)",
+       colour = NULL,
+       title = "Per-sample parent vs metabolite intensity") +
+  theme_bw() + theme(legend.position = "right")
+```
+
+The dashed line is `y = x`. Points below it have more parent than metabolite.
+Note the datasets separate into visible clusters. What the clusters are made of
+is the question the next section takes up: deposits differ in instrument,
+gradient and specimen at once, and nothing here tells them apart.
+
+## Peak-quality control
+
+```{r exp-fwhm-qc, fig.width = 7.5, fig.height = 4.5}
+peak_qc <- samples |>
+  filter(detection_tier == "both") |>
+  mutate(ds = short_ds(dataset_id)) |>
+  select(ds, par_fwhm, met_fwhm) |>
+  pivot_longer(c(par_fwhm, met_fwhm), names_to = "role", values_to = "fwhm") |>
+  mutate(role = sub("_fwhm", "", role))
+
+ggplot(peak_qc |> filter(is.finite(fwhm)), aes(x = fwhm, y = ds, colour = role)) +
+  geom_jitter(width = 0, height = 0.2, alpha = 0.5, size = 1.2) +
+  scale_x_continuous(trans = "log10") +
+  labs(x = "peak width at half maximum (s, log10)", y = NULL, colour = "role",
+       title = "Peak-width distribution per dataset") +
+  theme_bw()
+```
+
+Peak width is a chromatography property. A dataset whose widths sit far from the
+rest, or whose two compounds disagree with each other, is worth a second look in
+its per-dataset report before its numbers are trusted.
+
+# What we can and cannot compare across datasets
+
+This is the central constraint of the whole project, so it is worth stating
+precisely.
+
+A mass spectrometer counts ions, not molecules. How many ions a compound yields
+depends on how readily it ionises, which is a property of the molecule **and**
+of the method. Omeprazole and 5-hydroxyomeprazole ionise with different
+efficiency, so what we measure is
+
+```
+measured log2(parent / metabolite) = true log2(parent / metabolite) + offset
+```
+
+where `offset` is the log ratio of the two compounds' response factors. It is
+unknown, and it is different in every dataset, because every dataset used a
+different instrument and method. The standard fix is to spike an
+isotope-labelled internal standard of each compound into every sample. **No
+deposit in this corpus did that**, so the offset cannot be calibrated away.
+
+That term is established analytical chemistry rather than an assumption of ours.
+Oss et al. measured an electrospray ionisation-efficiency scale for 62 organic
+compounds and found it spans roughly six orders of magnitude under identical
+conditions ([Anal. Chem. 2010, 82(7),
+2865-2872](https://doi.org/10.1021/ac902856t)), and follow-up work from the same
+group shows the scale is itself condition- and instrument-dependent ([Rapid
+Commun. Mass Spectrom. 2021, 35, e9178](https://doi.org/10.1002/rcm.9178)) --
+which is why the offset cannot be assumed constant across deposits. Six orders
+of magnitude does not sink the ratio, for two reasons: that spread is across 62
+*unrelated* compounds, whereas for one fixed pair the offset is a single unknown
+constant, and the ratio is itself the normalisation, cancelling everything the
+two compounds share in a sample -- injected amount, dilution, most matrix
+suppression -- and leaving only that constant.
+
+Two consequences follow, and they are the reason this notebook is shaped the way
+it is.
+
+**We cannot compare absolute ratios between datasets.** A dataset whose median
+sits a unit above another's may simply have used a method that ionises the
+parent more efficiently. Any ranking of the deposits by their ratio would be
+measuring instruments, not patients. This is why none of the plots above are
+sorted by median.
+
+The corpus does contain two designs that let this be probed rather than merely
+asserted: one deposit pair ran the **same subjects on two chromatographies**,
+and the probe study sampled **two matrices from the same subjects**. Part A
+returns to them under "The ratio across cohorts". The short version is that the
+first is too small to pin the offset down, so the constraint above stands
+unchanged, while the second removes the offset by construction and is where the
+cross-matrix result comes from.
+
+**We can compare a difference measured inside a single dataset.** Within one
+dataset every sample went through the same method, so every sample carries the
+same `offset`. Take two groups in that dataset and subtract:
+
+```
+(true_case + offset) - (true_ref + offset) = true_case - true_ref
+```
+
+The offset cancels exactly. That difference, which we will call the
+**within-study contrast**, is free of the method term and is therefore the only
+quantity in this corpus that means the same thing in every dataset. It underpins
+the quantitative analyses in Part B.
+
+<!-- moved ahead of Part A: this is the control that licenses every
+prevalence claim below, so it has to be read first. -->
+# Does a propagated detection mean anything? The false-transfer rate
+
+Our pipeline is the metabolomics analogue of **match-between-runs (MBR)** in
+proteomics: identify by MS2 where a feature was fragmented, then transfer the
+identity to other files by accurate mass and retention time and quantify at MS1.
+Proteomics has measured what this costs. In a controlled two-species experiment,
+uncontrolled MBR transferred 44% of one organism's proteins into samples that
+provably did not contain it, concentrated in low-abundance one-hit detections
+(Lim, Paulo & Gygi 2019). Independent audits find that the common tools do not
+actually control the false-discovery rate of propagated identities unless a
+decoy procedure is added (PIP-ECHO, 2025).
+
+The lesson transfers exactly: **a propagated detection is a hypothesis until its
+false-transfer rate is estimated.** Part A's prevalence gains are only as
+trustworthy as our specificity, and specificity has to be measured, not assumed.
+
+Proteomics measures it with a decoy that **cannot be true** — a reversed or
+shuffled peptide sequence, or an entrapment proteome from a species that is not
+in the sample — and it scores a match on fragment evidence, charge and isotope
+envelope together. An MS1 extraction has neither property. It asks only whether
+an acceptable chromatographic peak sits at one m/z inside one retention-time
+window, and in an untargeted file real compounds occupy arbitrary masses. So a
+synthetic decoy mass is *not* a hypothesis that cannot be true: when it fires,
+the picker has usually found a real but different compound, which is the picker
+working correctly rather than a false transfer. We measured this directly —
+probing the metabolite's own window at +8 and +12 Da returns peaks that are not
+isotopologues of anything we search for, i.e. ordinary matrix. **A synthetic
+decoy therefore bounds our false-positive rate from above without estimating
+it**, so it is not reported here.
+
+Two controls are used instead, and both rest on files whose true answer is known
+rather than assumed:
+
+- **positive control** — every file carrying a SIRIUS-confirmed spectrum, which
+  is known to contain the compound. Anything the extraction fails to recover is
+  a false negative. This measures sensitivity.
+- **negative biological control** — the pre-dose plasma draws of the probe
+  study, taken before the drug was given, interrogated at the true m/z and the
+  true retention window. Real matrix, every interference a study sample carries,
+  absence known by design. This is the closest thing the corpus offers to an
+  entrapment experiment, and it measures specificity where it actually matters.
+
+```{r fig-decoy, fig.width = 6.4, fig.height = 3.6}
+#| echo: false
+# Positive-control counts are recomputed here from the SIRIUS-confirmed anchor
+# files rather than transcribed.
+{
+  # Runs before Part A builds pf, so it works from the per-file table directly,
+  # and is not restricted to metadata-carrying files: the positive control
+  # concerns the extraction. norm_file_key with the deposit's file list, never
+  # the bare fkey() -- confirmation names can carry a doubled accession, and the
+  # bare rule lost 39 confirmed files here.
+  .BFp <- readRDS("artifacts/bio_files_per_ds.rds")
+  .bare <- function(x, ds) {
+    r <- character(length(x))
+    for (d in unique(ds)) {
+      i <- ds == d
+      ref <- if (!is.null(.BFp[[d]])) basename(as.character(.BFp[[d]])) else NULL
+      r[i] <- norm_file_key(x[i], ref)
+    }
+    r
+  }
+  .sp  <- as.data.frame(samples_perfile)
+  .pfk <- .bare(.sp$file, .sp$dataset_id)
+  .conf <- read.csv("artifacts/hits-confirmed-all.csv", stringsAsFactors = FALSE)
+  .conf$fk <- .bare(.conf$source_file, .conf$dataset_id)
+  .pc <- do.call(rbind, lapply(c(par = "parent", met = "metabolite"), function(r) {
+    keys <- unique(paste0(.conf$dataset_id[.conf$role == r], "|", .conf$fk[.conf$role == r]))
+    x <- .sp[paste0(.sp$dataset_id, "|", .pfk) %in% keys, ]
+    hit <- if (r == "parent") x$detection_tier %in% c("both", "parent_only") else
+                              x$detection_tier %in% c("both", "metab_only")
+    data.frame(n = nrow(x), det = sum(hit))
+  }))
+
+  # Two controls, both on samples whose true answer is known. Split by role,
+  # because the metabolite is harder to recover and a pooled bar could hide a
+  # shortfall in it. Labelled positive/negative control rather than
+  # sensitivity/specificity: the y axis is a detection rate, so the negative bar
+  # reads 0% where specificity would read 100%.
+  POS <- "positive control: present"
+  NEG <- "negative control: absent"
+  .rows <- rbind(
+    data.frame(cond = "confirmed\nparent",     n = .pc["par", "n"], det = .pc["par", "det"],
+               grp = POS),
+    data.frame(cond = "confirmed\nmetabolite", n = .pc["met", "n"], det = .pc["met", "det"],
+               grp = POS),
+    # Pre-dose plasma, counted from the extracted files rather than written in:
+    # the submitter TSV declares 50 draws and 49 were extracted.
+    local({
+      # Both draws precede absorption, so both are known negatives. Pooling them
+      # is what tightens the bound: zero of n only says as much as n allows.
+      .pre <- .sp[.sp$dataset_id == "MSV000084008" & .sp$timepoint %in% c("0", "5"), ]
+      data.frame(cond = "pre-dose and\n5 min plasma", n = nrow(.pre),
+                 det = sum(.pre$detection_tier != "neither"), grp = NEG)
+    }))
+  .rows$rate <- .rows$det / .rows$n
+  # Exact binomial interval. It is what turns "no false positives" into a
+  # bounded false-positive rate, and 768 of 771 into a recovery with a floor.
+  .rows$lo <- NA_real_; .rows$hi <- NA_real_
+  for (i in seq_len(nrow(.rows))) {
+    ct <- binom.test(.rows$det[i], .rows$n[i])
+    .rows$lo[i] <- ct$conf.int[1]; .rows$hi[i] <- ct$conf.int[2]
+  }
+  for (i in seq_len(nrow(.rows)))
+    cat(sprintf("%-26s %4d/%-4d = %5.1f%%  (95%% CI %.1f%% to %.1f%%)\n",
+                gsub("[\r\n]+", " ", .rows$cond[i]), .rows$det[i], .rows$n[i],
+                100 * .rows$rate[i], 100 * .rows$lo[i], 100 * .rows$hi[i]))
+  .rows$cond <- factor(.rows$cond, levels = .rows$cond)
+  .rows$grp  <- factor(.rows$grp,  levels = c(POS, NEG))
+
+  ggplot(.rows, aes(cond, rate)) +
+    geom_col(width = 0.55, fill = "grey25") +
+    geom_text(aes(label = sprintf("%d / %d", det, n)), vjust = -0.4, size = 3.3) +
+    facet_grid(~ grp, scales = "free_x", space = "free_x") +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1.12),
+                       expand = expansion(mult = c(0, 0))) +
+    labs(x = NULL, y = "files with a detection") +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(),
+          strip.background = element_rect(fill = "grey93", colour = NA),
+          strip.text = element_text(face = "bold", size = 9.5)) -> .p_ctl
+  dir.create("thesis/graphics", showWarnings = FALSE, recursive = TRUE)
+  ggsave("thesis/graphics/flagship_decoy.png", .p_ctl, width = 6.4, height = 3.6, dpi = 200)
+  .p_ctl
+}
+```
+
+The two controls fail in opposite directions and both come back clean. The
+confirmed files re-detect at MS1 at the rates the figure gives, so the gating
+loses almost nothing that MS2 had already established. In the pre-dose plasma
+draws — real matrix, true m/z, true retention window, drug absent by design —
+the extraction finds nothing. Both counts are computed in the chunk above rather
+than written into this paragraph: the earlier hand-written pair (82 and 106) was
+left behind by the uncapped re-confirmation and understated the control by
+nearly an order of magnitude.
+
+That is what licenses Part A: the prevalence gains that follow are a gain in
+sensitivity rather than an accumulation of false positives.
+
+It licenses less than a decoy-based figure would, and the difference should be
+stated rather than glossed. The negative control is 49 files from one cohort, so
+it constrains the false-positive rate in dosed-study plasma, not across the
+corpus, and no comparable known-negative exists for the other eleven deposits or
+for urine, faeces and skin. Proteomics can quote a corpus-wide false-transfer
+rate (IonQuant measures 2.3% at a nominal 1% FDR, Yu 2021) because a reversed
+peptide sequence is knowably false in *every* run; nothing in an untargeted
+metabolomics archive is knowably absent in every file. Closing that gap needs
+cohorts with a documented unexposed arm, not a better statistic.
+
+
+# Part A: What propagation adds, per dataset and across the corpus
+
+## What the field does, and how we extend it
+
+The reverse-metabolomics / MASST tools answer one question at repository scale:
+in what fraction of files does a molecule appear? Their cross-cohort output is a
+**prevalence table or heatmap** of molecule-by-cohort detection rates, built
+from MS2 spectral matches, and used strictly for hypothesis generation. They
+never quantify intensity across deposits, and their own authors state that a
+negative result is not evidence of absence, because a compound present at low
+abundance may never be selected for fragmentation.
+
+That last point is exactly the gap MS1 propagation fills. We run the same
+prevalence analysis, but replace "did a file get an MS2 match?" with "does the
+compound's signal appear at its confirmed mass and retention time?", which is
+recorded for every file whether or not the instrument fragmented it. So Part A
+is the field's own analysis at higher sensitivity: **per compound, per cohort,
+the MS2 detection rate versus the MS1-propagated detection rate.** It rests on
+presence, not on a quantity, so it is immune to the response-factor and isobaric
+problems that constrain the ratio.
+
+One unit note: prevalence is a **per-file** rate, so this section uses the
+per-file table (not the subject-deduped one) and compares it to the per-file
+MASST hits, restricted to files a metadata source covers.
+
+```{r prevalence-setup}
+#| echo: false
+pf <- samples_perfile
+pf$has_metadata <- {
+  k <- paste0(pf$dataset_id, "|", basename(as.character(pf$file)))
+  h <- has_meta_lookup[k]; ifelse(is.na(h), FALSE, unname(h))
+}
+pf <- pf[pf$has_metadata %in% TRUE, ]
+pf$fk <- fkey(pf$file)
+
+# MS2 baseline: metadata-carrying files with a MASST hit of each role. Restrict
+# the hits to the same file universe (dataset_id | normalised key) so MS2 and
+# MS1 rates share a denominator.
+valid_dk       <- paste0(pf$dataset_id, "|", pf$fk)
+masst_hits$fk  <- fkey(masst_hits$file_path)
+masst_hits$dk  <- paste0(masst_hits$dataset_id, "|", masst_hits$fk)
+mh_valid       <- masst_hits[masst_hits$dk %in% valid_dk, ]
+
+# The ONE deposit pair that is the same study under two accessions, identified
+# from subject identity: the same 14 subjects, and on every shared file the
+# subject, timepoint, study day and body site agree 461/461. One physical file
+# shared by that pair must count ONCE. Rows from the pair share a namespace;
+# every other deposit keeps its own, so identical names across unrelated
+# deposits never merge.
+DUP_STUDY <- c("MSV000082493", "MSV000084008")
+dup_key <- function(dataset_id, fk)
+  ifelse(dataset_id %in% DUP_STUDY, paste0("DUPSTUDY|", fk),
+         paste0(dataset_id, "|", fk))
+
+
+ms2 <- mh_valid |>
+  dplyr::distinct(dataset_id, role, fk) |>
+  dplyr::count(dataset_id, role, name = "ms2") |>
+  tidyr::pivot_wider(names_from = role, values_from = ms2, values_fill = 0)
+if (!"parent"     %in% names(ms2)) ms2$parent     <- 0L
+if (!"metabolite" %in% names(ms2)) ms2$metabolite <- 0L
+
+# A file supports a RATIO only when both compounds are present, so that is
+# counted separately: it is the quantity the downstream ratio work actually
+# depends on.
+ms2_both <- mh_valid |>
+  dplyr::distinct(dataset_id, role, fk) |>
+  dplyr::count(dataset_id, fk, name = "n_roles") |>
+  dplyr::filter(n_roles == 2) |>
+  dplyr::count(dataset_id, name = "both")
+
+prevalence <- pf |>
+  dplyr::group_by(dataset_id) |>
+  dplyr::summarise(n_files        = dplyr::n(),
+                   ms1_parent     = sum(detection_tier %in% c("both", "parent_only")),
+                   ms1_metabolite = sum(detection_tier %in% c("both", "metab_only")),
+                   ms1_both       = sum(detection_tier == "both"),
+                   .groups = "drop") |>
+  dplyr::left_join(ms2_both, by = "dataset_id") |>
+  dplyr::mutate(both = tidyr::replace_na(as.integer(both), 0L)) |>
+  dplyr::left_join(ms2, by = "dataset_id") |>
+  dplyr::mutate(dplyr::across(c(parent, metabolite),
+                              ~ tidyr::replace_na(as.integer(.), 0L)),
+                ds = short_ds(dataset_id))
+
+prev_long <- prevalence |>
+  dplyr::transmute(ds, n_files,
+    `omeprazole (MS2)`          = parent        / n_files,
+    `omeprazole (MS1)`          = ms1_parent    / n_files,
+    `5-OH-omeprazole (MS2)`     = metabolite    / n_files,
+    `5-OH-omeprazole (MS1)`     = ms1_metabolite / n_files) |>
+  tidyr::pivot_longer(-c(ds, n_files), names_to = "panel", values_to = "rate") |>
+  tidyr::separate(panel, into = c("compound", "method"), sep = " \\(") |>
+  dplyr::mutate(method = sub("\\)", "", method))
+```
+
+## The prevalence heatmap: MS2 versus MS1, per compound, per cohort
+
+This is the figure that shows what the pipeline buys. Each row is a cohort, each
+column a (compound, detection-method) pair; colour is the fraction of that
+cohort's files in which the compound is detected. The MS1 columns should be at
+least as dark as their MS2 counterparts, and much darker wherever the instrument
+under-fragmented the compound.
+
+```{r prevalence-heatmap, fig.width = 8, fig.height = 5.5}
+prev_long |>
+  dplyr::mutate(col = paste0(compound, "\n", method),
+                col = factor(col, levels = c(
+                  "omeprazole\nMS2", "omeprazole\nMS1",
+                  "5-OH-omeprazole\nMS2", "5-OH-omeprazole\nMS1"))) |>
+  ggplot(aes(x = col, y = reorder(ds, rate, sum), fill = rate)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = scales::percent(rate, accuracy = 1)), size = 2.7) +
+  scale_fill_gradient(low = "grey95", high = "#1b6837",
+                      labels = scales::percent, name = "detection\nrate") +
+  labs(x = NULL, y = NULL,
+       title = "Files with a detection per cohort, MASST MS2 and MS1-propagated") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(lineheight = 0.9))
+```
+
+## The propagation gain per cohort
+
+The same numbers as a gain: MS1 detections divided by MS2 detections, per
+compound per cohort. This is the honest, cohort-resolved version of the
+propagation-gain headline (a single corpus-wide multiplier hides that the gain
+is largest exactly where MS2 coverage is thinnest).
+
+A cohort whose MS2 baseline is zero inside the analysed files has **no defined
+gain**: a ratio needs a denominator. Printing `x / max(0, 1)` would invent one,
+so those cells read `n/a` and the counts alone carry the meaning.
+
+**MSV000082433 (\*) needs its own note, because it is not a gain at all.** Its
+entire MS2 evidence for both roles is a single file, `957.mzML`, which sits on
+`20161103_Amerindian_Plate6`. Pan-ReDU indexes only plates 1 to 3 of this
+deposit, so that file is described by no metadata source, and the MS2 columns
+above, which are restricted to annotated files, cannot count it. The file itself
+is not the problem: it carries a clean, textbook omeprazole peak (1.1e8 at the
+confirmed retention time) and a confirmed 5-OH peak. It is simply unusable,
+because without metadata it cannot enter any stratified analysis.
+
+```{r ds82433-parent}
+#| echo: false
+# Counted, not written in: this pair read "219 of 224" for a while after a
+# re-extraction moved it.
+.x433 <- samples_perfile[samples_perfile$dataset_id == "MSV000082433", ]
+N433_NOPEAK <- sum(is.na(.x433$par_auc)); N433_FILES <- nrow(.x433)
+```
+
+Inside the annotated files the picture is the opposite. The parent produces **no
+chromatographic peak** at the confirmed retention time in `r N433_NOPEAK` of
+`r N433_FILES` files; the handful of files with any in-window signal show
+single-scan spikes (one point at 0.5 to 0.83 s scan spacing, with nothing on
+either side), which the point-count gate correctly rejects. So the metabolite
+counts for this cohort are a presence observation with **no parent, no ratio,
+and no MS2 baseline to compare against**. Read that row as "one confirmed but
+unannotated file, plus a metabolite-only presence signal", never as a
+propagation gain.
+
+```{r prevalence-gain}
+#| echo: false
+gain_str <- function(ms2, ms1) {
+  ifelse(ms2 > 0,
+         sprintf("%d -> %d  (%.1fx)", ms2, ms1, ms1 / pmax(ms2, 1)),
+         sprintf("%d -> %d  (n/a: no MS2 in analysed files)", ms2, ms1))
+}
+prevalence |>
+  dplyr::transmute(cohort = ifelse(ds == "MSV000082433", paste0(ds, " *"), ds), n_files,
+    `omeprazole: MS2 -> MS1` = gain_str(parent, ms1_parent),
+    `5-OH: MS2 -> MS1`       = gain_str(metabolite, ms1_metabolite),
+    # a ratio needs both compounds in one file, so it is counted here rather
+    # than inferred from the two columns beside it
+    `usable ratio: MS2 -> MS1` = gain_str(both, ms1_both)) |>
+  dplyr::arrange(dplyr::desc(n_files))
+
+write_csv(dplyr::arrange(prevalence, dplyr::desc(n_files)),
+          "artifacts/prevalence_by_deposit.csv")
+```
+
+Detecting one compound is not the same as being able to compute a ratio, which
+needs both in the same file. That is the number the whole quantitative strand
+rests on, so it is counted separately rather than inferred from the two columns
+above.
+
+**No file is counted twice.** MSV000082493 and MSV000084008 share 333 physical
+files; those contribute once, so the totals below are over distinct files.
+Simply summing the per-cohort rows above would have counted them twice and
+inflated every number.
+
+```{r propagation-corpus-totals}
+#| echo: false
+pfd <- pf
+pfd$dk <- dup_key(pfd$dataset_id, pfd$fk)
+pfd <- pfd[!duplicated(pfd$dk), ]                    # one row per physical file
+
+mhd <- mh_valid
+mhd$dk <- dup_key(mhd$dataset_id, mhd$fk)
+ms2_n <- function(r) length(unique(mhd$dk[mhd$role == r]))
+ms2_both_n <- length(intersect(mhd$dk[mhd$role == "parent"],
+                               mhd$dk[mhd$role == "metabolite"]))
+
+tot <- data.frame(
+  quantity = c("omeprazole", "5-OH-omeprazole", "both, i.e. a usable ratio"),
+  MASST_MS2 = c(ms2_n("parent"), ms2_n("metabolite"), ms2_both_n),
+  MS1_propagated = c(sum(pfd$detection_tier %in% c("both", "parent_only")),
+                     sum(pfd$detection_tier %in% c("both", "metab_only")),
+                     sum(pfd$detection_tier == "both")))
+tot$gain <- sprintf("%.2fx", tot$MS1_propagated / tot$MASST_MS2)
+
+# An interval on the gain, resampling DEPOSITS rather than files. Files inside a
+# deposit share its chromatography, its depositor and its detection rate, so they
+# are not independent draws and a file-level bootstrap reports an interval far
+# tighter than the evidence supports. Twelve deposits is the real sample size.
+set.seed(1)
+.dep <- unique(pfd$dataset_id)
+.gboot <- replicate(2000, {
+  d <- sample(.dep, replace = TRUE)
+  # A deposit drawn twice must count twice, so each draw carries its own tag;
+  # without it unique()/intersect() would silently collapse the duplicate and the
+  # resample would be a subsample.
+  tag <- function(tb, j) {
+    x <- tb[tb$dataset_id == d[j], , drop = FALSE]
+    if (nrow(x)) x$dk <- paste0(j, "|", x$dk)
+    x
+  }
+  p2 <- do.call(rbind, lapply(seq_along(d), function(j) tag(pfd, j)))
+  m2 <- do.call(rbind, lapply(seq_along(d), function(j) tag(mhd, j)))
+  ms1 <- c(sum(p2$detection_tier %in% c("both", "parent_only")),
+           sum(p2$detection_tier %in% c("both", "metab_only")),
+           sum(p2$detection_tier == "both"))
+  # distinct FILES, matching how the point estimate is counted
+  ms2 <- c(length(unique(m2$dk[m2$role == "parent"])),
+           length(unique(m2$dk[m2$role == "metabolite"])),
+           length(intersect(unique(m2$dk[m2$role == "parent"]),
+                            unique(m2$dk[m2$role == "metabolite"]))))
+  ifelse(ms2 > 0, ms1 / ms2, NA_real_)
+})
+.q <- apply(.gboot, 1, quantile, c(0.025, 0.975), na.rm = TRUE)
+tot$gain_ci <- sprintf("%.2f to %.2f", .q[1, ], .q[2, ])
+knitr::kable(tot, caption = sprintf(paste(
+  "Files with a detection, %d distinct metadata-carrying files across 12 deposits.",
+  "The gain interval is a bootstrap over deposits, not files."),
+  nrow(pfd)))
+```
+
+```{r fig-propagation-tables, fig.width = 6.8, fig.height = 3.4}
+#| echo: false
+# The same table as a figure, so the deck shows the notebook's own numbers.
+d <- as.data.frame(lapply(
+  stats::setNames(tot, c("compound", "MASST MS2", "MS1 propagated", "gain")),
+  as.character), check.names = FALSE)
+d$.row <- rev(seq_len(nrow(d)))
+hl <- d$.row[3]
+long <- tidyr::pivot_longer(d, -.row, names_to = "col", values_to = "val")
+long$col <- factor(long$col, levels = names(d)[names(d) != ".row"])
+ggplot(long, aes(as.integer(col), .row)) +
+  geom_tile(aes(fill = .row %in% hl), colour = "white", linewidth = 1.1) +
+  geom_text(aes(label = val, fontface = ifelse(.row %in% hl, "bold", "plain")),
+            size = 3.9) +
+  annotate("text", x = seq_len(ncol(d) - 1), y = max(d$.row) + 0.85,
+           label = names(d)[names(d) != ".row"], fontface = "bold", size = 3.9) +
+  scale_fill_manual(values = c(`TRUE` = "grey85", `FALSE` = "grey96"), guide = "none") +
+  scale_y_continuous(expand = expansion(add = c(0.55, 1.3))) +
+  scale_x_continuous(expand = expansion(add = 0.5)) +
+  labs(title = sprintf("Files with a detection, %d distinct files across 12 deposits",
+                       nrow(pfd)), x = NULL, y = NULL) +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 12, hjust = 0,
+                                  margin = margin(b = 10)))
+```
+
+The ratio row is the one that matters: a file needs **both** compounds before it
+can say anything quantitative, and that is where propagation helps most, because
+it can rescue either compound in a file where MS2 caught only the other one.
+
+## The resource this produces, deposit by deposit
+
+The totals say how much was recovered. They do not say where it landed, and for
+anyone deciding whether these data are worth reusing that is the more useful
+question. So the same output is described three ways below: how many independent
+units carry a ratio, what the ratio's level is in each deposit, and which strata
+each deposit could be cut by.
+
+The unit here is one row per subject per deposit, taking the median over that
+subject's files. Three deposits record no subject, so there the file is the unit
+and the count is an upper bound on the number of people rather than a number of
+people.
+
+```{r output-units}
+#| echo: false
+DUP_LABEL <- "MSV000082493/084008"
+
+rr <- pf[pf$detection_tier == "both" & is.finite(pf$log2_ratio), ]
+rr$dk    <- dup_key(rr$dataset_id, rr$fk)
+rr       <- rr[!duplicated(rr$dk), ]
+rr$study <- ifelse(rr$dataset_id %in% DUP_STUDY, DUP_LABEL, rr$dataset_id)
+rr$has_subject <- !is.na(rr$subject_id) & rr$subject_id != ""
+rr$unit  <- ifelse(rr$has_subject, paste0("S:", rr$study, "|", rr$subject_id),
+                   paste0("F:", rr$study, "|", rr$dk))
+
+ratio_units <- rr |>
+  dplyr::group_by(study, unit) |>
+  dplyr::summarise(log2_ratio  = median(log2_ratio),
+                   has_subject = all(has_subject),
+                   n_files     = dplyr::n(),
+                   sex         = dplyr::first(sex),
+                   health      = dplyr::first(health_status),
+                   age         = as_num(dplyr::first(age)),
+                   .groups     = "drop") |>
+  dplyr::mutate(ds = short_ds(study))
+
+out_tbl <- ratio_units |>
+  dplyr::group_by(ds) |>
+  dplyr::summarise(units       = dplyr::n(),
+                   files       = sum(n_files),
+                   unit_is     = ifelse(all(has_subject), "subject", "file"),
+                   median_log2 = round(median(log2_ratio), 2),
+                   IQR         = round(IQR(log2_ratio), 2),
+                   sex         = sum(!is.na(harmonise_sex(sex))),
+                   health      = sum(!is.na(harmonise_health(health))),
+                   age         = sum(is.finite(age)),
+                   .groups     = "drop") |>
+  dplyr::arrange(dplyr::desc(units))
+knitr::kable(out_tbl, caption = sprintf(
+  "Units carrying a usable ratio: %d across %d studies. The last three columns count units whose deposit records that field in a form a contrast can use.",
+  nrow(ratio_units), dplyr::n_distinct(ratio_units$ds)))
+write.csv(out_tbl, "artifacts/output_resource_by_deposit.csv", row.names = FALSE)
+```
+
+`r nrow(out_tbl)` studies carry at least one ratio, `r sum(out_tbl$units)` units
+in total, and only MSV000082433 carries none. That is the resource: small, but
+it did not exist before the extraction, since a ratio needs both compounds in
+one file and MS2 supplied that in `r ms2_both_n` files, concentrated almost
+entirely in the dosed cohort.
+
+Two of those rows are not independent of each other. MSV000092754 and
+MSV000092757 are the same subject panel measured twice, by HILIC and by reverse
+phase, so they contribute
+`r sum(out_tbl$units[out_tbl$ds %in% c("MSV000092754", "MSV000092757")])` units
+but not that many people; they are kept apart because the two measurements
+differ, not because the two deposits do.
+
+The second column is the reason the corpus cannot simply be pooled. The median
+level differs by deposit far more than it differs between people inside a
+deposit. Deposits differ in instrument, gradient and specimen at once, so one
+median carries all three and this figure separates none of them. The variance
+decomposition further down does, and the answer is not the one the
+response-factor argument predicts.
+
+```{r fig-ratio-by-dataset, fig.width = 7.6, fig.height = 4.4}
+#| echo: false
+ord <- ratio_units |> dplyr::group_by(ds) |>
+  dplyr::summarise(m = median(log2_ratio), .groups = "drop") |>
+  dplyr::arrange(m)
+ratio_units$ds <- factor(ratio_units$ds, levels = ord$ds)
+
+p_ratio_ds <- ggplot(ratio_units, aes(x = log2_ratio, y = ds)) +
+  geom_vline(xintercept = 0, linetype = 3, colour = "grey55") +
+  geom_boxplot(outlier.shape = NA, width = 0.55, fill = "grey92", colour = "grey35") +
+  geom_jitter(aes(shape = has_subject), height = 0.16, width = 0, alpha = 0.7, size = 1.7) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1),
+                     labels = c(`TRUE` = "subject", `FALSE` = "file (no subject recorded)"),
+                     name = "unit") +
+  labs(x = expression(log[2]*"(omeprazole / 5-OH-omeprazole)"), y = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "bottom")
+p_ratio_ds
+ggsave("thesis/graphics/flagship_ratio_by_dataset.png", p_ratio_ds,
+       width = 7.6, height = 4.4, dpi = 200)
+```
+
+A boxplot per deposit rather than a pooled one, because pooling these would
+average over whatever the between-deposit difference is made of and produce a
+number that describes no cohort. Within a deposit the spread is what a contrast
+can work with; between deposits it is not yet interpretable. That distinction is
+what separates the next two sections.
+
+```{r fig-output-strata, fig.width = 8.2, fig.height = 3.6}
+#| echo: false
+LV <- c("female", "male", "healthy", "not healthy", "<40", "40-59", ">=60")
+str_long <- dplyr::bind_rows(
+  ratio_units |> dplyr::transmute(ds, field = "sex", value = harmonise_sex(sex)),
+  ratio_units |> dplyr::transmute(ds, field = "health status", value = harmonise_health(health)),
+  ratio_units |> dplyr::transmute(ds, field = "age",
+                            value = cut(age, c(-Inf, 40, 60, Inf),
+                                        labels = c("<40", "40-59", ">=60"),
+                                        right = FALSE) |> as.character())) |>
+  dplyr::filter(!is.na(value)) |>
+  dplyr::mutate(field = factor(field, levels = c("sex", "health status", "age")),
+                value = factor(value, levels = LV))
+
+p_strata <- ggplot(str_long, aes(y = ds, fill = value)) +
+  geom_bar() +
+  facet_wrap(~ field, nrow = 1, scales = "free_x") +
+  scale_fill_brewer(palette = "Set2", name = NULL, drop = FALSE) +
+  labs(x = "units carrying a ratio", y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", legend.key.size = unit(0.4, "cm"))
+p_strata
+ggsave("thesis/graphics/flagship_output_strata.png", p_strata,
+       width = 8.2, height = 3.6, dpi = 200)
+
+knitr::kable(str_long |> dplyr::count(field, value, name = "units"),
+             caption = "Stratifier levels available across the ratio-bearing units")
+```
+
+Timepoint is deliberately absent. It is recorded almost only in the dosed
+cohort, where it is the design rather than a stratifier, and including it would
+have made the corpus look richer in covariates than it is.
+
+Sex is harmonised before counting: three deposits write `F`/`M` and the rest
+`female`/`male`, which would otherwise be four levels rather than two. Health
+status is mapped through the same explicit whitelist the covariate scan uses, so
+labels that are neither clearly healthy nor clearly a disease arm — `chronic
+illness`, `compensated`, `decompensated` — stay unset instead of being forced
+onto one side.
+
+The fields that survive are thin and unevenly spread, and no field is recorded
+across all ten studies. This is the ceiling on everything the next two sections
+attempt, and it is a property of what depositors wrote down rather than of the
+extraction.
+
+## The analysis unit, and the designs the corpus actually has
+
+Everything from here on is epidemiology rather than extraction, so the unit
+changes. The prevalence and gain tables above count **files**, correctly,
+because propagation is a per-injection operation. A statistical contrast is a
+different question and needs a unit that corresponds to an independent
+observation.
+
+Three things sit between a file and an independent observation, and each has
+bitten this analysis at some point:
+
+1. **Replicate injections.** One physical sample can be run several times.
+2. **Repeated measures within subject.** The probe cohort is 1,137 files from
+   **14 people**, about 27 rows each, and every one of those people appears in
+   several body sites. Testing body site against detection on the raw rows
+   treats one person as 27 observations and returns a p-value that means
+   nothing.
+3. **Deposits that record no subject at all.** Three do. There a file is the
+   only available unit and the design is simply unknown, which has to be said
+   rather than assumed away.
+
+The rule used below: **one row per subject per level of the contrast**. A
+subject sampled at ten timepoints contributes one observation; a subject sampled
+in four matrices contributes one observation *per matrix*, which is correct
+because body site is the thing being contrasted. Where no subject is recorded
+the file is the unit and the result is flagged `design unknown` and never
+reported as confirmatory.
+
+```{r unit-setup}
+# One file universe, MS1 and MS2 flags, independent studies rather than
+# accessions.
+ms2_keys <- unique(paste0(mh_valid$dataset_id, "|", mh_valid$fk))
+pm <- pf
+pm$ms2 <- paste0(pm$dataset_id, "|", pm$fk) %in% ms2_keys
+pm$ms1 <- pm$detection_tier %in% c("both", "parent_only", "metab_only")
+pm$par_ms1 <- pm$detection_tier %in% c("both", "parent_only")
+pm$met_ms1 <- pm$detection_tier %in% c("both", "metab_only")
+par_keys <- unique(paste0(mh_valid$dataset_id, "|", mh_valid$fk)[mh_valid$role == "parent"])
+met_keys <- unique(paste0(mh_valid$dataset_id, "|", mh_valid$fk)[mh_valid$role == "metabolite"])
+pm$par_ms2 <- paste0(pm$dataset_id, "|", pm$fk) %in% par_keys
+pm$met_ms2 <- paste0(pm$dataset_id, "|", pm$fk) %in% met_keys
+
+# DUP_STUDY / dup_key are defined with the MS2 baseline above, where the
+# reasoning is set out once. The appendix documents the evidence.
+
+pm$study <- dplyr::case_when(
+  grepl(paste(DUP_STUDY, collapse = "|"), pm$dataset_id) ~ "Jarmusch probe",
+  grepl("MSV000092754|MSV000092757", pm$dataset_id)      ~ "Chagas serum",
+  TRUE ~ short_ds(pm$dataset_id))
+pm <- pm[!duplicated(paste(pm$study, pm$fk)), ]
+
+nz <- function(v) ifelse(is.na(v) | !nzchar(as.character(v)), NA_character_, as.character(v))
+pm$subj <- nz(pm$subject_id)
+
+# Deposits name the same matrix differently: blood_plasma and "blood plasma",
+# UANoAdditive_YellowTop and urine, fecal and feces. Left raw, one matrix splits
+# into several rows of any cross-cohort table and each row reads as a different
+# biology.
+canon_site <- function(x) {
+  y <- tolower(trimws(gsub("[_.]+", " ", as.character(x))))
+  dplyr::case_when(
+    is.na(y) | !nzchar(y)               ~ NA_character_,
+    grepl("plasma", y)                  ~ "plasma",
+    grepl("serum", y)                   ~ "serum",
+    grepl("^ua|urine", y)               ~ "urine",
+    grepl("fecal|feces|faec|stool", y)  ~ "faeces",
+    grepl("forehead|arm skin|^skin", y) ~ "skin",
+    grepl("saliva", y)                  ~ "saliva",
+    grepl("oral cavity|mouth", y)       ~ "oral cavity",
+    grepl("milk", y)                    ~ "milk",
+    grepl("nasal", y)                   ~ "nasal cavity",
+    grepl("vagina", y)                  ~ "vagina",
+    grepl("anal", y)                    ~ "anal region",
+    TRUE                                ~ y)
+}
+pm$site  <- canon_site(pm$body_site)
+pm$sex2  <- dplyr::case_when(grepl("^f", tolower(trimws(pm$sex))) ~ "female",
+                             grepl("^m", tolower(trimws(pm$sex))) ~ "male",
+                             TRUE ~ NA_character_)
+pm$clin  <- ifelse(!is.na(nz(pm$health_status)), pm$health_status, pm$group)
+pm$agen  <- as_num(pm$age)
+pm$ageb  <- as.character(cut(pm$agen, c(-Inf, 40, 60, Inf),
+                             labels = c("<40", "40-60", ">60")))
+
+# The unit rule. Returns one row per (subject, level of g), with the detection
+# columns OR-ed within that unit, and records whether the design is
+# subject-resolved.
+units_for <- function(x, g, cols) {
+  keep <- !is.na(g) & nzchar(g)
+  x <- x[keep, , drop = FALSE]; g <- g[keep]
+  if (!nrow(x)) return(NULL)
+  # Per row, not per deposit: a file with no subject is its own unit, since
+  # collapsing the unlabelled rows of a partly-labelled deposit would invent one
+  # subject per level.
+  known <- subject_resolved(x$subj, sibling_ids = unlist(sibling_id_map[unique(x$dataset_id)], use.names = FALSE))
+  u <- ifelse(is.na(x$subj), paste0("file:", x$fk), paste(x$subj, g))
+  out <- data.frame(unit = u, g = g, x[, cols, drop = FALSE]) |>
+    dplyr::group_by(unit) |>
+    dplyr::summarise(g = dplyr::first(g),
+                     dplyr::across(dplyr::all_of(cols), any), .groups = "drop")
+  attr(out, "design") <- if (!known) "design unknown"
+    else if (any(is.na(x$subj))) sprintf("partial (%.0f%% subject-labelled)",
+                                         100 * mean(!is.na(x$subj)))
+    else "subject-resolved"
+  out
+}
+# Sample-size gate: a level needs >= 5 units to enter, and >= 2 levels must
+# survive.
+gate <- function(a, min_level = 5) {
+  a <- a[a$g %in% names(table(a$g))[table(a$g) >= min_level], ]
+  if (dplyr::n_distinct(a$g) < 2) NULL else a
+}
+# >= 3 events AND >= 3 non-events, or the table degenerates and Fisher is
+# undefined.
+fish <- function(g, v) if (sum(v) >= 3 && sum(!v) >= 3)
+  fisher.test(table(g, v), simulate.p.value = TRUE, B = 20000)$p.value else NA_real_
+```
+
+```{r unit-design-table}
+design_tbl <- pm |>
+  dplyr::group_by(study) |>
+  dplyr::summarise(files = dplyr::n(),
+                   subjects = dplyr::n_distinct(subj[!is.na(subj)]),
+                   subject_recorded = paste0(round(100 * mean(!is.na(subj))), "%"),
+                   files_per_subject = ifelse(dplyr::n_distinct(subj[!is.na(subj)]) > 0,
+                     round(dplyr::n() / dplyr::n_distinct(subj[!is.na(subj)]), 1), NA),
+                   .groups = "drop") |>
+  dplyr::arrange(dplyr::desc(dplyr::coalesce(files_per_subject, 0)))
+knitr::kable(design_tbl, caption = "Study designs: how many files stand behind one person")
+```
+
+Read the top and bottom rows. The probe cohort is
+`r design_tbl$files_per_subject[1]` files per subject, so any test run on its
+raw rows is inflated roughly that many times over. The three deposits reporting
+`0` subjects record no subject identifier at all, so nothing there can be
+de-duplicated and every contrast in them is exploratory.
+
+## What propagation unlocks: a per-dataset contrast scan
+
+The question this section answers is not "does propagation find more files" but
+**"does propagation let a single deposit answer a question it otherwise could
+not"**. That is a per-dataset question, tested inside each deposit, with no
+pooling anywhere.
+
+Every combination of study, stratifier and compound is tested twice: once using
+only the MASST MS2 detections, once using the MS1-propagated detections. A
+contrast enters only if it clears the sample-size gate above. Because this is a
+scan of several dozen contrasts, both methods get Benjamini-Hochberg control
+across everything they can test.
+
+```{r unlock-scan}
+STRAT <- c(sex = "sex2", `body site` = "site",
+           `clinical group` = "clin", `age band` = "ageb")
+ROLES <- list(omeprazole        = c("par_ms2", "par_ms1"),
+              `5-OH-omeprazole` = c("met_ms2", "met_ms1"),
+              `either compound` = c("ms2", "ms1"))
+set.seed(1)
+scan_rows <- list()
+for (s in unique(pm$study)) for (vn in names(STRAT)) for (rn in names(ROLES)) {
+  x  <- pm[pm$study == s, , drop = FALSE]
+  a0 <- units_for(x, x[[STRAT[[vn]]]], ROLES[[rn]])
+  if (is.null(a0)) next
+  dsg <- attr(a0, "design"); a <- gate(a0)
+  if (is.null(a)) next
+  p2 <- fish(a$g, a[[ROLES[[rn]][1]]]); p1 <- fish(a$g, a[[ROLES[[rn]][2]]])
+  if (is.na(p1) && is.na(p2)) next
+  scan_rows[[length(scan_rows) + 1]] <- data.frame(
+    study = s, stratifier = vn, compound = rn, design = dsg, units = nrow(a),
+    det_ms2 = sum(a[[ROLES[[rn]][1]]]), det_ms1 = sum(a[[ROLES[[rn]][2]]]),
+    p2 = p2, p1 = p1)
+}
+SCAN <- dplyr::bind_rows(scan_rows)
+SCAN$q2 <- NA_real_; SCAN$q1 <- NA_real_
+SCAN$q2[!is.na(SCAN$p2)] <- p.adjust(SCAN$p2[!is.na(SCAN$p2)], "BH")
+SCAN$q1[!is.na(SCAN$p1)] <- p.adjust(SCAN$p1[!is.na(SCAN$p1)], "BH")
+
+knitr::kable(data.frame(
+  method = c("MASST MS2 only", "MS1 propagated"),
+  testable = c(sum(!is.na(SCAN$p2)), sum(!is.na(SCAN$p1))),
+  significant_FDR_05 = c(sum(SCAN$q2 < 0.05, na.rm = TRUE),
+                         sum(SCAN$q1 < 0.05, na.rm = TRUE))),
+  caption = "Contrasts each method can test, and how many survive FDR control")
+```
+
+```{r unlock-table}
+sig <- SCAN[!is.na(SCAN$q1) & SCAN$q1 < 0.05, ]
+sig <- sig[order(sig$q1), ]
+sig$MASST <- ifelse(is.na(sig$q2), "could not test",
+             ifelse(sig$q2 < 0.05, sprintf("also found it (q = %.3g)", sig$q2),
+                    sprintf("NOT significant (q = %.3g)", sig$q2)))
+sig$new <- is.na(sig$q2) | sig$q2 >= 0.05
+knitr::kable(sig |> dplyr::transmute(study, stratifier, compound, design, units,
+                                     MS2 = det_ms2, MS1 = det_ms1, MASST,
+                                     q_MS1 = sprintf("%.3g", q1)),
+             caption = "Every contrast MS1 finds at FDR 0.05, and what MASST said about it")
+
+lost <- SCAN[!is.na(SCAN$q2) & SCAN$q2 < 0.05 & (is.na(SCAN$q1) | SCAN$q1 >= 0.05), ]
+```
+
+```{r fig-unlock-scan, fig.width = 9, fig.height = 5}
+#| echo: false
+.s <- sig
+.s$label <- paste0(.s$study, "\n", .s$stratifier, ", ", .s$compound)
+.s$label <- factor(.s$label, levels = rev(.s$label))
+.pl <- tidyr::pivot_longer(.s[, c("label", "design", "q2", "q1")],
+                           c(q2, q1), names_to = "method", values_to = "q")
+.pl$method <- ifelse(.pl$method == "q1", "MS1 propagated", "MASST MS2 only")
+.pl$q[is.na(.pl$q)] <- 1.2                       # "could not test" parked off-scale
+ggplot(.pl, aes(q, label, colour = method, shape = method)) +
+  geom_vline(xintercept = 0.05, linetype = 2, colour = "grey55") +
+  geom_line(aes(group = label), colour = "grey75", linewidth = 0.5) +
+  geom_point(size = 2.8) +
+  scale_x_continuous(trans = "log10",
+                     breaks = c(1e-4, 1e-3, 1e-2, 0.05, 0.2, 1),
+                     labels = c("0.0001", "0.001", "0.01", "0.05", "0.2", "1 / n.t.")) +
+  scale_colour_manual(values = c("MS1 propagated" = "#111111",
+                                 "MASST MS2 only" = "#9a9a9a"), name = NULL) +
+  scale_shape_manual(values = c("MS1 propagated" = 16, "MASST MS2 only" = 17), name = NULL) +
+  labs(x = "Benjamini-Hochberg q, log scale", y = NULL,
+       title = "Benjamini-Hochberg q per within-deposit contrast, MASST MS2 and MS1-propagated") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 8.5, lineheight = 0.95),
+        plot.title = element_text(face = "bold", size = 12.5))
+```
+
+Three numbers matter here.
+
+**Nothing is lost.** `r nrow(lost)` contrasts that MASST finds significant fail
+to replicate under propagation. Whatever else propagation does, it does not
+overturn the MS2 result, which is the minimum a match-between-runs method has to
+demonstrate.
+
+**`r sum(sig$new)` of `r nrow(sig)` findings are new**: MASST either could not
+test the contrast at all or returned a null. Of those,
+**`r sum(sig$new & sig$design == "subject-resolved")` sit on a subject-resolved
+design** and are the ones worth quoting; the remainder are in deposits with no
+subject identifier and are exploratory.
+
+**The defensible new findings are all the same finding.** They are the
+COVID-severity contrasts in MTBLS1866 and MTBLS11656, which is to say the two
+cohorts that also replicate each other in the section above. The per-dataset
+scan and the replication are the same fact approached from two directions, which
+is the strongest form the evidence takes anywhere in this project.
+
+MTBLS1866 is the demonstration piece. On the MASST detections the
+metabolite-versus- severity contrast returns a **perfect null**: three detected
+subjects, q = 1. MS1 supplies 37 and the same contrast in the same cohort
+becomes q = 0.0003. Nothing about the cohort, the metadata or the test changed.
+Only whether the compound was looked for in MS1.
+
+Two cautions, both visible in the table. The body-site contrasts in MSV000094097
+look strong and cannot be claimed, because that deposit records no subjects and
+its 144 files might be 144 people or 36 people sampled at four sites. And the
+probe cohort's body-site contrasts are significant under **both** methods once
+aggregated to 55 subject-by-site units; on raw files they were computed across
+1,125 rows from 14 people, which was never a valid test even though it happened
+to reach the same verdict.
+
+### The one deposit worth showing despite an unknown design
+
+MSV000094097 produces the largest single jump in the scan and cannot be counted
+as a result, so it is worth showing exactly as it is rather than dropping it.
+MASST finds the metabolite in 2 of its files. Propagation finds it in 32, across
+four body sites, and the body-site contrast goes from untestable to q = 0.0003.
+
+```{r fig-094097, fig.width = 7.6, fig.height = 4.2}
+#| echo: false
+.d97 <- pm[pm$study == "MSV000094097" & !is.na(pm$site), ]
+.t97 <- .d97 |>
+  dplyr::group_by(site) |>
+  dplyr::summarise(files = dplyr::n(),
+                   `omeprazole (MS2)` = sum(par_ms2), `omeprazole (MS1)` = sum(par_ms1),
+                   `5-OH-omeprazole (MS2)` = sum(met_ms2), `5-OH-omeprazole (MS1)` = sum(met_ms1),
+                   .groups = "drop") |>
+  tidyr::pivot_longer(-c(site, files), names_to = "panel", values_to = "count") |>
+  tidyr::separate(panel, into = c("compound", "method"), sep = " \\(") |>
+  dplyr::mutate(method = sub("\\)", "", method), rate = count / files,
+                col = factor(paste0(compound, "\n", method),
+                             levels = c("omeprazole\nMS2", "omeprazole\nMS1",
+                                        "5-OH-omeprazole\nMS2", "5-OH-omeprazole\nMS1")),
+                row = paste0(site, "  (", files, " files)"))
+ggplot(.t97, aes(col, reorder(row, rate, sum), fill = rate)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = count, colour = rate > 0.3), size = 4, fontface = "bold") +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey15"), guide = "none") +
+  scale_fill_gradient(low = "grey94", high = "black", guide = "none") +
+  labs(x = NULL, y = NULL,
+       title = "Files with a detection by body site, MSV000094097") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(lineheight = 0.9),
+        plot.title = element_text(face = "bold", size = 13))
+```
+
+The pattern is the one the rest of the corpus shows: both compounds present in
+the blood fractions, the metabolite reaching further than the parent, and the
+non-blood sites near empty. That coherence is why it is worth showing. What
+cannot be done is attach a p-value to it, because without subject identifiers
+there is no way to know whether the four body sites are four samples from the
+same person, in which case the contrast is paired and the test is invalid.
+
+This is a **metadata** limitation, not a measurement one. The spectra are fine;
+the deposit simply never recorded who each file came from. It is the single
+clearest argument in this project for depositors recording a subject identifier.
+
+## The corpus-wide gain, with and without the metadata restriction
+
+The per-cohort table above counts only files a metadata source covers, because
+every stratified analysis downstream needs that metadata. But the pipeline
+extracts from more files than that: a file with no metadata still yields a valid
+presence call, it just cannot be assigned to a subject or a group. Both numbers
+are worth stating, because they answer different questions. The unrestricted row
+is what the extraction actually recovers; the restricted row is what survives
+into an analysis.
+
+```{r prevalence-gain-total}
+#| echo: false
+# DUP_STUDY / dup_key as defined with the MS2 baseline above; the reasoning for
+# why only this pair collapses, and why 092754/092757 must not, is stated there.
+
+prop_totals <- function(d, label, dedup_files = TRUE) {
+  d$fk <- fkey(d$file)
+  dk   <- unique(paste0(d$dataset_id, "|", d$fk))
+  mh   <- masst_hits[masst_hits$dk %in% dk, ]
+  if (dedup_files) {
+    # Count distinct physical files per role. dup_key must not be deduplicated
+    # across roles first: a file with both a parent and a metabolite hit would
+    # collapse to one row and silently drop a role (this deflated the metabolite
+    # MS2 baseline 526 -> 146 and inflated its gain to 8x). Dedup within each
+    # role.
+    d  <- d[!duplicated(dup_key(d$dataset_id, d$fk)), ]
+    nd <- function(role) {
+      r <- mh[mh$role == role, ]
+      length(unique(dup_key(r$dataset_id, r$fk)))
+    }
+  } else {
+    nd <- function(role) nrow(dplyr::distinct(mh[mh$role == role, c("dataset_id", "fk")]))
+  }
+  p2 <- nd("parent"); m2 <- nd("metabolite")
+  p1 <- sum(d$detection_tier %in% c("both", "parent_only"))
+  m1 <- sum(d$detection_tier %in% c("both", "metab_only"))
+  fmt <- function(ms2, ms1) if (ms2 > 0)
+    sprintf("%d -> %d  (%.1fx)", ms2, ms1, ms1 / ms2) else
+    sprintf("%d -> %d  (n/a)", ms2, ms1)
+  data.frame(
+    scope                    = label,
+    files                    = nrow(d),
+    `omeprazole: MS2 -> MS1` = fmt(p2, p1),
+    `5-OH: MS2 -> MS1`       = fmt(m2, m1),
+    check.names = FALSE, stringsAsFactors = FALSE)
+}
+rbind(
+  prop_totals(samples_perfile, "all extracted, DISTINCT files",   dedup_files = TRUE),
+  prop_totals(pf,              "metadata-carrying, DISTINCT",     dedup_files = TRUE),
+  prop_totals(samples_perfile, "all extracted, summed (INFLATED)", dedup_files = FALSE))
+```
+
+The MS2 baseline here is **every MASST hit in `hits_curated`**, not just the
+subset we sent to SIRIUS. That matters: the confirmation step was capped per
+role per dataset, so dividing by the confirmed count would measure our own cap
+rather than the method, and inflates the gain several-fold. The uncapped
+baseline is the conservative choice and the one a "classic" MS2-only reanalysis
+would have had.
+
+## What the spread across cohorts tells us
+
+The spread of detection rate across cohorts is not noise; it is the biology of
+who is exposed. Two regimes are visible:
+
+- **Drug-probe cohorts** (every subject dosed by design) sit near 100% for both
+  compounds. They are the internal positive control: propagation should, and
+  does, recover almost everything there.
+- **General-population and disease cohorts** sit low, because only incidentally
+  dosed subjects carry the drug. Here the MS1-over-MS2 gain is largest, and the
+  absolute number of recovered exposures is the payoff: a few percent of a large
+  cohort is still tens of subjects the MS2-only analysis would have missed.
+
+The metabolite frequently has a higher detection rate than the parent (e.g. in
+excretory matrices), which is expected pharmacology, not an artefact: omeprazole
+is extensively metabolised, so in urine or feces the metabolite persists while
+the parent is largely gone. This asymmetry is itself a hypothesis-generating
+readout and is exactly the kind of pattern the presence analysis surfaces.
+
+## Does a cohort finding replicate in an independent cohort?
+
+The strongest argument for assembling a corpus rather than analysing one deposit
+is that a claim can be **tested twice, in populations that share nothing**. Two
+deposits here stratify subjects by COVID-19 severity and were produced by
+unrelated groups on different continents: MTBLS1866 (Italy) and MTBLS11656
+(China). Neither was collected to study omeprazole, and neither knows about the
+other. If severity really tracks exposure, the pattern should appear in both.
+
+Note this pairing is the opposite situation to MSV000082493 / MSV000084008
+below, which look like two cohorts but are one study re-deposited twice.
+Replication requires independence, so establishing it is a prerequisite for
+reading anything as a second observation rather than an echo of the first.
+
+```{r severity-replication}
+rep_sets <- c(MTBLS1866 = "Italy", MTBLS11656 = "China")
+
+# A column that is empty for every row is read as logical NA, and nzchar(NA) is
+# TRUE, so the "is this column populated" test must exclude NA or it always
+# passes.
+filled <- function(v) !is.na(v) & nzchar(as.character(v))
+
+rep_rows <- lapply(names(rep_sets), function(acc) {
+  x <- pf[grepl(paste0("^", acc, "(_|$)"), pf$dataset_id), , drop = FALSE]
+  if (!nrow(x)) return(NULL)
+  # Deposits differ in which column carries the severity strata; take whichever
+  # one this deposit actually populates.
+  g  <- if (sum(filled(x$health_status)) > 10) x$health_status else x$group
+  ok <- filled(g)
+  data.frame(cohort = paste0(acc, " (", rep_sets[[acc]], ")"),
+             stratum = as.character(g)[ok],
+             par = x$detection_tier[ok] %in% c("both", "parent_only"),
+             met = x$detection_tier[ok] %in% c("both", "metab_only"),
+             stringsAsFactors = FALSE)
+})
+rep_df <- dplyr::bind_rows(rep_rows)
+
+rep_tbl <- rep_df |>
+  dplyr::group_by(cohort, stratum) |>
+  dplyr::summarise(files = dplyr::n(),
+                   omeprazole = sum(par), `5-OH` = sum(met), .groups = "drop") |>
+  dplyr::arrange(cohort, dplyr::desc(`5-OH` / files))
+
+B_SIM <- 20000
+set.seed(1)   # the p is simulated, so pin it or the reported value drifts per render
+# A simulated Fisher p cannot go below 1/(B+1). Printing that floor as "0.0000"
+# would claim a precision the simulation does not have, so show it as an upper
+# bound.
+fmt_p <- function(p) ifelse(p <= 1 / (B_SIM + 1),
+                            sprintf("< %.0e", 1 / (B_SIM + 1)), sprintf("%.4f", p))
+
+rep_p <- rep_df |>
+  dplyr::group_by(cohort) |>
+  dplyr::summarise(
+    p_parent = fmt_p(fisher.test(table(stratum, par),
+                                 simulate.p.value = TRUE, B = B_SIM)$p.value),
+    p_metabolite = fmt_p(fisher.test(table(stratum, met),
+                                     simulate.p.value = TRUE, B = B_SIM)$p.value),
+    .groups = "drop")
+
+knitr::kable(rep_tbl, caption = "Detected files per severity stratum, two independent cohorts")
+knitr::kable(rep_p,
+             caption = "Fisher exact test of stratum against detection, within each cohort")
+```
+
+```{r fig-replication, fig.width = 8, fig.height = 5.4}
+#| echo: false
+.rl <- rep_tbl |>
+  tidyr::pivot_longer(c(omeprazole, `5-OH`), names_to = "compound", values_to = "detected") |>
+  dplyr::mutate(stratum = paste0(stratum, "  (n=", files, ")"),
+                compound = factor(ifelse(compound == "5-OH", "5-OH-omeprazole", "omeprazole"),
+                                  levels = c("omeprazole", "5-OH-omeprazole")))
+ggplot(.rl, aes(reorder(stratum, detected), detected, fill = compound)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.62) +
+  geom_text(aes(label = detected), position = position_dodge(width = 0.72),
+            hjust = -0.35, size = 3) +
+  coord_flip() + facet_wrap(~ cohort, scales = "free", ncol = 1) +
+  scale_fill_manual(values = c(omeprazole = "#1b1b1b", `5-OH-omeprazole` = "#9a9a9a"),
+                    name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.16))) +
+  labs(x = NULL, y = "files with the compound detected",
+       title = "Files with a detection by COVID-19 severity stratum, two independent cohorts") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text = element_text(face = "bold", size = 10),
+        plot.title = element_text(face = "bold", size = 12.5))
+```
+
+Both cohorts give the same ordering, and in both the **healthy control stratum
+contributes zero detected files of either compound**. That the healthy groups
+are exactly empty in two unrelated populations is the part that a single deposit
+cannot establish: within one cohort an empty control group is a plausible
+accident of size, whereas twice it is the negative control the corpus was
+assembled to provide.
+
+The reading is exposure, not pathology. Omeprazole is prescribed heavily in
+hospital and intensive care, so what replicates is that the sicker strata are
+the medicated strata. The finding is that the pipeline recovers a real,
+interpretable prescribing gradient from data deposited for an unrelated purpose,
+in two countries at once.
+
+### Does the exposure reading hold up everywhere it can be checked?
+
+Calling these associations exposure rather than pathology is not a hedge, it is
+a testable claim: if the pipeline is measuring who was **prescribed**
+omeprazole, then the drug should concentrate in strata receiving more medical
+care, and should be near absent where none is given. Crucially it should track
+*care*, not illness as such, so a cohort stratified by a disease that does not
+change prescribing should show nothing. Four independent studies record a
+clinical grouping and can be checked.
+
+```{r fig-exposure-sense, fig.width = 8.4, fig.height = 5.4}
+#| echo: false
+.cl <- pm |> dplyr::filter(!is.na(clin), nzchar(clin))
+.cl$unit <- ifelse(is.na(.cl$subj), paste(.cl$study, .cl$fk),
+                   paste(.cl$study, .cl$subj, .cl$clin))
+.cs <- .cl |>
+  dplyr::group_by(unit) |>
+  dplyr::summarise(study = dplyr::first(study), clin = dplyr::first(clin),
+                   ms1 = any(ms1), .groups = "drop") |>
+  dplyr::group_by(study, clin) |>
+  dplyr::summarise(n = dplyr::n(), det = sum(ms1), rate = mean(ms1), .groups = "drop") |>
+  dplyr::group_by(study) |>
+  dplyr::filter(dplyr::n() >= 2, sum(n) >= 20) |>
+  dplyr::ungroup()
+.cs$label <- paste0(.cs$clin, "  (", .cs$n, ")")
+ggplot(.cs, aes(rate, reorder(label, rate))) +
+  geom_col(width = 0.6, fill = "grey25") +
+  geom_text(aes(label = sprintf("%d/%d", det, n)), hjust = -0.18, size = 3.1) +
+  facet_wrap(~ study, scales = "free_y", ncol = 2) +
+  scale_x_continuous(labels = scales::percent,
+                     expand = expansion(mult = c(0, 0.22))) +
+  labs(x = "subjects with a detection", y = NULL,
+       title = "Subjects with a detection by clinical stratum, per study") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text = element_text(face = "bold", size = 10),
+        plot.title = element_text(face = "bold", size = 12.5))
+```
+
+The gradient is **not** uniform across the four, and that is the informative
+part.
+
+It is strong in exactly the two cohorts whose strata differ in **intensity of
+hospital care**: MTBLS1866 runs from 78% in patients who survived intensive care
+down to 0 of 26 healthy, and MTBLS11656 from severe disease down to 0 of 45 in
+both the mild and the healthy arms. It is absent in the Chagas cohort, where the
+strata are infection status in what is largely an outpatient population, and
+where infected (11 of 72) and healthy (1 of 6) sit at the same rate. ST002722
+has 6 subjects in its second arm and cannot say anything either way.
+
+That pattern is what makes the exposure reading credible rather than convenient.
+If the pipeline were picking up something generic about being unwell, Chagas
+infection should have moved it too. It does not, because Chagas outpatients are
+not receiving stress-ulcer prophylaxis, whereas intensive-care patients very
+often are. The signal tracks **care intensity, not illness**, which is precisely
+what a prescribing signal should do and what a disease-mechanism signal should
+not.
+
+Stating it as exposure is therefore a **strength of the result, not a caveat on
+it**. It would be far more worrying to find omeprazole distributed at random
+across clinical strata, or concentrated in the healthy arms. The claim is that
+the readout works, and this is the evidence that it does; the claim is not that
+COVID-19 causes omeprazole to appear in plasma.
+
+## Pooling presence across studies: a random-effects meta-analysis
+
+The scan above asks what each deposit can answer on its own. This asks the
+stronger question: measure a contrast **inside** each study, then pool the
+study-level effects. Nothing crosses a study boundary except a log odds ratio,
+so the response-factor offset and the isomer are both irrelevant, and
+between-study disagreement becomes a measured quantity (`I2`) instead of an
+assumption.
+
+The unit is the one defined above: one subject per contrast level, with deposits
+that record no subject flagged rather than silently treated as independent.
+Because the same question can be put to the MS2 baseline, this is also the
+sharpest available test of what propagation buys at the corpus level.
+
+```{r pool-helpers}
+# DerSimonian-Laird random-effects pooling of log odds ratios.
+dl_pool <- function(yi, vi) {
+  wf <- 1 / vi; mf <- sum(wf * yi) / sum(wf)
+  Q  <- sum(wf * (yi - mf)^2); df <- length(yi) - 1
+  C  <- sum(wf) - sum(wf^2) / sum(wf)
+  tau2 <- max(0, (Q - df) / C)
+  w <- 1 / (vi + tau2); m <- sum(w * yi) / sum(w); se <- sqrt(1 / sum(w))
+  list(OR = exp(m), lo = exp(m - 1.96 * se), hi = exp(m + 1.96 * se),
+       p = 2 * pnorm(-abs(m / se)), I2 = max(0, 100 * (Q - df) / Q), k = length(yi))
+}
+# Haldane 0.5 correction only when a cell is empty, which it often is here.
+or_2x2 <- function(grp, det) {
+  a <- sum(grp & det); b <- sum(grp & !det); c <- sum(!grp & det); e <- sum(!grp & !det)
+  if (min(a, b, c, e) == 0) { a <- a + .5; b <- b + .5; c <- c + .5; e <- e + .5 }
+  c(yi = log((a * e) / (b * c)), vi = 1/a + 1/b + 1/c + 1/e)
+}
+fmt_pool <- function(p) sprintf("%.2f (%.2f to %.2f), p = %.3g, I2 = %.0f%%, k = %d",
+                                p$OR, p$lo, p$hi, p$p, p$I2, p$k)
+```
+
+### The unexposed-by-design stratum
+
+Three studies contain a stratum that should carry no drug: the healthy arms of
+the two COVID cohorts, and the uninfected arm of the Chagas serum study. Each
+study's reference level is taken from **its own vocabulary**, never from a name
+match, which would otherwise sweep in QC and blank injections and invert the
+result.
+
+```{r pool-reference}
+# The Chagas deposit carries TWO unexposed labels, "uninfected" and "healthy",
+# as separate strata. Taking only one of them would be a choice made after
+# seeing the answer, so both are used. It is also the conservative direction:
+# the "healthy" arm contains the single detection, which weakens the contrast
+# rather than helping it.
+REF <- list("MTBLS1866"    = "non-COVID-19 healthy",
+            "MTBLS11656"   = "Healthy Control",
+            "Chagas serum" = c("uninfected", "healthy"))
+
+ref_rows <- function(role) {
+  dplyr::bind_rows(lapply(names(REF), function(s) {
+    x  <- pm[pm$study == s, , drop = FALSE]
+    a  <- units_for(x, x$clin, role)
+    if (is.null(a)) return(NULL)
+    ref <- a$g %in% REF[[s]]
+    if (sum(ref) < 5 || sum(!ref) < 5) return(NULL)
+    o <- or_2x2(ref, a[[role]])
+    data.frame(study = s, reference = paste(REF[[s]], collapse = " + "),
+               ref_units = sum(ref), ref_detected = sum(ref & a[[role]]),
+               other_units = sum(!ref), other_detected = sum(!ref & a[[role]]),
+               yi = o[["yi"]], vi = o[["vi"]])
+  }))
+}
+ref_ms1 <- ref_rows("ms1"); ref_ms2 <- ref_rows("ms2")
+pr1 <- dl_pool(ref_ms1$yi, ref_ms1$vi); pr2 <- dl_pool(ref_ms2$yi, ref_ms2$vi)
+
+knitr::kable(ref_ms1[, 1:6],
+             caption = "Detections in the unexposed-by-design stratum, per subject")
+knitr::kable(data.frame(method = c("MASST MS2 only", "MS1 propagated"),
+                        pooled_OR = c(fmt_pool(pr2), fmt_pool(pr1))),
+             caption = "Pooled odds of detection in the reference stratum versus the rest")
+```
+
+**`r sum(ref_ms1$ref_detected)` detection in `r sum(ref_ms1$ref_units)`
+reference subjects across three independent studies**, against
+`r sum(ref_ms1$other_detected)` in the rest, with `I2 = 0%`. The two COVID
+cohorts contribute exact zeros; the single detection is in the Chagas healthy
+arm, which is one subject of six and is exactly the kind of incidental
+prescription a general-population arm is expected to contain.
+
+The MS2 row is the point. On the MASST baseline the same three studies pool to p
+= `r sprintf("%.3f", pr2$p)`, which clears no threshold. **The contrast becomes
+significant only once propagation supplies the detections** (p =
+`r sprintf("%.4f", pr1$p)`), and it does so without putting a single false
+positive into the strata where the drug should be absent. This is the
+corpus-level analogue of the pre-dose negative control in `04`.
+
+### Sex: does propagation move an estimate, or only sharpen it?
+
+Sex is the one variable testable in five independent studies under **both**
+methods, which makes it the place to ask whether adding propagated detections
+biases a pooled effect rather than merely narrowing it.
+
+```{r pool-sex}
+sex_pool <- function(role) {
+  tb <- dplyr::bind_rows(lapply(unique(pm$study), function(s) {
+    x <- pm[pm$study == s, , drop = FALSE]
+    a <- units_for(x, x$sex2, role); if (is.null(a)) return(NULL)
+    a <- gate(a); if (is.null(a)) return(NULL)
+    if (sum(a[[role]]) < 3 || sum(!a[[role]]) < 3) return(NULL)
+    o <- or_2x2(a$g == "female", a[[role]])
+    data.frame(study = s, design = attr(units_for(x, x$sex2, role), "design"),
+               units = nrow(a), detected = sum(a[[role]]),
+               yi = o[["yi"]], vi = o[["vi"]])
+  }))
+  if (nrow(tb) < 2) return(NULL)
+  list(tb = tb, p = dl_pool(tb$yi, tb$vi))
+}
+sx2 <- sex_pool("ms2"); sx1 <- sex_pool("ms1")
+knitr::kable(sx1$tb[, c("study", "design", "units", "detected")],
+             caption = "Studies contributing to the sex contrast, per subject")
+knitr::kable(data.frame(
+  method = c("MASST MS2 only", "MS1 propagated"),
+  pooled_OR_female_vs_male = c(fmt_pool(sx2$p), fmt_pool(sx1$p)),
+  CI_width_log_odds = round(c(log(sx2$p$hi) - log(sx2$p$lo),
+                              log(sx1$p$hi) - log(sx1$p$lo)), 2)),
+  caption = "Sex contrast pooled over five independent studies under each method")
+```
+
+Both are null and both have `I2 = 0%`, so propagation does not manufacture an
+association. What it changes is precision: the interval narrows from
+`r sprintf("%.2f", log(sx2$p$hi) - log(sx2$p$lo))` to
+`r sprintf("%.2f", log(sx1$p$hi) - log(sx1$p$lo))` log-odds, which turns an
+interval spanning roughly a `r sprintf("%.0f", sx2$p$hi / sx2$p$lo)`-fold range,
+and therefore compatible with almost anything, into a usefully bounded null.
+
+This is the check a match-between-runs method owes before its extra detections
+are trusted in any association analysis, and it is only possible because sex
+happens to be recorded in five studies. It is not itself a biological result.
+
+### Age: where propagation prevents a claim rather than enabling one
+
+```{r pool-age}
+age_pool <- function(role) {
+  tb <- dplyr::bind_rows(lapply(unique(pm$study), function(s) {
+    x <- pm[pm$study == s & is.finite(pm$agen), , drop = FALSE]
+    if (!nrow(x)) return(NULL)
+    # Collapse to people where the deposit supports it; where it records no
+    # subject, the file is the unit and the estimate is labelled as resting on
+    # an unknown design.
+    known <- subject_resolved(x$subj, sibling_ids = unlist(sibling_id_map[unique(x$dataset_id)], use.names = FALSE))
+    a <- data.frame(u = if (known) x$subj else x$fk, agen = x$agen, y = x[[role]]) |>
+      dplyr::group_by(u) |>
+      dplyr::summarise(agen = dplyr::first(agen), y = any(y), .groups = "drop")
+    if (nrow(a) < 20 || sum(a$y) < 5 || sum(!a$y) < 5) return(NULL)
+    if (diff(range(a$agen)) < 10) return(NULL)
+    m <- try(glm(y ~ I(agen / 10), data = a, family = binomial))
+    if (inherits(m, "try-error")) return(NULL)
+    co <- summary(m)$coefficients
+    if (!"I(agen/10)" %in% rownames(co)) return(NULL)
+    data.frame(study = s, design = if (known) "subject-resolved" else "design unknown",
+               subjects = nrow(a),
+               age_range = paste0(round(min(a$agen)), " to ", round(max(a$agen))),
+               OR_per_decade = round(exp(co["I(agen/10)", "Estimate"]), 2),
+               yi = co["I(agen/10)", "Estimate"], vi = co["I(agen/10)", "Std. Error"]^2)
+  }))
+  if (nrow(tb) < 2) return(NULL)
+  list(tb = tb, p = dl_pool(tb$yi, tb$vi))
+}
+ag2 <- age_pool("ms2"); ag1 <- age_pool("ms1")
+knitr::kable(ag1$tb[, c("study", "design", "subjects", "age_range", "OR_per_decade")],
+             caption = "The age slopes, with the cohorts that produced them")
+knitr::kable(data.frame(method = c("MASST MS2 only", "MS1 propagated"),
+                        pooled_OR_per_decade = c(fmt_pool(ag2$p), fmt_pool(ag1$p))),
+             caption = "Detection against age, logistic within each study then pooled")
+```
+
+```{r fig-pooled-forest, fig.width = 8.6, fig.height = 4.4}
+#| echo: false
+.row <- function(p, contrast, method) data.frame(
+  contrast = contrast, method = method, OR = p$OR, lo = p$lo, hi = p$hi,
+  note = sprintf("k=%d  I2=%.0f%%  p=%s", p$k, p$I2,
+                 ifelse(p$p < 0.001, format(signif(p$p, 1), scientific = TRUE),
+                        format(round(p$p, 3), nsmall = 3))))
+.f <- rbind(
+  .row(pr2, "Unexposed stratum\nvs the rest", "MASST MS2 only"),
+  .row(pr1, "Unexposed stratum\nvs the rest", "MS1 propagated"),
+  .row(sx2$p, "Female vs male", "MASST MS2 only"),
+  .row(sx1$p, "Female vs male", "MS1 propagated"),
+  .row(ag2$p, "Per decade of age", "MASST MS2 only"),
+  .row(ag1$p, "Per decade of age", "MS1 propagated"))
+.f$contrast <- factor(.f$contrast, levels = rev(unique(.f$contrast)))
+ggplot(.f, aes(OR, contrast, colour = method, shape = method)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = "grey55") +
+  geom_errorbar(aes(xmin = lo, xmax = hi), width = 0.16,
+                position = position_dodge(width = 0.62), linewidth = 0.6) +
+  geom_point(size = 2.6, position = position_dodge(width = 0.62)) +
+  geom_text(aes(label = note), position = position_dodge(width = 0.62),
+            hjust = 0, vjust = -1.1, size = 2.8, show.legend = FALSE) +
+  scale_x_continuous(trans = "log10", breaks = c(0.02, 0.1, 0.5, 1, 2, 5)) +
+  scale_colour_manual(values = c("MS1 propagated" = "#111111",
+                                 "MASST MS2 only" = "#9a9a9a"), name = NULL) +
+  scale_shape_manual(values = c("MS1 propagated" = 16, "MASST MS2 only" = 17), name = NULL) +
+  labs(x = "pooled odds ratio (log scale), random effects", y = NULL,
+       title = "Random-effects pooled odds ratio per contrast, MASST MS2 and MS1-propagated") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 12.5))
+```
+
+Read this one carefully, because the naive version is wrong. Restricted to the
+MASST detections only **`r ag2$p$k` studies** can fit an age term
+(`r paste(ag2$tb$study, collapse = " and ")`, `r sum(ag2$tb$subjects)` units
+between them), they happen to agree, and the pool returns a significant
+`r sprintf("%.2f", ag2$p$OR)`-fold increase per decade, which flatters a
+well-known prescribing pattern. Propagation lets **`r ag1$p$k` studies** fit it
+and the pooled effect collapses to non-significance with `I2 =
+`r sprintf("%.0f%%", ag1$p$I2)``.
+
+**At `r ag2$p$k` studies, `I2` cannot detect heterogeneity at all.** The MS2
+answer is not cleaner than the MS1 answer; it is blind. That is the clearest
+statement in this notebook of what an MS2-only corpus analysis costs: not merely
+fewer detections, but too few studies to see that the studies disagree.
+
+#### Why they disagree, and why pooling harder cannot fix it
+
+The heterogeneity is structural. **Every study that can fit a slope is a
+clinical cohort**, and age inside a hospital population is a proxy for case-mix:
+a Chagas infection cohort, a spot-urine cohort from a Glasgow clinic, a cohort
+of older adults with chronic illness. Each slope measures who in *that*
+population was prescribed a proton-pump inhibitor, which is a different quantity
+in each. And the **age ranges barely overlap**, as the table shows: a per-decade
+linear slope fitted to a cohort spanning the thirties and one fitted to a cohort
+spanning the sixties describe different segments of a relationship there is no
+reason to think is linear. They were never estimating a common parameter, so the
+pooling was ill-posed before the data arrived.
+
+#### The clean version of the question cannot be asked here
+
+The way to remove the case-mix confound is to ask only about people who are not
+patients. The corpus does not support it.
+
+```{r pool-age-healthy}
+HEALTHY <- list("MTBLS1866"      = "non-COVID-19 healthy",
+                "MTBLS11656"     = "Healthy Control",
+                "Chagas serum"   = "uninfected",
+                "MSV000082433"   = "healthy",
+                "MSV000091520"   = "healthy",
+                "Jarmusch probe" = "healthy")
+healthy_tbl <- dplyr::bind_rows(lapply(names(HEALTHY), function(s) {
+  x <- pm[pm$study == s, , drop = FALSE]
+  if (!nrow(x)) return(NULL)
+  v <- nz(x$health_status)
+  h <- !is.na(v) & tolower(v) == tolower(HEALTHY[[s]])
+  if (!any(h)) return(NULL)
+  y <- x[h, , drop = FALSE]
+  u <- if (!all(is.na(y$subj))) dplyr::n_distinct(y$subj) else nrow(y)
+  data.frame(study = s, healthy_units = u,
+             age = if (all(is.na(y$agen))) "not recorded" else
+                   paste0(round(min(y$agen, na.rm = TRUE)), " to ",
+                          round(max(y$agen, na.rm = TRUE))),
+             MS1_detected = sum(y$ms1), MS2_detected = sum(y$ms2))
+}))
+knitr::kable(healthy_tbl, caption = "Healthy strata: do any have age and events together?")
+```
+
+Six studies carry a healthy stratum. Three record no age at all. Of those that
+do, two contribute almost no events, and the probe cohort's detections exist
+only because every subject was **dosed by design**, which answers a different
+question and records no age anyway. That leaves roughly nine detections in
+healthy people with a recorded age, and five of those are MSV000082433's, which
+the closing subsection shows are metabolite-without-parent in non-blood sites
+and most likely the isomer.
+
+The negative is worth stating positively: **background exposure in non-clinical
+populations is close to zero here**, which converges with the unexposed-stratum
+result above and is precisely why age is unaskable. Omeprazole in this corpus
+marks clinical care, so any age effect is inseparable from the setting that
+produced it. We report no pooled age association.
+
+### What does not pool
+
+- **Body site.** Only one study has two body sites with enough subjects, so the
+  biofluid view below is a pooled description and not a meta-analysis.
+- **MSV000082433.** It contributes five MS1 detections MASST does not have, but
+  all five are **metabolite without parent**, in five different non-blood sites
+  (nasal cavity, vagina, oral cavity, arm skin), in healthy women aged 18 to 33.
+  That is the signature of the isobaric interference described in `03`, not of
+  drug exposure, and the deposit is not counted as a propagation success
+  anywhere here.
+
+## Prevalence by biofluid: the reverse-metabolomics biology view
+
+The heatmap above is organised by cohort to show the method's value (MS2 vs
+MS1). The reverse-metabolomics papers instead organise prevalence by a **biology
+axis** (tissue / biofluid / health phenotype); Gentry et al. (Nature 2024, Fig
+2b-d) is the canonical example, a molecule-by-tissue and
+molecule-by-health-condition prevalence heatmap. We reproduce that view here,
+MS1-propagated: pooling across cohorts by body site, the detection prevalence of
+each compound.
+
+Since this is a cross-repository comparison it is computed **per specimen**, on
+the same collapsed table the meta-analysis above uses. A file-level version
+would let the probe cohort's replicate injections dominate the plasma row simply
+by having been injected more often, which is a property of its protocol rather
+than of plasma.
+
+This pooling deliberately crosses cohorts, so exposure and body site are partly
+confounded (a biofluid seen only in a drug-probe cohort will read high for
+reasons of study design, not physiology). It is therefore hypothesis-generating,
+in exactly the spirit the field uses it: the expected signal is that the parent
+concentrates in blood/plasma while the metabolite persists in excretory matrices
+(urine, feces), which if it appears is the pharmacology falling out of public
+data with no targeted assay.
+
+```{r prevalence-by-biofluid, fig.width = 7.5, fig.height = 5}
+# Same unit rule as everywhere else, built explicitly here because this table
+# also needs the study, to show how many cohorts stand behind each matrix.
+bysite <- pm |>
+  dplyr::filter(!is.na(site)) |>
+  dplyr::mutate(.u = ifelse(is.na(subj), paste(study, fk), paste(study, subj, site))) |>
+  dplyr::group_by(.u) |>
+  dplyr::summarise(site = dplyr::first(site), study = dplyr::first(study),
+                   par_ms1 = any(par_ms1), met_ms1 = any(met_ms1), .groups = "drop") |>
+  dplyr::group_by(site) |>
+  dplyr::summarise(n_specimens = dplyr::n(),
+                   n_studies = dplyr::n_distinct(study),
+                   omeprazole = mean(par_ms1), `5-OH-omeprazole` = mean(met_ms1),
+                   .groups = "drop") |>
+  dplyr::filter(n_specimens >= 5) |>
+  tidyr::pivot_longer(c(omeprazole, `5-OH-omeprazole`),
+                      names_to = "compound", values_to = "rate")
+
+ggplot(bysite, aes(x = compound,
+                   y = reorder(paste0(site, "  (", n_specimens, " specimens, ",
+                                      n_studies, ifelse(n_studies == 1, " study)", " studies)")),
+                                rate, sum),
+                   fill = rate)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = scales::percent(rate, accuracy = 1),
+                colour = rate > 0.45), size = 3, fontface = "bold") +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey15"), guide = "none") +
+  scale_fill_gradient(low = "grey95", high = "#762a83",
+                      labels = scales::percent, name = "MS1 detection\nrate") +
+  labs(x = NULL, y = NULL,
+       title = "MS1-propagated detection prevalence by body site, per specimen") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+The study count on each row is the part to read first. A body site carried by
+one study is that study's exposure pattern wearing a biofluid label, and only
+the rows backed by several cohorts describe anything about the matrix itself.
+
+## The ratio across cohorts: measuring the offset instead of assuming it
+
+Prevalence is a per-compound presence question, and presence rests on the
+parent, which has no isobaric twin. The parent/metabolite **ratio** is a
+different kind of object: a quantity whose absolute value carries a per-method
+response-factor offset. The standing position in this project has been that the
+offset is unknown, so ratios must not be pooled across cohorts. That position is
+defensible but untested, and the corpus turns out to contain the experiment that
+tests it.
+
+### Trying to measure the offset directly, and failing to pin it down
+
+MSV000092754 and MSV000092757 are the **same subjects and the same serum**, run
+on HILIC and on reverse phase. Biology is held constant by construction, so
+whatever separates the two deposits is method. This is the only place in the
+corpus where the offset can be observed rather than assumed, so it is worth
+asking what it gives.
+
+```{r ratio-offset}
+ratio_pf <- pf |>
+  dplyr::filter(detection_tier == "both", is.finite(log2_ratio))
+
+# One study under two accessions must not count twice; two accessions of one
+# subject panel on two columns must not be merged. Both rules are established
+# above.
+ratio_pf$study <- dplyr::case_when(
+  grepl(paste(DUP_STUDY, collapse = "|"), ratio_pf$dataset_id) ~ "Jarmusch probe (082493 + 084008)",
+  grepl("MSV000092754|MSV000092757", ratio_pf$dataset_id)      ~ "Chagas serum (092754 + 092757)",
+  TRUE ~ short_ds(ratio_pf$dataset_id))
+
+chagas <- ratio_pf |>
+  dplyr::filter(grepl("MSV000092754|MSV000092757", dataset_id)) |>
+  dplyr::mutate(chromatography = ifelse(grepl("092754", dataset_id), "HILIC", "RP"))
+
+chagas_grp <- chagas |>
+  dplyr::group_by(chromatography) |>
+  dplyr::summarise(files = dplyr::n(), subjects = dplyr::n_distinct(subject_id),
+                   median_log2 = median(log2_ratio), .groups = "drop")
+OFFSET_GRP <- abs(diff(chagas_grp$median_log2))
+
+# The paired form is the design that actually holds biology fixed: the same
+# person on both columns. It is also far smaller, because few subjects yield a
+# ratio twice.
+chagas_pair <- chagas |>
+  dplyr::filter(!is.na(subject_id), nzchar(as.character(subject_id))) |>
+  dplyr::group_by(subject_id, chromatography) |>
+  dplyr::summarise(m = median(log2_ratio), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = chromatography, values_from = m) |>
+  dplyr::filter(!is.na(HILIC), !is.na(RP))
+
+OFFSET_PAIR <- median(chagas_pair$RP - chagas_pair$HILIC)
+# A median of exactly zero arrives as -1e-16 and would print as "-0.00".
+OFFSET_PAIR_TXT <- sprintf("%+.2f", ifelse(abs(OFFSET_PAIR) < 0.005, 0, OFFSET_PAIR))
+cp <- wilcox.test(chagas_pair$RP, chagas_pair$HILIC, paired = TRUE)
+
+knitr::kable(chagas_grp, digits = 2,
+             caption = "Same subjects, same serum, two chromatographies (group level)")
+knitr::kable(chagas_pair |> dplyr::mutate(difference = RP - HILIC), digits = 2,
+             caption = "The same comparison, paired within subject")
+```
+
+Compared at the group level the two columns differ by
+`r sprintf("%.2f", OFFSET_GRP)` log2, about
+`r sprintf("%.1f", 2^OFFSET_GRP)`-fold, which looks like a reassuringly small
+offset. The paired version is the design that actually holds biology fixed, and
+it does not support that reading: only **`r nrow(chagas_pair)` subjects** yield
+a ratio on both columns, the median difference is `r OFFSET_PAIR_TXT` log2,
+reverse phase is higher in `r sum(chagas_pair$RP > chagas_pair$HILIC)` of
+`r nrow(chagas_pair)`, and p = `r sprintf("%.2f", cp$p.value)`. The per-subject
+differences run from
+`r sprintf("%.1f", min(chagas_pair$RP - chagas_pair$HILIC))` to
+`r sprintf("%+.1f", max(chagas_pair$RP - chagas_pair$HILIC))` log2.
+
+So the honest conclusion is not "the offset is 1.5-fold". It is that the one
+direct measurement available puts the **central** offset near zero while leaving
+it very imprecisely determined, on six subjects. That is not a licence to pool
+absolute ratios across deposits. It does mean the interesting cross-cohort ratio
+work has to come from designs where the offset cannot enter at all, which is
+what follows.
+
+### The matrix contrast that carries no offset at all
+
+The cleanest comparison in the corpus needs no correction whatsoever. Within the
+probe study the **same 14 subjects** gave plasma and urine, on the same
+instrument, in the same run. Any response factor is shared and cancels exactly
+in a paired test.
+
+```{r ratio-paired-matrix}
+# Same canonical vocabulary as Part A, then restricted to the matrices that can
+# actually carry a ratio.
+ratio_pf$site <- canon_site(ratio_pf$body_site)
+ratio_pf$site[!ratio_pf$site %in% c("plasma", "serum", "urine", "faeces")] <- NA
+
+paired <- ratio_pf |>
+  dplyr::filter(study == "Jarmusch probe (082493 + 084008)",
+                site %in% c("plasma", "urine")) |>
+  dplyr::group_by(subject_id, site) |>
+  dplyr::summarise(m = median(log2_ratio), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = site, values_from = m) |>
+  dplyr::filter(!is.na(plasma), !is.na(urine))
+
+pw   <- wilcox.test(paired$plasma, paired$urine, paired = TRUE)
+gap  <- median(paired$plasma - paired$urine)
+```
+
+Across `r nrow(paired)` subjects the plasma ratio exceeds the urine ratio in
+**`r sum(paired$plasma > paired$urine)` of `r nrow(paired)`**, by a median of
+`r sprintf("%.2f", gap)` log2 (`r sprintf("%.0f", 2^gap)`-fold), paired Wilcoxon
+p = `r sprintf("%.2g", pw$p.value)`. The parent dominates in blood and the
+metabolite dominates in urine, which is the textbook disposition of an
+extensively metabolised drug, recovered from public data with no targeted assay
+and with the offset arithmetically removed.
+
+### Does the ordering survive across independent studies?
+
+Now the harder question: does the same ordering appear when the cohorts are not
+the same people? Only study-by-matrix cells backed by at least five subjects are
+interpretable; the rest rest on a single subject and are listed only for
+completeness.
+
+```{r ratio-by-study-matrix}
+cell <- ratio_pf |>
+  dplyr::filter(!is.na(site)) |>
+  dplyr::group_by(site, study) |>
+  dplyr::summarise(files = dplyr::n(), subjects = dplyr::n_distinct(subject_id),
+                   median_log2 = median(log2_ratio), .groups = "drop") |>
+  dplyr::mutate(usable = subjects >= 5) |>
+  dplyr::arrange(dplyr::desc(usable), median_log2)
+
+knitr::kable(cell, digits = 2,
+             caption = "log2(parent / metabolite) per body site and independent study")
+
+vc <- ratio_pf |> dplyr::filter(site %in% c("plasma", "serum", "urine"))
+av <- anova(lm(log2_ratio ~ site + factor(study), data = vc))
+ss <- av[["Sum Sq"]]
+var_tbl <- data.frame(term = c("body site", "study, given body site", "residual"),
+                      pct_variance = round(100 * ss / sum(ss), 1))
+
+# An interval on the split, resampling STUDIES rather than files. The two
+# components are properties of a corpus of a few studies, not of its files, and a
+# file-level bootstrap would report a precision the design does not have. A study
+# drawn twice enters as two studies, or the resample is a subsample.
+set.seed(1)
+.st <- unique(vc$study)
+.vboot <- replicate(2000, {
+  d <- sample(.st, replace = TRUE)
+  z <- do.call(rbind, lapply(seq_along(d), function(j) {
+    x <- vc[vc$study == d[j], , drop = FALSE]
+    if (nrow(x)) x$study <- paste0(j, "|", x$study)
+    x
+  }))
+  if (dplyr::n_distinct(z$site) < 2 || dplyr::n_distinct(z$study) < 2)
+    return(rep(NA_real_, 3))
+  a2 <- anova(lm(log2_ratio ~ site + factor(study), data = z))
+  if (nrow(a2) < 3) return(rep(NA_real_, 3))
+  s2 <- a2[["Sum Sq"]]
+  100 * s2[seq_len(3)] / sum(s2)
+})
+var_tbl$ci_95 <- sprintf("%.1f to %.1f",
+                         apply(.vboot, 1, quantile, 0.025, na.rm = TRUE),
+                         apply(.vboot, 1, quantile, 0.975, na.rm = TRUE))
+var_tbl$usable_resamples <- sum(!is.na(.vboot[1, ]))
+knitr::kable(var_tbl, caption = paste(
+  "Variance in the ratio attributable to matrix versus study.",
+  "Intervals are a bootstrap over studies, the unit the components describe."))
+```
+
+The four usable cells order urine below plasma below serum, and the plasma cells
+from two unrelated studies (the probe cohort and MTBLS1866) bracket zero while
+the serum cell sits well above it. That ordering is suggestive but it is **not**
+a test: each cell still carries its own offset, and the serum column is one
+study. The variance decomposition is the part that does carry weight, because it
+does not depend on any single cell being correctly calibrated: body site
+accounts for about four times more of the ratio's variance than study identity
+does. The bootstrap intervals overlap, so the honest reading is that the study
+term is small rather than absent -- but whatever the per-deposit offsets are,
+they are not what is organising this data. Three quarters of the variance sits
+within cells, which is where a biological signal would have to live and where
+this design cannot look for it.
+
+### What this does and does not license
+
+The one thing here that stands on its own is the **paired matrix contrast**,
+because the offset is arithmetically absent rather than assumed small. The
+variance decomposition supports it. The cross-study ordering is consistent with
+it. Read together, the ratio gives a **disposition readout**: parent-dominant in
+blood, metabolite-dominant in urine. Part B continues to use within-study
+contrasts, where no offset can enter at all.
+
+Four things this does not license, three of which looked like results until they
+were checked:
+
+- **Pooling absolute ratios across deposits, or ranking deposits by ratio.** The
+  offset was not successfully measured above, only bounded loosely. The original
+  constraint stands.
+- **Dosed probe versus incidental exposure.** Pooled, the two differ strongly
+  (medians 0.52 and 2.31, Wilcoxon p = 3e-11). But the entire "dosed" arm is
+  MSV000082493 and MSV000084008, which is **one study under two accessions**.
+  The comparison is one study against eight, and the apparent significance is a
+  pseudo-replicated single cohort. It is not a finding.
+- **Reverse phase versus HILIC.** Pooled, these also differ strongly (p =
+  2e-11), but HILIC here is almost entirely serum and reverse phase almost
+  entirely plasma, so that test measures matrix, not method. The controlled
+  version, the same subjects on both columns above, is null and points the other
+  way.
+- **The metabolite channel remains isomer-exposed.** Omeprazole sulfone shares
+  the metabolite's formula and precursor mass. The urine result is the ratio's
+  largest effect and sits in the channel most vulnerable to it, so it is
+  reported as disposition consistent with pharmacology, not as a quantified
+  metabolite concentration.
+
+# Every field, both read-outs
+
+The scan above asks whether propagation *enables* a contrast, comparing what MS2
+could test against what MS1 can. This section asks the different question the
+workflow was built for: given everything the corpus records, what does it
+actually show. Every deposit is crossed with every field that divides it, and
+each combination is tested twice — once on presence, once on the ratio.
+
+Two joins have to be right or the whole scan is noise. `metrics_*` carries
+cache-prefixed file names, so the key needs `norm_file_key(x, bio_files)`; the
+bare form leaves the accession on MetaboLights names and the join silently
+returns almost nothing. And `load_metadata()` can describe more files than the
+deposit contributed — MSV000091520 lists 2,732 rows against 2,144 extracted
+files — so the metadata is restricted to the extraction set before anything is
+counted.
+
+```{r scan-build}
+#| echo: false
+BIO <- readRDS("artifacts/bio_files_per_ds.rds")
+SFIELDS <- c("sex", "age", "health_status", "body_site", "country", "treatment")
+
+scan_pf <- function(ds) {
+  r <- readRDS(sprintf("artifacts/per_dataset/%s.rds", ds))
+  m <- merge(as.data.frame(r$metrics_par), as.data.frame(r$metrics_met),
+             by = "file", all = TRUE)
+  pd <- m$par_detected %in% TRUE; md <- m$met_detected %in% TRUE
+  d <- data.frame(k = norm_file_key(m$file, BIO[[ds]]), par = pd, met = md,
+                  l2 = ifelse(pd & md, log2(m$par_auc / m$met_auc), NA_real_))
+  meta <- tryCatch(load_metadata(ds), error = function(e) NULL)
+  if (is.null(meta) || !nrow(meta)) meta <- as.data.frame(r$sample_tbl)
+  meta$k <- norm_file_key(meta$file, BIO[[ds]])
+  meta <- meta[meta$k %in% norm_file_key(BIO[[ds]], BIO[[ds]]), ]
+  meta <- meta[!duplicated(meta$k), ]
+  i <- match(meta$k, d$k)
+  meta$par <- d$par[i] %in% TRUE; meta$met <- d$met[i] %in% TRUE
+  meta$l2 <- d$l2[i]; meta$ds <- ds
+  meta
+}
+scan_all <- bind_rows(lapply(names(BIO), function(x)
+  tryCatch(scan_pf(x), error = function(e) {
+    message("scan_pf failed for ", x, ": ", conditionMessage(e)); NULL })))
+stopifnot(nrow(scan_all) > 0)
+scan_all <- scan_all[!(scan_all$ds == "MSV000082493" &
+                       grepl("plasma|blood", tolower(scan_all$body_site))), ]
+cat(nrow(scan_all), "files |", n_distinct(scan_all$ds), "deposits | detected: parent",
+    sum(scan_all$par), "metabolite", sum(scan_all$met), "both",
+    sum(scan_all$par & scan_all$met), "\n")
+```
+
+## What unit each deposit supports
+
+A contrast needs independent observations, so files have to be collapsed to
+people wherever the deposit records who they came from. Nine of the twelve do.
+What varies is how the identifier behaves, and the differences are not cosmetic:
+it may repeat, because the person was sampled more than once; it may appear
+exactly once, because the study drew one sample per participant; or it may cover
+only part of the deposit. Only the last of those is a real obstacle. A test that
+asked merely whether the identifier repeats would reject six of the nine.
+
+```{r scan-units}
+#| echo: false
+unit_of <- function(x) {
+  sid <- if ("subject_id" %in% names(x)) x$subject_id else rep(NA, nrow(x))
+  sib <- unlist(sibling_id_map[unique(x$ds)], use.names = FALSE)
+  ok <- !is.na(sid) & nzchar(trimws(as.character(sid)))
+  lab <- sum(ok); nsub <- n_distinct(sid[ok]); reps <- if (nsub) lab / nsub else NA
+  if (!lab) list("file", "no subject id recorded")
+  else if (lab < nrow(x))
+    list(if (subject_resolved(sid, sibling_ids = sib)) "subject (partial)" else "file",
+         sprintf("id on %d of %d files, %d subjects", lab, nrow(x), nsub))
+  else if (nsub == nrow(x)) list("subject", sprintf("%d subjects, one sample each", nsub))
+  else list("subject", {
+    # Median and range, not the mean: a mean of "5.1 files each" describes no
+    # subject, and it hid that MSV000084008 runs 9 to 36 files per person.
+    .k <- as.integer(table(sid[ok]))
+    sprintf("%d subjects, %d files each (%d-%d)", nsub,
+            as.integer(stats::median(.k)), min(.k), max(.k))
+  })
+}
+units <- bind_rows(lapply(split(scan_all, scan_all$ds), function(x) {
+  u <- unit_of(x)
+  data.frame(deposit = short_ds(x$ds[1]), files = nrow(x),
+             unit = u[[1]], reason = u[[2]])
+}))
+knitr::kable(units, row.names = FALSE,
+             caption = "The analysis unit each deposit can support, and why")
+```
+
+Three deposits support repeated measures on the same people; four are
+cross-sectional, one sample per participant; two label part of the deposit and
+are corroborated by their sibling; three record nobody. Only that last group is
+analysed at file level, and those results are exploratory in the strict sense —
+the files are not independent observations and a p-value on them overstates the
+evidence. They are still worth computing, because a contrast that fails even at
+file level cannot be rescued by a stricter unit.
+
+## The scan
+
+Presence is tested with Fisher's exact test on categorical fields and logistic
+regression on continuous ones; the ratio with a linear model on the files
+carrying both compounds. Benjamini-Hochberg control is applied within each
+read-out.
+
+```{r scan-run}
+#| echo: false
+set.seed(1)
+scan_rows <- list()
+for (ds in unique(scan_all$ds)) {
+  x0 <- scan_all[scan_all$ds == ds, ]
+  u <- unit_of(x0)
+  x <- if (u[[1]] == "subject")
+    x0 |> group_by(subject_id) |>
+      summarise(par = any(par), met = any(met), l2 = median(l2[is.finite(l2)]),
+                across(any_of(SFIELDS), ~ .x[1]), .groups = "drop") |> as.data.frame()
+    else x0
+  for (f in intersect(SFIELDS, names(x))) {
+    v <- x[[f]]; keep <- !is.na(v) & nzchar(trimws(as.character(v)))
+    if (sum(keep) < 8) next
+    xf <- x[keep, ]; vv <- v[keep]
+    num <- !any(is.na(as_num(vv)))
+    cont <- num && n_distinct(vv) > 12
+    if (!cont) {
+      tb <- table(vv); if (length(tb) < 2 || sum(tb >= 3) < 2) next
+      vv <- factor(vv)
+    } else vv <- as_num(vv)
+    for (rl in c("par", "met", "either")) {
+      y <- if (rl == "either") (xf$par | xf$met) else xf[[rl]]
+      if (n_distinct(y) < 2) next
+      pv <- tryCatch(if (cont)
+          summary(glm(y ~ vv, family = binomial))$coefficients[2, 4]
+        else fisher.test(table(vv, y), simulate.p.value = TRUE, B = 2000)$p.value,
+        error = function(e) NA_real_)
+      scan_rows[[length(scan_rows) + 1]] <- data.frame(
+        deposit = short_ds(ds), unit = u[[1]], field = f, readout = "presence",
+        role = rl, n = nrow(xf), det = sum(y), est = NA_real_, p = pv)
+    }
+    r2 <- xf[is.finite(xf$l2), ]
+    if (nrow(r2) >= 6) {
+      v2 <- if (cont) as_num(r2[[f]]) else factor(r2[[f]])
+      if (cont || n_distinct(v2) >= 2) {
+        co <- tryCatch(summary(lm(r2$l2 ~ v2))$coefficients, error = function(e) NULL)
+        if (!is.null(co) && nrow(co) >= 2)
+          scan_rows[[length(scan_rows) + 1]] <- data.frame(
+            deposit = short_ds(ds), unit = u[[1]], field = f, readout = "ratio",
+            role = "both", n = nrow(r2), det = nrow(r2), est = co[2, 1], p = co[2, 4])
+      }
+    }
+  }
+}
+SC <- bind_rows(scan_rows)
+SC$q <- NA_real_
+for (rd in unique(SC$readout)) {
+  i <- SC$readout == rd & !is.na(SC$p)
+  SC$q[i] <- p.adjust(SC$p[i], "BH")
+}
+knitr::kable(SC |> group_by(field, readout) |>
+               summarise(tests = n(), significant = sum(q < 0.05, na.rm = TRUE),
+                         .groups = "drop"),
+             caption = "Tests run and how many survive FDR, by field and read-out")
+```
+
+```{r scan-significant}
+#| echo: false
+sig <- SC[!is.na(SC$q) & SC$q < 0.05, ]
+knitr::kable(sig[order(sig$q), c("deposit","unit","field","readout","role","n","det","q")],
+             row.names = FALSE, digits = 4,
+             caption = "Every contrast surviving FDR 0.05")
+```
+
+Two things stand out, and both are replications rather than single findings.
+Clinical group separates detection in two unrelated COVID cohorts, MTBLS1866 in
+Italy and MTBLS11656 in China, neither of which knows about the other. Age does
+the same in two unrelated serum cohorts, the Chagas study and ST002044 in India.
+A single deposit showing an effect is a hypothesis; the same effect in a second
+cohort collected by different people for a different reason is the argument this
+workflow exists to make.
+
+The negative is as informative. **No ratio contrast survives FDR anywhere in the
+corpus**, against presence contrasts that do — the quantitative read-out
+validated in `04` does not travel, exactly as the body-site and cross-study
+analyses predict. And sex is null in every deposit that records it.
+
+
+# Part B: The quantitative strand, and its limits
+
+Part A is the field's prevalence analysis, made more sensitive. Part B is the
+piece the field does not have: turning the propagated detections into a
+quantitative, error-controlled cross-cohort analysis, borrowing directly from
+how proteomics handles the identical problem.
+
+## The within-study contrast (the quantitative strand)
+
+Where a cohort supports it, the within-study contrast (defined above: the offset
+cancels in a within-cohort difference) is the quantitative unit that *could* be
+pooled. We compute it per cohort here; the pooling itself is deferred for the
+reasons in the final section.
+
+## Defining the contrast
+
+For each dataset we restrict to samples where both compounds were detected, pick
+the grouping variable the dataset can actually support, collapse it to two
+levels ("case" vs "reference"), and fit a linear model of `log2_ratio` on that
+grouping. The coefficient is the contrast.
+
+```{r within-study-fn}
+fit_within_study <- function(df) {
+
+  df_both <- df %>% filter(detection_tier == "both", is.finite(log2_ratio))
+  if (nrow(df_both) < 6) {
+    return(tibble(contrast = NA_character_, estimate = NA_real_,
+                  se = NA_real_, n = nrow(df_both), note = "n<6"))
+  }
+
+  # Try stratifiers in priority order; first usable one wins. This ordering is
+  # the weak point of the whole section: see the final discussion.
+  candidates <- c("health_status", "group", "sex", "country", "body_site")
+  picked <- NULL
+  for (v in candidates) {
+    if (!v %in% names(df_both)) next
+    counts <- df_both %>% filter(!is.na(.data[[v]])) %>% count(.data[[v]])
+    if (nrow(counts) >= 2 && all(counts$n >= 3)) { picked <- v; break }
+  }
+  if (is.null(picked)) {
+    return(tibble(contrast = NA_character_, estimate = NA_real_,
+                  se = NA_real_, n = nrow(df_both), note = "no_stratifier"))
+  }
+
+  # Collapse to two levels: the smallest group becomes "case", so the estimate
+  # reads as "case minus reference".
+  df_both <- df_both %>%
+    mutate(
+      .v    = .data[[picked]],
+      .case = .v == names(sort(table(.v)))[1],
+      .grp  = factor(ifelse(.case, "case", "ref"), levels = c("ref", "case"))
+    )
+
+  m <- lm(log2_ratio ~ .grp, data = df_both)
+  coefs <- summary(m)$coefficients
+  tibble(
+    contrast = paste0(picked, ": ", names(sort(table(df_both$.v)))[1], " vs rest"),
+    estimate = coefs[".grpcase", "Estimate"],
+    se       = coefs[".grpcase", "Std. Error"],
+    n        = nrow(df_both),
+    note     = NA_character_
+  )
+}
+```
+
+## The effect-size table
+
+```{r per-study-effects}
+effects <- samples %>%
+  group_by(dataset_id) %>%
+  group_modify(~ fit_within_study(.x)) %>%
+  ungroup() %>%
+  left_join(datasets %>% select(dataset_id, repository, chromatography,
+                                const_country, const_body_site),
+            by = "dataset_id") %>%
+  arrange(dataset_id)
+
+effects
+write_csv(effects, "artifacts/meta_effects.csv")
+```
+
+### What each column means
+
+An **effect size** is just a number that says how big a difference is, expressed
+so that it can be compared with the same number from another study. Many fields
+use a standardised effect size (Cohen's d, Hedges' g), which divides the
+difference by its spread so that studies measuring different things on different
+scales can be put side by side. **We deliberately do not standardise here.** Our
+readout is already on a common and directly interpretable scale: `log2_ratio` is
+in doublings, and the response-factor offset cancels in the subtraction. So the
+raw difference in log2 units *is* the effect size, and it means the same thing
+in every dataset. Standardising would divide by a within-dataset spread that
+varies for reasons (cohort heterogeneity, sample size) that have nothing to do
+with the biology, and would make the studies less comparable rather than more.
+
+| column | meaning |
+|---|---|
+| `dataset_id` | the (deposit, assay) entity |
+| `contrast` | which grouping variable was used, and which level was treated as "case". `sex: female vs rest` and `health_status: severe vs rest` are **not the same question**, which matters a great deal below |
+| `estimate` | the contrast itself: mean `log2(par/met)` in the case group minus the reference group. Units are log2, so `+1` means the parent-to-metabolite ratio is twice as high in the case group; `0` means no difference; negative means the case group has relatively more metabolite (faster apparent metabolism) |
+| `se` | standard error of that estimate: how precisely we know it. Small `se` means a tight estimate. A rough 95% interval is `estimate ± 1.96 × se`. Any pooling would weight studies by this |
+| `n` | number of both-tier samples the fit used. With `n` in single digits, `se` is large and the estimate is weak |
+| `note` | why a dataset has no estimate: `n<6` (too few usable samples) or `no_stratifier` (no grouping variable with two levels of at least three samples) |
+| `repository`, `chromatography`, `const_country`, `const_body_site` | dataset-level attributes, available as moderators for a future pooled model |
+
+## Per-study contrast, ordered
+
+```{r exp-effect-bars, fig.width = 7.5, fig.height = 4.5}
+fit_eff <- effects |> filter(!is.na(estimate), !is.na(se))
+
+eff_plot <- fit_eff |>
+  mutate(ci_lo = estimate - 1.96 * se,
+         ci_hi = estimate + 1.96 * se,
+         ds    = fct_reorder(short_ds(dataset_id), estimate))
+
+ggplot(eff_plot, aes(x = estimate, y = ds)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_errorbar(aes(xmin = ci_lo, xmax = ci_hi), orientation = "y",
+                width = 0.25, colour = "grey40") +
+  geom_point(aes(colour = chromatography), size = 3) +
+  geom_text(aes(label = paste0("n=", n)), hjust = -0.25, size = 3, colour = "grey30") +
+  labs(x = "contrast: case minus reference, log2(parent / metabolite)",
+       y = NULL, colour = "chrom.",
+       title = "Per-study contrast with 95% confidence interval") +
+  theme_bw()
+```
+
+Here the intervals are wide, most of them cross zero, and, critically, the
+contrasts on the y-axis are **not all asking the same question**. Read this as a
+description of what each dataset happens to offer, not as a set of comparable
+results.
+
+## Does the ratio itself track sex, health or age across the corpus?
+
+Part A pooled *presence*, which is a rate and needs no common scale. The obvious
+next question is whether the *ratio* moves with the covariates the corpus
+records most often, pooled across all cohorts rather than one cohort at a time.
+This is the analysis the offset argument above predicts will fail, so it is
+worth running rather than asserting.
+
+Two models are fitted for each covariate. The first pools every subject and
+ignores which study they came from, which is what a naive corpus analysis would
+do. The second adds a study term, which absorbs the per-cohort offset and leaves
+only the within-cohort information — the same logic as the within-study
+contrast, but pooled. If a covariate effect is real it should survive the study
+term; if it is the offset in disguise, it will not.
+
+```{r ratio-covariate-recover}
+# Chagas records subject, sex, age and infection status in its file names and
+# only partly in the catalogue. The recovery is validated rather than assumed:
+# where the catalogue does carry a subject id the parsed one agrees 158/158, sex
+# differs only in encoding and age by at most a year. It is local to this
+# section, so Chagas unit counts differ from Part A.
+rq <- pm[pm$detection_tier %in% "both" & is.finite(pm$log2_ratio), ]
+ch_pat <- "^(pos|neg)_(inf|uninf|non)[_a-z]*_([0-9]+)(_[0-9]+)?_(female|male)_([0-9]+)_.*$"
+ch <- rq$study == "Chagas serum" & grepl(ch_pat, rq$fk)
+rq$subj[ch] <- sub(ch_pat, "\\3", rq$fk[ch])
+rq$sex2[ch] <- sub(ch_pat, "\\5", rq$fk[ch])
+rq$agen[ch] <- as_num(sub(ch_pat, "\\6", rq$fk[ch]))
+rq$clin[ch] <- ifelse(sub(ch_pat, "\\2", rq$fk[ch]) == "uninf",
+                      "uninfected", "T. cruzi infected")
+rq <- rq[!(rq$study == "Chagas serum" & grepl("_qc_", rq$fk)), ]
+
+rq$health <- harmonise_health(rq$clin)
+
+# The unit rule again: one ratio per subject per matrix, median over that
+# subject's files. A cohort sampling 16 files per person must not outvote a
+# cohort sampling one.
+ru <- rq |>
+  dplyr::mutate(unit = ifelse(is.na(subj), paste0("file:", fk),
+                              paste(study, subj, site))) |>
+  dplyr::group_by(unit) |>
+  dplyr::summarise(study = dplyr::first(study), site = dplyr::first(site),
+                   l2 = median(log2_ratio), sex2 = dplyr::first(sex2),
+                   health = dplyr::first(health), agen = dplyr::first(agen),
+                   .groups = "drop")
+```
+
+```{r ratio-covariate-audit}
+# The health mapping is printed rather than trusted: every clinical label in the
+# corpus, and which side of the binary it was put on.
+rq |> dplyr::filter(!is.na(clin)) |>
+  dplyr::count(study, clin, health, name = "files") |>
+  dplyr::arrange(study)
+```
+
+```{r ratio-covariate-scan}
+# Restricted to blood, because matrix moves the ratio by more than any covariate
+# tested here (plasma vs urine is about -2.6 log2) and would otherwise dominate.
+blood <- ru[ru$site %in% c("plasma", "serum"), ]
+
+scan_cov <- function(dat, v, label) {
+  z <- dat[!is.na(dat[[v]]), ]
+  if (nrow(z) < 8) return(NULL)
+  naive <- summary(lm(as.formula(paste("l2 ~", v)), data = z))$coefficients
+  adj   <- summary(lm(as.formula(paste("l2 ~ study +", v)), data = z))$coefficients
+  ra <- grep(paste0("^", v), rownames(adj))[1]
+  tibble(covariate = label, units = nrow(z), studies = dplyr::n_distinct(z$study),
+         est_naive = round(naive[2, 1], 2), p_naive = signif(naive[2, 4], 2),
+         est_adj   = round(adj[ra, 1], 2),  p_adj   = signif(adj[ra, 4], 2),
+         p_study   = signif(anova(lm(as.formula(paste("l2 ~ study +", v)),
+                                     data = z))["study", "Pr(>F)"], 2))
+}
+
+ratio_cov <- dplyr::bind_rows(
+  scan_cov(blood, "sex2",   "sex (male vs female)"),
+  scan_cov(blood, "health", "not healthy vs healthy"),
+  scan_cov(blood, "agen",   "age (per year)"))
+ratio_cov
+write_csv(ratio_cov, "artifacts/ratio_covariates.csv")
+```
+
+```{r ratio-covariate-confound}
+# How much of "healthy vs not" is really "one deposit vs another"? If each
+# health arm sits almost entirely in its own study, the contrast and the offset
+# are the same number. The within-cohort version is the check: only a study
+# containing BOTH arms can separate them.
+hb <- blood[!is.na(blood$health), ]
+health_by_study <- hb |> dplyr::count(study, health) |>
+  tidyr::pivot_wider(names_from = health, values_from = n, values_fill = 0)
+health_by_study
+
+both_arms <- health_by_study$study[
+  health_by_study$healthy >= 3 & health_by_study$`not healthy` >= 3]
+within_health <- lapply(both_arms, function(s) {
+  z <- hb[hb$study == s, ]
+  # same direction as the model coefficient: not healthy minus healthy
+  tibble(study = s, units = nrow(z),
+         est = round(unname(diff(tapply(z$l2, z$health, median))), 2),
+         p   = signif(wilcox.test(l2 ~ health, data = z)$p.value, 2))
+}) |> dplyr::bind_rows()
+within_health
+```
+
+Nothing survives the study term. Sex moves the ratio by
+`r sprintf("%+.2f", ratio_cov$est_naive[1])` log2 pooled ($p =
+`r ratio_cov$p_naive[1]`$) and by `r sprintf("%+.2f", ratio_cov$est_adj[1])`
+once study is accounted for ($p = `r ratio_cov$p_adj[1]`$). Age is flat either
+way ($p = `r ratio_cov$p_naive[3]`$ and $p = `r ratio_cov$p_adj[3]`$).
+
+Health status is the one covariate that looks significant, and it is the most
+instructive result in this section. Pooled across the corpus and ignoring which
+deposit each subject came from, unhealthy subjects sit
+`r sprintf("%+.2f", ratio_cov$est_naive[2])` log2 below the healthy ones at $p =
+`r ratio_cov$p_naive[2]`$ — a result that, reported on its own, would read as a
+real corpus-level finding. Adding the study term leaves the estimate essentially
+unchanged at `r sprintf("%+.2f", ratio_cov$est_adj[2])` but takes the $p$ value
+to `r ratio_cov$p_adj[2]`, while the study term itself is significant at $p =
+`r ratio_cov$p_study[2]`$.
+
+An estimate that survives adjustment while its $p$ value does not is the
+signature of confounding rather than of a real effect losing power. Health status
+in this corpus is almost entirely a between-study variable, as the table above
+shows: each arm sits largely in its own deposit, so comparing healthy against
+unhealthy mostly compares one deposit against another, and the offset is exactly
+what that comparison picks up. Only a cohort holding both arms can separate the
+two, and
+`r if (!nrow(within_health)) "no cohort in the corpus holds both" else paste0(if (nrow(within_health) == 1) "the single cohort that does gives " else paste0("the ", nrow(within_health), " that do give "), sprintf("%+.2f", within_health$est[1]), " log2 at $p = ", within_health$p[1], "$ on ", within_health$units[1], " subjects")`.
+The direction agrees with the pooled estimate but the significance does not
+survive, which is the whole point: the corpus-wide result is not evidence that
+illness changes the
+hydroxylation ratio; it is evidence that the deposits differ from each other,
+which is what the offset argument said all along.
+
+The result is negative but not final. It rests on `r nrow(blood)` blood subjects
+across `r dplyr::n_distinct(blood$study)` studies, because a ratio needs both
+compounds in the same file. Two things would enlarge it: deeper metadata, since
+the Chagas recovery above shows deposits were set aside on what the catalogues
+indexed rather than on what the submitters actually recorded; and deposits that
+contain both arms of a contrast, since a clinical stratum that is also a deposit
+cannot be separated from that deposit's offset by any amount of pooling.
+
+# Chagas HILIC vs RP: one direct check
+
+MSV000092754 (HILIC) and MSV000092757 (reverse phase) are paired deposits from
+the same Chagas serum study: the same subjects and blood draws, run on two
+chromatographies, matched by `codigo_num`. It is the only place in the corpus
+where we can watch the same biology measured two ways, which makes it the one
+direct check on the offset argument above.
+
+```{r chagas-pair}
+#| echo: false
+HILIC_DS <- "MSV000092754"
+RP_DS    <- "MSV000092757"
+
+per_subject_ratio <- function(ds) {
+  samples %>%
+    filter(dataset_id == ds, detection_tier == "both",
+           !par_fwhm_outlier %in% TRUE, !met_fwhm_outlier %in% TRUE,
+           is.finite(log2_ratio)) %>%
+    group_by(subject_id) %>%
+    summarise(log2_ratio    = median(log2_ratio, na.rm = TRUE),
+              health_status = dplyr::first(health_status),
+              .groups       = "drop")
+}
+
+chagas <- dplyr::inner_join(
+  per_subject_ratio(HILIC_DS) %>% dplyr::rename(log2_ratio_HILIC = log2_ratio),
+  per_subject_ratio(RP_DS)    %>% dplyr::select(subject_id, log2_ratio_RP = log2_ratio),
+  by = "subject_id")
+
+cat("Subjects matched across both chromatographies:", nrow(chagas), "\n")
+```
+
+```{r chagas-paired, fig.width = 6, fig.height = 4.5}
+if (nrow(chagas) >= 3) {
+  chagas |>
+    pivot_longer(c(log2_ratio_HILIC, log2_ratio_RP),
+                 names_to = "chromatography", values_to = "log2_ratio") |>
+    mutate(chromatography = sub("log2_ratio_", "", chromatography)) |>
+    ggplot(aes(x = chromatography, y = log2_ratio,
+               group = subject_id, colour = health_status)) +
+    geom_line(alpha = 0.5) +
+    geom_point(size = 2.5) +
+    labs(x = NULL, y = "log2(parent / metabolite)", colour = "health status",
+         title = "Per-subject log2 ratio on HILIC and reverse phase, MSV000092754 / MSV000092757") +
+    theme_bw()
+}
+```
+
+**What this can and cannot tell us.** Only a handful of subjects survive the
+requirement of a usable ratio in *both* chromatographies, so this is a look, not
+a test. Correlation coefficients, Bland-Altman limits of agreement and
+heteroscedasticity slopes on this many points would report precision we do not
+have, so we do not compute them.
+
+What the picture is good for is direction. If the lines were roughly parallel,
+each subject shifting by a similar amount between the two methods, that is the
+constant-additive-offset behaviour the previous section assumes, and it would
+support the claim that the offset cancels in a within-study contrast. If instead
+the lines cross each other freely, the readout depends on the chromatography in
+a way a single constant cannot absorb, and every cross-method claim in the
+project needs a louder caveat. Judge it by eye, and treat it as one encouraging
+or discouraging data point rather than as a validation.
+
+# What a meta-analysis could add, and what it needs first
+
+The obvious next step is to pool the per-study contrasts into a single
+cross-cohort estimate: a random-effects meta-analysis, weighting each dataset by
+its precision, reporting a pooled contrast with a confidence interval plus τ²
+and I² to quantify how much the cohorts genuinely disagree. That is the standard
+tool and it is the right shape for this data. **We are not running it yet, on
+purpose.**
+
+**Why not.** A meta-analysis pools estimates that answer the same question. Look
+again at the `contrast` column: because `fit_within_study()` walks a priority
+list and takes the first usable grouping, most datasets end up contributing a
+**sex** contrast, simply because sex is the one variable that is populated
+nearly everywhere. Pooling "severe versus healthy" from one study together with
+"male versus female" from another does not estimate anything. Run anyway it
+returns a tidy-looking pooled value with a narrow interval and I² near zero,
+which is worse than no answer because it looks like a result. The blocker is not
+the statistics; it is that the corpus does not supply a shared, biologically
+meaningful contrast across enough datasets.
+
+**What would make it work**, roughly in order of value:
+
+- **Pick one question and only include datasets that can answer it.** For
+  example health status or disease severity, dropping every dataset without it.
+  Fewer studies, but a pooled number that means something.
+- **Handle the censored samples.** `parent_only` and `metab_only` are ratio
+  observations with one bound known. An interval-censored (Tobit-style) model
+  uses them as bounds instead of discarding them, which matters because they are
+  exactly the most extreme ratios, and dropping them shrinks any effect toward
+  zero.
+- **Decide how to treat the method.** Chromatography, instrument and biofluid
+  all reset the offset. With a real pooled model these become moderators or
+  subgroups. Note the corpus currently has at least two deposits whose recorded
+  chromatography is doubtful given their retention times, so this needs the
+  metadata fixed before it can be trusted.
+- **Consider the one-stage alternative.** Rather than fitting each study then
+  pooling, a hierarchical (mixed-effects) model on the sample-level data with a
+  random effect per dataset uses the individual samples directly, which is
+  generally better behaved when per-study `n` is small, as it is here.
+- **Pool a robust quantity, never raw abundance.** This is settled practice, and
+  it converges across fields. Cross-repository proteomics meta-analyses of
+  independent public deposits (e.g. the 12-dataset colorectal-cancer study,
+  PMC10833860) uniformly re-process the raw files and then pool a
+  distribution-free quantity: rank-binned abundances there, Stouffer/Fisher
+  p-value combination in MetaMSD, within-study log fold-changes in the
+  metabolomics tool MetaHD. If we ever pool a ratio across cohorts, it must be
+  rank-transformed or reduced to a per-cohort statistic first, for the same
+  response-factor reason that forbids pooling the raw ratio. That these
+  cross-repository quantitative meta-analyses exist and work is also the point:
+  our contribution is not the pooling, which is standard, but using MS1
+  propagation to *produce* the per-cohort quantity that the reverse-metabolomics
+  / MASST world does not generate.
+- **Do not treat every accession as an independent cohort.** `01` records the
+  known exceptions in `artifacts/related_deposits.csv`. Today it contains one:
+  **MSV000084008 is a re-deposit of MSV000082493's blood arm**, and both come
+  from the same 14 subjects (PMC7485946). They contribute different biofluids
+  here, so both are kept, but pooling them as two studies would count those
+  subjects twice and hand the pair a double vote in any precision-weighted
+  estimate. A deposit accession is not a study, and any pooling has to be keyed
+  on the study.
+- **Be honest about country.** Each country is represented by a single dataset,
+  so country and dataset are perfectly confounded. Any "country effect" is that
+  one deposit's method. At best this is a calibration check against published
+  CYP2C19 frequencies, never an estimate.
+
+The prerequisite for all of it is a decision about which question the pool is
+supposed to answer. That is a discussion to have as a group, not something to
+settle by picking whichever variable happens to be populated.
+
+# Appendix: one study, two accessions (MSV000082493 and MSV000084008)
+
+```{r appendix-overlap}
+#| echo: false
+N_SHARED_APPX <- length(intersect(
+  norm_file_key(samples_perfile$file[samples_perfile$dataset_id == "MSV000082493"]),
+  norm_file_key(samples_perfile$file[samples_perfile$dataset_id == "MSV000084008"])))
+```
+
+These two deposits are **not independent cohorts**. They are the same study,
+submitted twice:
+
+- The same **14 subjects**, and on every file present in both, `subject_id`
+  agrees: `r N_SHARED_APPX` of `r N_SHARED_APPX`.
+- **`r N_SHARED_APPX` files are shared between them** - all `blood_plasma`.
+  Where both yield a parent detection, the AUC correlation is **1.000** and the
+  median relative difference is **0**; the largest single difference is 11%, so
+  most are the same raw file and a few differ slightly (most likely
+  re-conversion, not different samples). Both deposits are RP.
+- 082493 additionally holds the multi-matrix collection (390 skin, 148 fecal,
+  139 urine, 8 plasma); 084008 holds 106 plasma files 082493 does not. Neither
+  is a subset of the other, so distinct plasma across both is 447.
+
+Nothing in the repository metadata signals this. Different accessions, separate
+submissions, no cross-reference. It surfaced only from a duplicate-file audit.
+
+**This inflates any public-data meta-analysis, and it hits an MS2-only analysis
+harder than ours**, because the duplicated files are exactly the plasma where
+MASST found the parent:
+
+| counted over | summed | distinct | inflation |
+|---|---|---|---|
+| parent MS2 hit files | 389 | 233 | **+67%** |
+| 5-OH MS2 hit files | 494 | 342 | **+44%** |
+| all MS2 hit files, corpus | 668 | 472 | **+42%** |
+
+So a classic reverse-metabolomics presence analysis reporting "N public files
+contain the drug" would over-report by roughly half on this pair alone. That is
+a property of the data ecosystem, not of any particular method, and it is not
+routinely checked.
+
+## A shared file name does not always mean a duplicate
+
+The opposite case exists in this same corpus and is just as dangerous.
+**MSV000092754 and MSV000092757 share all 164 file names** (`pos_QC_1.mzXML` and
+so on) and the same 79 subjects, but 092754 is HILIC and 092757 is RP: the same
+samples on two columns, submitted as separate accessions. Their extracted values
+differ by up to **117x**. De-duplicating those by file name would merge a HILIC
+run into an RP run and delete 164 real files.
+
+So file name identity means two opposite things here, and only the analytical
+context distinguishes them:
+
+| pair | file names | chromatography | verdict |
+|---|---|---|---|
+| 082493 / 084008 | 333 shared | RP / RP | same files - **collapse** |
+| 092754 / 092757 | 164 shared | HILIC / RP | different runs - **keep apart** |
+
+**What we therefore do**, and it must be stated wherever these numbers appear:
+
+1. **Identify the duplicate pair from subject identity**, not file names: the
+   same 14 subjects, with subject, timepoint, study day and body site agreeing
+   on 461 of 461 shared files. File names cannot make this call - here they
+   indicate a duplicate, in 092754/092757 they indicate a collision.
+2. **Collapse that pair, and only that pair, on file name** (`DUP_STUDY` below).
+   Every other dataset stays namespaced by its own accession.
+3. **Treat 082493 + 084008 as one study.** Per-cohort tables keep both
+   accessions for provenance, but they must never be read as two independent
+   replications - and a result "confirmed" in both is confirmed once.
+4. **Re-run the collision audit when datasets are added.** Compare extracted
+   AUCs for every shared key across every dataset pair: agreement means one
+   file deposited twice, disagreement means two files that happen to share a
+   name. Nothing else separates the two cases reliably.
+
+One thing this does **not** address, and which is worth stating rather than
+hiding: each deposit also contains **technical replicates** - 237 rows in each
+of 082493 and 084008 repeat a `(subject, timepoint, day, body_site)`
+combination. Those are multiple injections of one specimen, and they are counted
+individually in every file-level number here, including the gain. A
+specimen-level count would be more defensible, but it needs an identifier for
+the specimen rather than for the person, and no deposit records one: the three
+that repeat a subject do not distinguish a re-injection from a second draw, and
+the rest have one file per person, so it cannot be done corpus-wide.
+
+Subject-level analyses were never affected: the project already takes one
+measure per subject, and the subject IDs agree across the two accessions.
+
+```{r dedup-corpus}
+#| echo: false
+fk_all <- fkey(samples_perfile$file)
+dk_all <- paste0(samples_perfile$dataset_id, "|", fk_all)
+cat("files summed across datasets :", length(dk_all), "\n")
+cat("distinct physical files      :", length(unique(fk_all)), "\n")
+cat("counted more than once       :", length(dk_all) - length(unique(fk_all)), "\n")
+```
+
+
+# References
+
+- Viechtbauer, W. (2010). Conducting Meta-Analyses in R with the metafor
+  package. *Journal of Statistical Software*, 36(3).
+- Blanz, J. et al. (2017). Evaluation of relative MS response factors of drug
+  metabolites for semi-quantitative assessment of chemical liabilities. *Journal
+  of Mass Spectrometry*, 52(4).
+- Viallon, V. et al. (2021). A new pipeline for the normalization and pooling of
+  metabolomics data. *Metabolites*, 11(9).
+- Belasimo, A. et al. (2024). MetaHD: a multivariate meta-analysis model for
+  metabolomics data. *Bioinformatics*, 40(7).
+- Petrović, J. et al. (2020). Meta-analysis of probability estimates of
+  worldwide variation of CYP2D6 and CYP2C19. *Translational Psychiatry*, 10.
+- Tornio, A., Backman, J. T. (2018). Cytochrome P450 in pharmacogenetics: an
+  update. *British Journal of Clinical Pharmacology*, 122 (Suppl. 5).
+- Abouir, K. et al. (2024). Improving CYP2C19 phenotyping using stereoselective
+  omeprazole and 5-hydroxy-omeprazole metabolic ratios. *Basic & Clinical
+  Pharmacology & Toxicology*.

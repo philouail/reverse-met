@@ -13,7 +13,12 @@ required <- list(
   MsBackendMetaboLights        = list(version = "1.7.4",  type = "min",
                                       install = 'remotes::install_github("RforMassSpectrometry/MsBackendMetaboLights@gabri")'),
   MsBackendMetabolomicsWorkbench = list(version = "0.1.3", type = "min",
-                                      install = 'BiocManager::install("MsBackendMetabolomicsWorkbench")')
+                                      install = 'BiocManager::install("MsBackendMetabolomicsWorkbench")'),
+  # The MS1 extraction runs on Chromatograms, and the per-stage timings reported in
+  # docs/pipeline-timing.md and the deck are version-dependent, so an unnoticed old
+  # build silently invalidates them (1.3.2 was still installed while 1.3.3 was assumed).
+  Chromatograms                = list(version = "1.3.3",  type = "min",
+                                      install = 'BiocManager::install("Chromatograms", update = FALSE, ask = FALSE)')
 )
 
 for (pkg in names(required)) {

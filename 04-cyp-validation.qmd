@@ -1,0 +1,1242 @@
+---
+title: "04: CYP2C19 ground-truth validation"
+subtitle: "Does the mined omeprazole / 5-OH ratio track genotyped CYP2C19 status?"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+MSV000082493 and MSV000084008 (Jarmusch et al., *Clin Transl Sci* 2020,
+PMC7485946) dosed healthy volunteers with omeprazole as a CYP2C19 probe and
+carry the **genotyped** CYP2C19 metaboliser phenotype per subject in
+`artifacts/rescue_samples.csv`. The authors reported the identical OME /
+5-OH-OME ratio but never tested it against that genotype, so this is a new use
+of the data, and a ground-truth check that the whole cascade (MASST → SIRIUS →
+MS1 EIC → ratio) measures real pharmacology.
+
+Expected: low CYP2C19 activity (Poor) → less 5-OH → **high** log2(parent/metab);
+Ultrarapid → low. Run after `03` has cached the two datasets.
+
+Joins between the metrics and the submitter table go through `norm_file_key()`,
+never a bare basename: the metrics carry cache-prefixed names while the TSV
+carries bare ones, and that mismatch has silently produced empty joins several
+times in this project.
+
+```{r setup}
+suppressPackageStartupMessages({ library(dplyr); library(tidyr); library(ggplot2) })
+source("R/metadata.R")
+source("R/masst.R")   # compound_spec + PHENO, the domain constants
+source("R/ms1.R")     # resolve_isobars(), so this notebook gates as the corpus does
+
+# shared by every figure below: class order and class colours
+PH_SHORT <- c("Poor", "Inter.", "Normal", "Rapid", "Ultra")
+pal <- c("Poor Metabolizer" = "#B2182B", "Intermediate Metabolizer" = "#EF8A62",
+         "Normal Metabolizer" = "#D9D9D9", "Rapid Metabolizer" = "#67A9CF",
+         "Ultrarapid Metabolizer" = "#2166AC")
+```
+
+# Per-file table + genotype join
+
+`sample_table_all.csv` is deduped to one file per subject, which collapses the
+timepoint × specimen structure this readout needs. We rebuild a per-file table
+from the cached per-dataset metrics (before dedup), replicating
+`build_sample_table()`'s detection rule (shape pass AND robust-SNR ≥ 3), and
+join the genotype by filename stem (metrics carry `.mzXML`/prefixed cache names,
+the genotype table `.mzXML`, identical stems).
+
+```{r dup-overlap}
+#| echo: false
+# Counted rather than written into the paragraph below: an earlier hand-written
+# pair (222 and 513) survived a rebuild that changed both.
+.d <- read.csv("artifacts/sample_table_perfile.csv", check.names = FALSE)
+.k93 <- norm_file_key(.d$file[.d$dataset_id == "MSV000082493"])
+.k08 <- norm_file_key(.d$file[.d$dataset_id == "MSV000084008"])
+N_SHARED <- length(intersect(.k93, .k08)); N_84008 <- length(.k08)
+```
+
+The two accessions are one study: MSV000082493 re-deposits `r N_SHARED` of
+MSV000084008's `r N_84008` plasma files, so a per-file table built from both
+carries each of those twice and the join propagates the duplicate. Every rate
+would then be computed on a set biased toward the re-deposited files. Plasma is
+therefore attributed to MSV000084008 alone; those files carry no metadata under
+the other accession in any case. The count the join below reports as dropped is
+smaller than `r N_SHARED`, because it counts only the rows that survived the
+genotype join rather than every shared file.
+
+```{r per-file-join}
+cyp_ds <- c("MSV000082493", "MSV000084008")
+rs <- read.csv("artifacts/rescue_samples.csv", check.names = FALSE, stringsAsFactors = FALSE)
+cf_all <- read.csv("artifacts/hits-confirmed-all.csv", stringsAsFactors = FALSE)
+
+# CYP2C19 activity order (low -> high); the ratio should DECREASE along it
+# PHENO (CYP2C19 activity order) comes from R/masst.R.
+rs$pheno_rank <- match(rs$cyp2c19_phenotype, PHENO)
+
+bare <- function(x)  # strip MSV000XXXXXX_ cache prefix + extension, lowercase
+  sub("^msv[0-9]{9}_", "", tolower(tools::file_path_sans_ext(basename(x))))
+rs$stem <- bare(rs$file)
+
+per_file_tier <- function(d) {
+  r <- readRDS(sprintf("artifacts/per_dataset/%s.rds", d))
+  # Same isobar rejection the corpus tables use. Without it this notebook counts
+  # peaks at the other compound's retention time as detections: 86 of the 90
+  # urine "omeprazole" peaks are the isobaric hydroxyomeprazole sulfide.
+  .g <- resolve_isobars(r$metrics_par, r$metrics_met, cf_all, d, r$rt_anchor)
+  m <- merge(.g$par, .g$met, by = "file", all = TRUE)
+  # Detection is decided in the picker (accept_peak + drop-list); metrics_*
+  # carry it as a flag.
+  par_det <- m$par_detected %in% TRUE
+  met_det <- m$met_detected %in% TRUE
+  m$detection_tier <- ifelse( par_det &  met_det, "both",
+                       ifelse( par_det & !met_det, "parent_only",
+                       ifelse(!par_det &  met_det, "metab_only", "neither")))
+  m$log2_ratio <- ifelse(m$detection_tier == "both",
+                         log2(m$par_auc / m$met_auc), NA_real_)
+  m$dataset_id <- d
+  m$stem <- bare(m$file)
+  m
+}
+pf <- bind_rows(lapply(cyp_ds, per_file_tier))
+
+j <- pf |>
+  inner_join(rs[, c("stem", "deposit_id", "cyp2c19_phenotype", "cyp2c19_genotype",
+                    "pheno_rank", "subject_id", "timepoint", "timepoint_mins",
+                    "specimen", "pharmkinetics_cyp2c19")],
+             by = "stem")
+
+.dup <- j$dataset_id == "MSV000082493" & grepl("plasma", tolower(j$specimen))
+if (any(.dup)) {
+  cat("dropped", sum(.dup), "re-deposited plasma rows from MSV000082493\n")
+  j <- j[!.dup, ]
+}
+stopifnot(!any(duplicated(j$stem)))
+both <- j |> filter(detection_tier == "both", is.finite(log2_ratio),
+                    !par_fwhm_outlier %in% TRUE, !met_fwhm_outlier %in% TRUE)
+cat("joined files:", nrow(j), " | with both compounds + clean ratio:", nrow(both), "\n")
+table(j$dataset_id, j$detection_tier)
+```
+
+# Ratio vs genotyped phenotype
+
+Per cohort: median ratio by phenotype, file-level Spearman/Kruskal-Wallis, and
+the valid **subject-level** Spearman (one ratio per subject, no
+pseudoreplication).
+
+```{r phenotype-tests}
+test_cohort <- function(d, label) {
+  x <- both |> filter(if (is.null(d)) TRUE else deposit_id == d, !is.na(pheno_rank))
+  if (nrow(x) < 8 || dplyr::n_distinct(x$cyp2c19_phenotype) < 3) {
+    cat("\n[", label, "] too few points (n=", nrow(x), ")\n"); return(invisible())
+  }
+  cat("\n----------", label, " (n =", nrow(x), "files) ----------\n")
+  ph <- x |> group_by(cyp2c19_phenotype) |>
+    summarise(n = n(), med = round(median(log2_ratio), 2), .groups = "drop") |>
+    arrange(match(cyp2c19_phenotype, PHENO))
+  print(as.data.frame(ph))
+  # SUBJECT level only: a file is not an independent observation, so a per-file
+  # Spearman here would measure how often each volunteer was injected rather
+  # than their genotype. The per-file medians printed above are description, not
+  # a test.
+  subj <- x |> group_by(subject_id, cyp2c19_phenotype, pheno_rank) |>
+    summarise(ratio = median(log2_ratio), .groups = "drop")
+  if (nrow(subj) >= 8 && dplyr::n_distinct(subj$cyp2c19_phenotype) >= 3) {
+    sp2 <- cor.test(subj$ratio, subj$pheno_rank, method = "spearman", exact = FALSE)
+    kw2 <- kruskal.test(ratio ~ factor(cyp2c19_phenotype), subj)
+    cat(sprintf("subject level (n = %d): Spearman rho = %.3f  p = %.3g  (expect NEGATIVE)\n",
+                nrow(subj), sp2$estimate, sp2$p.value))
+    cat(sprintf("Kruskal-Wallis across phenotypes p = %.3g\n", kw2$p.value))
+  } else cat("too few subjects for a subject-level test\n")
+  invisible(x)
+}
+x84 <- test_cohort("MSV000084008", "084008 PLASMA (classic CYP readout)")
+x82 <- test_cohort("MSV000082493", "082493 urine/feces/skin")
+invisible(test_cohort(NULL, "POOLED CYP cohorts"))
+```
+
+# Per-subject AUC metabolic ratio (the clinical readout)
+
+Everything above uses **one ratio per subject** taken from single files. That is
+not how CYP2C19 phenotyping is done clinically: the accepted metric is the
+**ratio of areas under the concentration-time curves** over the dosing interval,
+AUC(omeprazole) / AUC(5-OH-omeprazole). Integrating removes the dependence on
+*when* the sample happened to be drawn, which in a single-timepoint ratio is
+pure noise: one subject sampled near their peak and another past it differ for
+reasons that have nothing to do with genotype.
+
+MSV000084008 supports this directly: 461 plasma files, 14 subjects, 8-9
+timepoints per subject on each of two study days. The timepoint comes from the
+submitter's `ATTRIBUTE_Time_Point_Mins` (recovered by the metadata union in
+`01`; Pan-ReDU does not carry it).
+
+Two conventions worth stating because they change the answer:
+
+- **Days are integrated separately.** Day 1 and day 9 straddle the antibiotic
+  exposure, so they are different physiological states and pooling them would
+  blur the contrast the study was designed around.
+- **A non-detected timepoint contributes 0** to the AUC, the standard
+  pharmacokinetic below-limit-of-detection convention. "Non-detected" means the
+  timepoint fails the picker's detection gate (`detection_tier`), not merely
+  that no peak was integrated: a timepoint where only noise was picked is set to
+  0, not allowed to contribute its raw integrated area. Dropping those points
+  instead would bias the AUC upward exactly for the poor metabolisers whose
+  metabolite is genuinely absent.
+
+The direction is predicted before looking: poor metabolisers clear omeprazole
+slowly, so a lower activity rank should give a higher parent/metabolite ratio,
+i.e. Spearman rho < 0.
+
+```{r auc-ratio}
+auc_tsv <- "dataset_metadata/MSV000084008_metadata.tsv"
+if (!file.exists(auc_tsv)) {
+  cat("submitter TSV not present - AUC section skipped\n")
+} else {
+  r_auc <- readRDS("artifacts/per_dataset/MSV000084008.rds")
+  # same isobar rejection the corpus tables use, so this section cannot integrate
+  # a peak at the other compound's retention time
+  .cf0 <- read.csv("artifacts/hits-confirmed-all.csv", stringsAsFactors = FALSE)
+  .mr  <- resolve_isobars(r_auc$metrics_par, r_auc$metrics_met, .cf0,
+                          "MSV000084008", r_auc$rt_anchor)
+  mp <- as.data.frame(.mr$par); mm <- as.data.frame(.mr$met)
+  ta <- read.delim(auc_tsv, check.names = FALSE, stringsAsFactors = FALSE)
+  # normalised key, never a bare basename: the metrics carry cache-prefixed
+  # names
+  ta$k <- norm_file_key(ta$filename)
+  mp$k <- norm_file_key(mp$file); mm$k <- norm_file_key(mm$file)
+  # Gate to detection: a timepoint that fails the picker's detection gate is
+  # below-LOD (NA here -> 0 in trap()), not its raw integrated noise-area.
+  # Detected points keep their AUC.
+  mp_i <- match(ta$k, mp$k); mm_i <- match(ta$k, mm$k)
+  ta$par_auc <- ifelse(mp$par_detected[mp_i] %in% TRUE, mp$par_auc[mp_i], NA_real_)
+  ta$met_auc <- ifelse(mm$met_detected[mm_i] %in% TRUE, mm$met_auc[mm_i], NA_real_)
+  # apex retention times, kept for the isomer restrictions below
+  ta$par_rt <- mp$par_apex_rt[mp_i]; ta$met_rt <- mm$met_apex_rt[mm_i]
+  ta$tmin <- as.numeric(ta$ATTRIBUTE_Time_Point_Mins)
+  ta <- ta[ta$MS_SampleType == "sample" & !is.na(ta$tmin), ]
+
+  trap <- function(x, y) {              # trapezoidal AUC; NA -> 0 (below LOD)
+    o <- order(x); x <- x[o]; y <- y[o]; y[is.na(y)] <- 0
+    if (length(unique(x)) < 4) return(NA_real_)
+    sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+  }
+  auc <- do.call(rbind, lapply(
+    split(ta, list(ta$ATTRIBUTE_Subject, ta$ATTRIBUTE_Study_Day), drop = TRUE),
+    function(d) data.frame(
+      subject = d$ATTRIBUTE_Subject[1], day = d$ATTRIBUTE_Study_Day[1],
+      n_tp = length(unique(d$tmin)),
+      auc_par = trap(d$tmin, d$par_auc), auc_met = trap(d$tmin, d$met_auc),
+      phenotype = d$PharmGeno_Phenotype_2C19[1], stringsAsFactors = FALSE)))
+  auc$log2_ratio <- log2(auc$auc_par / auc$auc_met)
+  auc <- auc[is.finite(auc$log2_ratio), ]
+  auc$rank <- match(auc$phenotype, PHENO)
+
+  cat("timepoints per subject-day: median", median(auc$n_tp),
+      "range", min(auc$n_tp), "-", max(auc$n_tp), "\n\n")
+  print(auc[order(auc$rank, auc$subject),
+            c("subject","day","n_tp","log2_ratio","phenotype")],
+        row.names = FALSE, digits = 3)
+
+  cat("\nmean log2(AUC parent / AUC metabolite) by phenotype:\n")
+  subj <- aggregate(log2_ratio ~ subject + phenotype + rank, data = auc, FUN = mean)
+  print(tapply(subj$log2_ratio, factor(subj$phenotype, levels = PHENO), mean))
+
+  cat("\n")
+  for (dd in sort(unique(auc$day))) {
+    s <- auc[auc$day == dd, ]
+    ct <- cor.test(s$rank, s$log2_ratio, method = "spearman", exact = FALSE)
+    cat(sprintf("day %-3s n=%2d | Spearman rho = %+.3f  p = %.4f\n",
+                dd, nrow(s), ct$estimate, ct$p.value))
+  }
+  ct <- cor.test(subj$rank, subj$log2_ratio, method = "spearman", exact = FALSE)
+  cat(sprintf("both days, per subject  n=%2d | Spearman rho = %+.3f  p = %.4f\n",
+              nrow(subj), ct$estimate, ct$p.value))
+}
+```
+
+Every volunteer as one line, on the axis the clinical protocol fixes:
+
+```{r fig-ratio-by-volunteer, fig.width=6.4, fig.height=4.4}
+#| echo: false
+# Written straight to thesis/graphics: the chapter figure and the notebook
+# figure must be the same object. The earlier PNGs came from scratch scripts
+# that were later deleted, so nine of thirteen chapter figures had no
+# reproducible source and silently went stale.
+.p_vol <- if (exists("auc") && nrow(auc) > 5) {
+  .v <- aggregate(log2_ratio ~ subject + phenotype + rank, data = auc, FUN = mean)
+  .v$phenotype <- factor(.v$phenotype, levels = PHENO)
+  .fit <- lm(log2_ratio ~ rank, data = .v)
+  .line <- data.frame(rank = seq(1, 5, length.out = 50))
+  .line$log2_ratio <- predict(.fit, .line)
+  .nv <- table(.v$phenotype)
+
+  ggplot(.v, aes(rank, log2_ratio)) +
+    geom_line(data = .line, colour = "grey35", linewidth = 0.8) +
+    geom_point(aes(fill = phenotype), shape = 21, size = 3.4, stroke = 0.6,
+               colour = "grey20") +
+    scale_fill_manual(values = pal, guide = "none") +
+    scale_x_continuous(breaks = 1:5,
+                       labels = sprintf("%s\n(%d)", PH_SHORT, as.integer(.nv))) +
+    labs(x = "Genotyped CYP2C19 metaboliser class  (low → high activity), volunteers in brackets",
+         y = "log2( AUC omeprazole / AUC 5-OH-omeprazole )",
+         title = "One point per volunteer: the plasma ratio against genotype",
+         subtitle = sprintf("Least-squares fit: %.3f log2 per class (p = %.4f, R2 = %.2f, n = %d)",
+                            coef(.fit)[2], summary(.fit)$coefficients[2, 4],
+                            summary(.fit)$r.squared, nrow(.v))) +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold"))
+} else NULL
+if (!is.null(.p_vol)) {
+  dir.create("thesis/graphics", showWarnings = FALSE, recursive = TRUE)
+  ggsave("thesis/graphics/flagship_ratio_volunteer.png", .p_vol,
+         width = 6.4, height = 4.4, dpi = 200)
+}
+.p_vol
+```
+
+## Does the ranking depend on the classes being equally spaced?
+
+The model below treats the activity rank as a number, which assumes the five
+classes are evenly spaced --- something nothing guarantees. Spearman assumes
+only that the order is right, so it is the assumption-free version of the same
+claim, and the singleton classes can be thrown away entirely to check that the
+two populated ones still separate. Whether one subject carries the result is
+asked once, of the model the chapter reports, in the leave-one-out below.
+
+```{r auc-robustness}
+if (exists("subj") && nrow(subj) > 5) {
+  full <- cor.test(subj$rank, subj$log2_ratio, method = "spearman", exact = FALSE)
+  cat(sprintf("rank-only (Spearman): n=%2d rho=%+.3f p=%.4f\n",
+              nrow(subj), full$estimate, full$p.value))
+  # Ties make an exact Spearman impossible, so the p above is asymptotic. A
+  # permutation test assumes nothing; if the two agree, the fallback is sound.
+  set.seed(1)
+  .pm <- replicate(20000, cor(sample(subj$rank), subj$log2_ratio,
+                              method = "spearman"))
+  cat(sprintf("permutation check (20,000 relabellings): p = %.4f
+",
+              (1 + sum(abs(.pm) >= abs(full$estimate) - 1e-12)) / 20001))
+  two <- subj[subj$phenotype %in% c("Intermediate Metabolizer",
+                                    "Normal Metabolizer"), ]
+  if (dplyr::n_distinct(two$phenotype) == 2) {
+    w <- wilcox.test(log2_ratio ~ phenotype, data = two)
+    cat(sprintf("singletons removed - Intermediate (n=%d) vs Normal (n=%d): p = %.3f\n",
+                sum(two$phenotype == "Intermediate Metabolizer"),
+                sum(two$phenotype == "Normal Metabolizer"), w$p.value))
+  }
+}
+```
+
+Ties are the design here --- eight of the fourteen are normal metabolisers ---
+so an exact Spearman cannot be computed and `exact = FALSE` takes the asymptotic
+p-value deliberately. The permutation line above is the check on that fallback:
+it assumes nothing, and its agreeing with the asymptotic p is what licenses
+using it.
+
+## Is an isomer being integrated instead?
+
+Fragmentation does not separate 5-OH-omeprazole from omeprazole sulfone, and an
+isomer of omeprazole itself is reported in these samples. Chromatography does
+separate them: each mass carries two RT clusters (parent ~157 and ~167 s,
+metabolite ~157 and ~182 s) and the confirmed anchors place omeprazole in the
+*later* parent cluster and 5-OH-omeprazole in the *earlier* metabolite one. If
+an isomer were being integrated, restricting to the correct cluster should
+change the answer.
+
+A restriction can only remove a **detection**, never a file: an apex in the
+wrong cluster makes that channel unusable at that timepoint, which is the
+below-LOD case the AUC already handles by contributing 0.
+
+```{r isomer-restrictions}
+if (!exists("ta") || !"par_rt" %in% names(ta)) {
+  cat("AUC section did not run - isomer restrictions skipped\n")
+} else {
+  PC <- 162; MC <- 163                      # cluster split, parent / metabolite
+  a <- ta[!is.na(ta$par_auc) & !is.na(ta$met_auc), ]
+  pmed <- median(a$par_rt, na.rm = TRUE); mmed <- median(a$met_rt, na.rm = TRUE)
+
+  fit_restricted <- function(keep_par, keep_met, label) {
+    d <- ta
+    d$par_auc[!keep_par] <- NA_real_
+    d$met_auc[!keep_met] <- NA_real_
+    ac <- do.call(rbind, lapply(
+      split(d, list(d$ATTRIBUTE_Subject, d$ATTRIBUTE_Study_Day), drop = TRUE),
+      function(z) data.frame(
+        subject = z$ATTRIBUTE_Subject[1],
+        l2 = log2(trap(z$tmin, z$par_auc) / trap(z$tmin, z$met_auc)),
+        phenotype = z$PharmGeno_Phenotype_2C19[1], stringsAsFactors = FALSE)))
+    ac <- ac[is.finite(ac$l2), ]
+    s <- aggregate(l2 ~ subject + phenotype, data = ac, FUN = mean)
+    s$rank <- match(s$phenotype, PHENO)
+    ct <- cor.test(s$rank, s$l2, method = "spearman", exact = FALSE)
+    m <- summary(lm(l2 ~ rank, data = s))
+    cat(sprintf("  %-40s files %3d subj %2d | rho %+.3f p %.4f | slope %+.3f\n",
+                label, sum(!is.na(d$par_auc) & !is.na(d$met_auc)), nrow(s),
+                ct$estimate, ct$p.value, m$coefficients[2, 1]))
+  }
+  ok <- function(x, cond) is.na(x) | cond   # undetected apexes are already NA
+
+  fit_restricted(TRUE, TRUE, "all accepted")
+  fit_restricted(ok(ta$par_rt, ta$par_rt >= PC), TRUE, "parent from the late cluster only")
+  fit_restricted(TRUE, ok(ta$met_rt, ta$met_rt <= MC), "metabolite inside its window only")
+  fit_restricted(ok(ta$par_rt, ta$par_rt >= PC),
+                 ok(ta$met_rt, ta$met_rt <= MC), "both channels unambiguous")
+  fit_restricted(ok(ta$par_rt, abs(ta$par_rt - pmed) <= 2),
+                 ok(ta$met_rt, abs(ta$met_rt - mmed) <= 2),
+                 "both within 2 s of the cohort median")
+
+  cat(sprintf("\nparent apex in the EARLY cluster: %d of %d\n",
+              sum(a$par_rt < PC, na.rm = TRUE), nrow(a)))
+  cat(sprintf("metabolite apex outside its window: %d\n", sum(a$met_rt > MC, na.rm = TRUE)))
+  cat(sprintf("per-subject median apex spread: parent %.1f s, metabolite %.1f s\n",
+              diff(range(tapply(a$par_rt, a$ATTRIBUTE_Subject, median), na.rm = TRUE)),
+              diff(range(tapply(a$met_rt, a$ATTRIBUTE_Subject, median), na.rm = TRUE))))
+}
+```
+
+# The linear model against genotype
+
+Everything above uses Spearman, which asks only whether the ratio decreases as
+activity increases. The chapter reports a linear model instead, because a rank
+correlation carries no units and a claim about a measurement needs an effect
+size in interpretable ones.
+
+The classes are ranked poor = 1 to ultrarapid = 5 and the subject-level log2
+ratio is regressed on that rank, one row per volunteer. The coefficient is a
+change **per genotype class**, not per hour. Treating the rank as a number
+assumes the classes are equally spaced, which nothing guarantees; that is the
+price of an interpretable coefficient.
+
+```{r lm-genotype}
+subj_auc <- aggregate(log2_ratio ~ subject + phenotype + rank, data = auc, FUN = mean)
+m_auc <- lm(log2_ratio ~ rank, data = subj_auc)
+summary(m_auc)
+.ci <- confint(m_auc)["rank", ]
+cat(sprintf("\nslope %.3f log2 per class, 95%% CI %.3f to %.3f\n",
+            coef(m_auc)[2], .ci[1], .ci[2]))
+cat(sprintf("fold change per class: %.3f (%.3f to %.3f)\n",
+            2^coef(m_auc)[2], 2^.ci[1], 2^.ci[2]))
+# R-squared has no closed form here, so resample the 14 volunteers for an interval
+set.seed(1)
+.r2 <- replicate(2000, {
+  i <- sample(nrow(subj_auc), replace = TRUE)
+  if (length(unique(subj_auc$rank[i])) < 2) return(NA_real_)
+  summary(lm(log2_ratio ~ rank, data = subj_auc[i, ]))$r.squared
+})
+cat(sprintf("R2 %.2f, bootstrap 95%% CI %.2f to %.2f, over %d volunteers\n",
+            summary(m_auc)$r.squared,
+            quantile(.r2, 0.025, na.rm = TRUE), quantile(.r2, 0.975, na.rm = TRUE),
+            nrow(subj_auc)))
+```
+
+## Does the summary statistic matter?
+
+Replacing the integral with a plain mean of each volunteer's file ratios should
+give the same answer if the conclusion is not an artefact of how the repeated
+measurements were collapsed.
+
+```{r lm-mean-of-files}
+mof <- both |>
+  filter(deposit_id == "MSV000084008", !is.na(pheno_rank)) |>
+  group_by(subject_id, pheno_rank) |>
+  summarise(v = mean(log2_ratio), .groups = "drop")
+summary(lm(v ~ pheno_rank, data = mof))$coefficients
+```
+
+## Does timing produce the result?
+
+The ratio decays across the dosing interval, so a difference between volunteers
+could in principle be a difference in when their blood was drawn. Refitting the
+same model at one fixed draw at a time removes that: every volunteer is then
+compared at the same point after dosing.
+
+The submitter TSV carries duplicate column names, which dplyr refuses to
+transform, so a minimal frame is built from it once and reused.
+
+```{r lm-draws-frame}
+draws <- data.frame(
+  subject = ta$ATTRIBUTE_Subject,
+  day     = ta$ATTRIBUTE_Study_Day,
+  rank    = match(ta$PharmGeno_Phenotype_2C19, PHENO),
+  tmin    = ta$tmin,
+  l2      = log2(ta$par_auc / ta$met_auc),
+  stringsAsFactors = FALSE)
+draws <- draws[is.finite(draws$l2) & !is.na(draws$rank), ]
+```
+
+```{r lm-fixed-draw}
+fixed_draw <- function(tp) {
+  x <- draws |> filter(tmin == tp) |>
+    group_by(subject, rank) |> summarise(v = mean(l2), .groups = "drop")
+  co <- summary(lm(v ~ rank, data = x))$coefficients
+  data.frame(draw_min = tp, n = nrow(x), beta = co[2, 1], se = co[2, 2], p = co[2, 4])
+}
+do.call(rbind, lapply(c(120, 240, 300, 360), fixed_draw))
+```
+
+## Each dosing occasion separately
+
+Day 9 follows the seven-day antibiotic course, so it is worth showing that it
+still reports the same phenotype rather than assuming it.
+
+```{r lm-per-occasion}
+per_day <- do.call(rbind, lapply(sort(unique(auc$day)), function(d) {
+  x <- auc[auc$day == d & is.finite(auc$log2_ratio), ]
+  co <- summary(lm(log2_ratio ~ rank, data = x))$coefficients
+  data.frame(occasion = d, n = nrow(x), beta = co[2, 1], p = co[2, 4])
+}))
+both_days <- summary(lm(log2_ratio ~ rank, data = subj_auc))$coefficients
+rbind(per_day, data.frame(occasion = "mean of both", n = nrow(subj_auc),
+                          beta = both_days[2, 1], p = both_days[2, 4]))
+
+w <- auc |> select(subject, day, log2_ratio) |> filter(is.finite(log2_ratio)) |>
+  tidyr::pivot_wider(names_from = day, values_from = log2_ratio)
+w <- w[complete.cases(w), ]
+cat(sprintf("\nwithin-subject change across the antibiotic course: median %+.2f log2, n = %d\n",
+            median(w[[3]] - w[[2]]), nrow(w)))
+print(wilcox.test(w[[3]], w[[2]], paired = TRUE))
+```
+
+## Leave-one-volunteer-out
+
+Three classes contain a single volunteer, so the model is refitted fourteen
+times, each fit omitting one.
+
+```{r lm-jackknife}
+jk <- do.call(rbind, lapply(seq_len(nrow(subj_auc)), function(i) {
+  co <- summary(lm(log2_ratio ~ rank, data = subj_auc[-i, ]))$coefficients
+  data.frame(dropped = subj_auc$subject[i], phenotype = subj_auc$phenotype[i],
+             beta = co[2, 1], p = co[2, 4])
+}))
+jk[order(jk$beta), ]
+cat(sprintf("\nbeta range %+.3f to %+.3f | worst p %.4f\n",
+            min(jk$beta), max(jk$beta), max(jk$p)))
+```
+
+## The elimination rate as a second read-out
+
+How fast the ratio falls is itself genotype-dependent: a poor metaboliser clears
+omeprazole slowly, so their ratio should decay more gently. This is a natural
+second endpoint, and this cohort cannot support it.
+
+```{r lm-elimination-rate}
+slopes <- draws |>
+  group_by(subject, day, rank) |> filter(n_distinct(tmin) >= 3) |>
+  summarise(b = coef(lm(l2 ~ I(tmin / 60)))[2], .groups = "drop") |>
+  group_by(subject, rank) |> summarise(b = mean(b), .groups = "drop")
+summary(lm(b ~ rank, data = slopes))$coefficients
+slopes |> group_by(rank) |> summarise(n = n(), median_slope = round(median(b), 3))
+```
+
+# Genotype dosage (star alleles)
+
+CYP2C19 allele activity: *1 = 1 (normal), *2/*3 = 0 (no function), *17 = 1.5
+(increased). The activity score respects functional spacing the equal-spaced
+rank ignores; the loss-of-function dose isolates the strong *2/*3 effect from
+the noisy *17. Subject level.
+
+```{r genotype-dosage}
+allele_act <- function(a) ifelse(a %in% c("2", "3"), 0,
+                          ifelse(a == "17", 1.5, ifelse(a == "1", 1, NA_real_)))
+lof_allele <- function(a) as.integer(a %in% c("2", "3"))
+add_geno <- function(df) {
+  parts <- strsplit(as.character(df$cyp2c19_genotype), "_")
+  df$act_score <- vapply(parts, function(p) sum(allele_act(p)), numeric(1))
+  df$lof_dose  <- vapply(parts, function(p) sum(lof_allele(p)), integer(1))
+  df
+}
+gp <- add_geno(both |> filter(deposit_id == "MSV000084008", !is.na(cyp2c19_genotype)))
+gsub <- gp |> group_by(subject_id, cyp2c19_genotype, act_score, lof_dose) |>
+  summarise(ratio = median(log2_ratio), n_files = n(), .groups = "drop") |>
+  arrange(act_score)
+if (nrow(gsub) >= 8) {
+  print(as.data.frame(gsub))
+  s1 <- cor.test(gsub$ratio, gsub$act_score, method = "spearman", exact = FALSE)
+  cat(sprintf("Spearman(subject ratio, activity_score) rho = %+.3f  p = %.3g  (expect NEG)\n",
+              s1$estimate, s1$p.value))
+  gsub$carrier <- gsub$lof_dose > 0
+  if (dplyr::n_distinct(gsub$carrier) == 2) {
+    w <- wilcox.test(ratio ~ carrier, gsub)
+    cat(sprintf("LoF carriers *2/*3 (n=%d) median = %.2f  vs  non-carriers (n=%d) median = %.2f;  Wilcoxon p = %.3g\n",
+                sum(gsub$carrier), median(gsub$ratio[gsub$carrier]),
+                sum(!gsub$carrier), median(gsub$ratio[!gsub$carrier]), w$p.value))
+  }
+}
+```
+
+# Specimen-resolved phenotyping (082493)
+
+Hepatic CYP2C19 is classically read from plasma: can a non-invasive matrix
+(urine / skin / feces) recover the genotype? Subject-level is the honest test.
+
+
+
+The same comparison as a figure, one panel per matrix and each panel labelled
+with the number of subjects behind it:
+
+```{r figure-data}
+#| echo: false
+# Facet by the MATRIX, not by the deposit. The two accessions are one study, and
+# lumping 082493's urine, faeces and skin into a single panel hides that they
+# behave differently: the ratio tracks genotype in plasma and not at all in
+# urine.
+harm_site <- function(x) {
+  y <- tolower(trimws(x))
+  dplyr::case_when(grepl("plasma", y) ~ "plasma",
+                   grepl("^ua|urine", y) ~ "urine",
+                   grepl("fecal|feces|faec", y) ~ "faeces",
+                   grepl("forehead|skin", y) ~ "skin",
+                   TRUE ~ y)
+}
+# One value per subject per matrix, integrated over the dosing interval, not one
+# per file. The ratio falls across the interval, so pooling draws mixes the time
+# course into the between-subject comparison -- which is why the single-timepoint
+# version of this test came out null. Trapezoid over the recorded minutes, the
+# same estimator the AUC section above validates on; faeces records no timepoint
+# and therefore supports no curve.
+.trap_site <- function(d, ...) {
+  d <- d[is.finite(d$timepoint_mins), ]
+  if (nrow(d) < 3 || dplyr::n_distinct(d$timepoint_mins) < 3)
+    return(data.frame(par = NA_real_, met = NA_real_))
+  d <- d[order(d$timepoint_mins), ]
+  ar <- function(y) { y[is.na(y)] <- 0
+    sum(diff(d$timepoint_mins) * (head(y, -1) + tail(y, -1)) / 2) }
+  data.frame(par = ar(d$par_auc), met = ar(d$met_auc))
+}
+plot_df <- j |>
+  filter(deposit_id %in% cyp_ds, !is.na(pheno_rank)) |>
+  mutate(site = harm_site(specimen)) |>
+  # Urine is excluded rather than left to come out empty. Its parent channel is
+  # 96 per cent the isobaric sulfide, so after the isobar gate a urine ratio
+  # rests on a handful of files and would read as a null result instead of as
+  # the absence of a usable measurement.
+  filter(site != "urine") |>
+  mutate(
+         par_auc = ifelse(par_detected %in% TRUE, par_auc, NA_real_),
+         met_auc = ifelse(met_detected %in% TRUE, met_auc, NA_real_)) |>
+  group_by(subject_id, cyp2c19_phenotype, pheno_rank, site, timepoint) |>
+  group_modify(.trap_site) |>
+  ungroup() |>
+  filter(is.finite(par), is.finite(met), par > 0, met > 0) |>
+  mutate(log2_ratio = log2(par / met),
+         phenotype = factor(cyp2c19_phenotype, levels = PHENO))
+# label each panel with the number of subjects behind it, so a panel resting on
+# two people is not read as equivalent to one resting on fourteen
+.nsub <- plot_df |> dplyr::group_by(site) |>
+  dplyr::summarise(ns = dplyr::n_distinct(subject_id), .groups = "drop")
+stopifnot(nrow(.nsub) > 0)
+plot_df$cohort <- factor(
+  paste0(plot_df$site, "  (", .nsub$ns[match(plot_df$site, .nsub$site)], " subjects)"),
+  levels = paste0(.nsub$site, "  (", .nsub$ns, " subjects)")[order(-.nsub$ns)])
+write.csv(plot_df, "artifacts/cyp_validation_data.csv", row.names = FALSE)
+```
+
+```{r fig-by-phenotype, fig.width=9, fig.height=4}
+#| echo: false
+ggplot(plot_df, aes(phenotype, log2_ratio, fill = phenotype)) +
+  geom_boxplot(outlier.shape = NA, width = 0.62, alpha = 0.95) +
+  geom_jitter(width = 0.15, height = 0, size = 0.8, alpha = 0.45) +
+  facet_wrap(~cohort, scales = "free_y") +
+  scale_fill_manual(values = pal, guide = "none") +
+  scale_x_discrete(labels = PH_SHORT) +
+  labs(x = "Genotyped CYP2C19 metaboliser class  (low → high activity)",
+       y = "log2( AUC omeprazole / AUC 5-OH-omeprazole )",
+       title = "Per-subject AUC ratio by genotyped CYP2C19 class, per matrix") +
+  theme_bw(base_size = 11) +
+  theme(strip.background = element_rect(fill = "grey92"),
+        plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+```{r specimen-resolved}
+# One row per subject, as everywhere else: plot_df carries a value per dosing day,
+# and a subject measured twice must not enter the test twice.
+.by_subject <- plot_df |>
+  dplyr::group_by(site, subject_id, pheno_rank) |>
+  dplyr::summarise(log2_ratio = mean(log2_ratio), .groups = "drop")
+for (sp in sort(unique(.by_subject$site))) {
+  z <- .by_subject[.by_subject$site == sp, ]
+  n <- nrow(z)
+  if (nrow(z) >= 8 && dplyr::n_distinct(z$pheno_rank) >= 3) {
+    ct <- cor.test(z$log2_ratio, z$pheno_rank, method = "spearman", exact = FALSE)
+    co <- summary(lm(log2_ratio ~ pheno_rank, data = z))$coefficients
+    cat(sprintf("  %-7s %2d subjects  rho=%+.3f p=%.3g  |  beta=%+.3f p=%.3g
+",
+                sp, n, ct$estimate, ct$p.value, co[2, 1], co[2, 4]))
+  } else {
+    cat(sprintf("  %-7s %2d subjects  (too few, or under three classes)
+", sp, n))
+  }
+}
+```
+
+
+# Controls the probe cohort makes possible
+
+The dosed cohort supports three checks that no other deposit can offer, because
+it is the only place where we know what the answer must be before looking.
+
+## Pre-dose samples: biological negatives
+
+Every subject was drawn at minute 0, before the dose. The drug cannot be
+present. These are real plasma from real people, with the full complexity of the
+matrix, so they are a harder test of specificity than any synthetic decoy.
+
+```{r pre-dose}
+#| echo: false
+ta_f <- "dataset_metadata/MSV000084008_metadata.tsv"
+if (!file.exists(ta_f)) { cat("submitter TSV not present\n") } else {
+  ta <- read.delim(ta_f, check.names = FALSE, stringsAsFactors = FALSE)
+  ta$k <- norm_file_key(ta$filename)
+  r84 <- readRDS("artifacts/per_dataset/MSV000084008.rds")
+  mp <- as.data.frame(r84$metrics_par); mm <- as.data.frame(r84$metrics_met)
+  mp$k <- norm_file_key(mp$file); mm$k <- norm_file_key(mm$file)
+  ta$par_det <- mp$par_detected[match(ta$k, mp$k)] %in% TRUE
+  ta$met_det <- mm$met_detected[match(ta$k, mm$k)] %in% TRUE
+  ta$tmin <- as.numeric(ta$ATTRIBUTE_Time_Point_Mins)
+  z <- ta[ta$MS_SampleType == "sample" & !is.na(ta$tmin), ]
+  tb <- data.frame(
+    group = c("pre-dose (t = 0)", "post-dose (t > 0)"),
+    files = c(sum(z$tmin == 0), sum(z$tmin > 0)),
+    parent = c(sum(z$par_det[z$tmin == 0]), sum(z$par_det[z$tmin > 0])),
+    metabolite = c(sum(z$met_det[z$tmin == 0]), sum(z$met_det[z$tmin > 0])))
+  tb$parent_pct <- sprintf("%.1f%%", 100 * tb$parent / tb$files)
+  knitr::kable(tb, row.names = FALSE, caption = "Detections before and after dosing.")
+  ft <- fisher.test(matrix(c(tb$parent[1], tb$files[1] - tb$parent[1],
+                             tb$parent[2], tb$files[2] - tb$parent[2]), nrow = 2))
+  cat(sprintf("\nFisher pre vs post (parent): p = %.3g\n", ft$p.value))
+}
+```
+
+
+**Zero detections in 49 pre-dose files, for either compound**, against 60% after
+dosing (p = 2e-18). The picker does not invent the drug in samples that cannot
+contain it.
+
+## The ratio moves with time since dose
+
+A metabolic ratio is not constant over a dosing interval; that is precisely why
+clinical protocols fix the draw at 3 h. If our ratio is measuring pharmacology
+rather than noise, it must fall as the parent clears faster than its metabolite.
+Nothing in the pipeline was tuned to produce this, and the test is run **within
+subject**, so between-subject phenotype differences cannot generate it.
+
+```{r ratio-vs-time}
+#| echo: false
+# Build a minimal frame rather than mutating the submitter TSV: that file
+# carries duplicate column names, which dplyr refuses to transform.
+if (exists("z")) {
+  mpa <- as.data.frame(r84$metrics_par); mma <- as.data.frame(r84$metrics_met)
+  mpa$k <- norm_file_key(mpa$file); mma$k <- norm_file_key(mma$file)
+  tt <- data.frame(
+    subject = as.character(z$ATTRIBUTE_Subject),
+    day     = as.character(z$ATTRIBUTE_Study_Day),
+    tmin    = z$tmin,
+    par_det = z$par_det, met_det = z$met_det,
+    par_auc = mpa$par_auc[match(z$k, mpa$k)],
+    met_auc = mma$met_auc[match(z$k, mma$k)],
+    stringsAsFactors = FALSE)
+  tt <- tt[tt$par_det & tt$met_det & tt$tmin > 0, ]
+  tt$l2 <- log2(tt$par_auc / tt$met_auc)
+  tt <- tt[is.finite(tt$l2), ]
+  tt$bin <- cut(tt$tmin, c(0, 30, 60, 120, 240, 480, Inf),
+                labels = c("<=30m", "30-60m", "1-2h", "2-4h", "4-8h", ">8h"))
+  agg <- do.call(rbind, lapply(levels(tt$bin), function(b) {
+    q <- tt[tt$bin == b, ]; if (!nrow(q)) return(NULL)
+    data.frame(bin = b, files = nrow(q), subjects = length(unique(q$subject)),
+               median_log2 = round(median(q$l2), 2))
+  }))
+  print(agg, row.names = FALSE)
+  rho <- vapply(split(tt, tt$subject), function(q)
+    if (nrow(q) >= 4 && length(unique(q$tmin)) >= 4)
+      cor(q$tmin, q$l2, method = "spearman") else NA_real_, numeric(1))
+  rho <- rho[is.finite(rho)]
+  bt <- binom.test(sum(rho < 0), length(rho))
+  cat(sprintf("
+within-subject Spearman(time, ratio): median rho = %+.3f
+", median(rho)))
+  cat(sprintf("%d of %d subjects negative, sign test p = %.4g
+",
+              sum(rho < 0), length(rho), bt$p.value))
+}
+```
+
+
+The ratio falls monotonically across the dosing interval and
+**`r if (exists("rho")) sum(rho < 0) else NA` of
+`r if (exists("rho")) length(rho) else NA` subjects show a negative slope
+individually** (sign test p =
+`r if (exists("bt")) signif(bt$p.value, 2) else NA`). This is ordinary
+pharmacokinetics recovered from public files, and it is the clearest evidence
+that the number behaves like a drug measurement rather than an artefact of the
+extraction.
+
+It also explains why the single-timepoint ratio was null against genotype while
+the AUC works: a ratio that moves this much with sampling time carries the draw
+time as noise.
+
+```{r fig-ratio-and-detection, fig.width=9.4, fig.height=5.4}
+#| echo: false
+# Plasma only. Urine used to sit beside it to show that its null ratio was not a
+# detection failure -- but after the isobar gate urine has no ratio to defend, and
+# the claim that it detected both compounds more often than plasma was measuring
+# the sulfide. What urine does say is in the paragraph below, where it is a
+# statement about the metabolite rather than about the ratio.
+KEEP <- "plasma"
+rat <- plot_df |>
+  dplyr::filter(site %in% KEEP) |>
+  dplyr::transmute(site, phenotype, value = log2_ratio,
+                   panel = "the ratio: log2( AUC omeprazole / AUC 5-OH )")
+
+# The denominator must be every file of that matrix, not only the ones where the
+# picker returned a peak. metrics_* holds a row only when pick() found
+# something, so building this from `j` alone silently drops the empty files and
+# inflates every rate (plasma read 78-94% against a true 53%). Start from the
+# sample metadata and treat a file with no metrics row as "neither".
+det <- rs |>
+  dplyr::filter(deposit_id %in% cyp_ds) |>
+  dplyr::mutate(site = harm_site(specimen),
+                phenotype = factor(cyp2c19_phenotype, levels = PHENO)) |>
+  dplyr::filter(site %in% KEEP, !is.na(phenotype)) |>
+  dplyr::left_join(dplyr::distinct(j, stem, detection_tier), by = "stem") |>
+  dplyr::mutate(detection_tier = ifelse(is.na(detection_tier), "neither", detection_tier)) |>
+  dplyr::group_by(site, phenotype) |>
+  dplyr::summarise(files = dplyr::n(),
+                   parent     = mean(detection_tier %in% c("both", "parent_only")),
+                   metabolite = mean(detection_tier %in% c("both", "metab_only")),
+                   .groups = "drop") |>
+  tidyr::pivot_longer(c(parent, metabolite), names_to = "compound", values_to = "value") |>
+  dplyr::mutate(panel = "the detection behind it: % of files with the compound",
+                value = 100 * value,
+                compound = factor(compound, levels = c("parent", "metabolite"),
+                                  labels = c("omeprazole (parent)",
+                                             "5-OH-omeprazole (metabolite)")))
+
+# facet_grid frees scales by ROW only, which would force the percentages onto
+# the ratio's axis. One combined facet variable with facet_wrap gives each panel
+# its own.
+lv <- c(paste("plasma —", unique(rat$panel)), paste("plasma —", unique(det$panel)))
+rat$pan <- factor(paste(rat$site, "—", rat$panel), levels = lv)
+det$pan <- factor(paste(det$site, "—", det$panel), levels = lv)
+
+# Each volunteer contributes ~36 plasma files (9 draws x 2 dosing occasions x
+# duplicate aliquots), so a class holding ONE person still shows dozens of files
+# and its bar looks as solid as the eight-person Normal class. Put the volunteer
+# count on the axis: it is shared by both columns, so it labels the boxplots and
+# the bars at once.
+.nvol <- rs |>
+  dplyr::filter(deposit_id %in% cyp_ds, !is.na(cyp2c19_phenotype)) |>
+  dplyr::distinct(subject_id, cyp2c19_phenotype) |>
+  dplyr::count(cyp2c19_phenotype)
+.lab_n <- setNames(sprintf("%s\n(%d)", PH_SHORT,
+                           .nvol$n[match(PHENO, .nvol$cyp2c19_phenotype)]), PHENO)
+
+ggplot() +
+  geom_boxplot(data = rat, aes(phenotype, value, fill = phenotype),
+               outlier.shape = NA, width = 0.62, alpha = 0.95) +
+  geom_jitter(data = rat, aes(phenotype, value),
+              width = 0.15, height = 0, size = 0.7, alpha = 0.4) +
+  geom_col(data = det, aes(phenotype, value, fill = phenotype, alpha = compound),
+           position = position_dodge(width = 0.72), width = 0.68, colour = "grey30",
+           linewidth = 0.25) +
+  # "%" on every label: a bare number above a bar reads as a count, and with ~36
+  # files per volunteer a "50" is easily taken for 50 detections rather than 50
+  # per cent.
+  geom_text(data = det, aes(phenotype, value, group = compound,
+                            label = sprintf("%.0f%%", value)),
+            position = position_dodge(width = 0.72), vjust = -0.35, size = 2.5) +
+  facet_wrap(~ pan, scales = "free_y", ncol = 2) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.13))) +  # room for the 100% labels
+  scale_fill_manual(values = pal, guide = "none") +
+  # Colour already carries the genotype class on both sides, so the compound is
+  # carried by shading. Overriding the swatch fill is what makes that legend
+  # readable at all.
+  scale_alpha_manual(values = c(1, 0.42), name = "Bars (right-hand panels):",
+                     guide = guide_legend(
+                       override.aes = list(fill = "grey35", colour = "grey30"))) +
+  scale_x_discrete(labels = .lab_n) +
+  labs(x = "Genotyped CYP2C19 metaboliser class  (low → high activity), volunteers in brackets",
+       y = NULL,
+       title = "Left: the ratio.  Right: the detection rate behind it.",
+       subtitle = paste("Each volunteer gives ~36 files,",
+                        "so a one-person class still fills a bar")) +
+  theme_bw(base_size = 11) +
+  theme(strip.background = element_rect(fill = "grey92"),
+        strip.text = element_text(size = 9),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+```{r fig-detect-vs-time, fig.width=9.4, fig.height=4.4}
+#| echo: false
+# Detection rate against time since dose, for MS2 and for the MS1 picker. Every
+# volunteer received omeprazole, so this is an absorption curve reconstructed
+# from detections: it should be empty before the dose AND at 5 min (not yet
+# absorbed), rise to a maximum at 4-5 h, and fall by 8 h. The picker should sit
+# at or above MS2 everywhere, and the gap should widen at the tails where the
+# concentration is low and data-dependent acquisition stops triggering.
+h_all <- read.csv("artifacts/hits_curated.csv", check.names = FALSE, stringsAsFactors = FALSE)
+h_all$k <- norm_file_key(h_all$file_path)
+.r  <- readRDS("artifacts/per_dataset/MSV000084008.rds")
+.mp <- as.data.frame(.r$metrics_par); .mp$k <- norm_file_key(.mp$file)
+.mm <- as.data.frame(.r$metrics_met); .mm$k <- norm_file_key(.mm$file)
+.rs <- rs; .rs$k <- norm_file_key(.rs$file)
+.s <- .rs[which(.rs$deposit_id == "MSV000084008" &
+                grepl("plasma", tolower(.rs$specimen)) &
+                is.finite(.rs$timepoint_mins)), ]
+.hk <- function(role) h_all$k[h_all$ATTRIBUTE_DatasetAccession == "MSV000084008" &
+                              h_all$role == role]
+.d <- data.frame(
+  tmin = .s$timepoint_mins,
+  pheno = .s$cyp2c19_phenotype,
+  `omeprazole|MS2`            = .s$k %in% .hk("parent"),
+  `omeprazole|MS1 picker`     = .mp$par_detected[match(.s$k, .mp$k)] %in% TRUE,
+  `5-OH-omeprazole|MS2`       = .s$k %in% .hk("metabolite"),
+  `5-OH-omeprazole|MS1 picker`= .mm$met_detected[match(.s$k, .mm$k)] %in% TRUE,
+  check.names = FALSE)
+.d$pheno <- NULL   # the genotype split is plotted separately, below
+
+.long <- .d |>
+  tidyr::pivot_longer(-tmin, names_to = "series", values_to = "det") |>
+  tidyr::separate(series, c("compound", "route"), sep = "\\|") |>
+  dplyr::group_by(tmin, compound, route) |>
+  dplyr::summarise(pct = 100 * mean(det), n = dplyr::n(), .groups = "drop") |>
+  dplyr::mutate(compound = factor(compound, levels = c("omeprazole", "5-OH-omeprazole")))
+
+# Evenly spaced categories, not real time: on a linear axis the 0 and 5 min
+# draws overlap, and those two points carry the negative-control argument.
+.lv <- sort(unique(.long$tmin))
+.lab <- c("0" = "pre-dose", "5" = "5 min", "30" = "30 min", "60" = "1 h",
+          "120" = "2 h", "240" = "4 h", "300" = "5 h", "360" = "6 h", "480" = "8 h")
+.long$tf <- factor(.lab[as.character(.long$tmin)], levels = unname(.lab[as.character(.lv)]))
+
+# (this is now the top row of the combined figure in the next chunk)
+```
+
+```{r fig-detect-by-genotype, fig.width=9.4, fig.height=7.0}
+#| echo: false
+# The same absorption curve, split by genotype. Purely descriptive: three of the
+# five classes hold a single volunteer, so the classes are pooled into low /
+# normal / high activity and the volunteer count is written into each label. No
+# test is run on this - the formal genotype result is the ratio, not presence.
+.g <- data.frame(
+  tmin  = .s$timepoint_mins,
+  pheno = factor(.s$cyp2c19_phenotype, levels = PHENO),
+  omeprazole        = .mp$par_detected[match(.s$k, .mp$k)] %in% TRUE,
+  `5-OH-omeprazole` = .mm$met_detected[match(.s$k, .mm$k)] %in% TRUE,
+  check.names = FALSE)
+.g <- .g[!is.na(.g$pheno), ]
+.g$grp <- cut(as.integer(.g$pheno), c(0, 2, 3, 5),
+              labels = c("low activity", "normal activity", "high activity"))
+.n <- tapply(.s$subject_id[!is.na(.s$cyp2c19_phenotype)],
+             cut(match(.s$cyp2c19_phenotype[!is.na(.s$cyp2c19_phenotype)], PHENO),
+                 c(0, 2, 3, 5), labels = c("low activity", "normal activity",
+                                           "high activity")),
+             function(x) length(unique(x)))
+levels(.g$grp) <- sprintf("%s (%d volunteers)", levels(.g$grp), .n[levels(.g$grp)])
+
+.gl <- .g |>
+  tidyr::pivot_longer(c(omeprazole, `5-OH-omeprazole`),
+                      names_to = "compound", values_to = "det") |>
+  dplyr::group_by(tmin, grp, compound) |>
+  dplyr::summarise(pct = 100 * mean(det), .groups = "drop") |>
+  dplyr::mutate(compound = factor(compound,
+                                  levels = c("omeprazole", "5-OH-omeprazole")))
+.gl$tf <- factor(.lab[as.character(.gl$tmin)], levels = unname(.lab[as.character(.lv)]))
+
+# One figure, four panels: compound across the columns, and down the rows the
+# two questions asked of the same curve - what each route reaches, and whether
+# genotype shows in presence. Sharing the axis makes the two directly
+# comparable.
+.top <- .long |> dplyr::transmute(tf, compound, series = route, pct,
+                                  row = "by route")
+.bot <- .gl   |> dplyr::transmute(tf, compound, series = as.character(grp), pct,
+                                  row = "by genotype")
+.cmb <- dplyr::bind_rows(.top, .bot)
+.cmb$row <- factor(.cmb$row, levels = c("by route", "by genotype"))
+.cmb$series <- factor(.cmb$series, levels = c("MS2", "MS1 picker", levels(.gl$grp)))
+
+.p_det <- ggplot(.cmb, aes(tf, pct, colour = series, linetype = series, group = series)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.9) +
+  facet_grid(row ~ compound) +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_colour_manual(values = setNames(
+    c("#B2182B", "#2166AC", "#B2182B", "grey35", "#2166AC"), levels(.cmb$series))) +
+  scale_linetype_manual(values = setNames(
+    c("solid", "solid", "22", "22", "22"), levels(.cmb$series))) +
+  labs(x = NULL, y = "% of files with the compound",
+       colour = NULL, linetype = NULL, tag = "A") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey92")) +
+  guides(colour = guide_legend(nrow = 1))
+
+# Panel B: the ratio over the same axis. Presence and the quantity are two views
+# of the same absorption curve, so they belong in one figure rather than two.
+.rt <- tt |>
+  dplyr::group_by(subject, day, tmin) |>
+  dplyr::summarise(l2 = median(l2), .groups = "drop") |>
+  dplyr::mutate(series = paste(subject, day))
+.rt$tf <- factor(.lab[as.character(.rt$tmin)], levels = unname(.lab[as.character(.lv)]))
+.rmed <- .rt |> dplyr::group_by(tf) |>
+  dplyr::summarise(l2 = median(l2), n = dplyr::n_distinct(subject), .groups = "drop")
+
+.p_rat <- ggplot(.rt, aes(tf, l2)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey70") +
+  geom_line(aes(group = series), colour = "grey78", linewidth = 0.4) +
+  geom_point(colour = "grey50", size = 0.9, alpha = 0.7) +
+  geom_line(data = .rmed, aes(group = 1), colour = "#111111", linewidth = 1.1) +
+  geom_point(data = .rmed, aes(fill = n < 5), shape = 21, size = 2.4,
+             colour = "#111111", stroke = 0.8) +
+  geom_text(data = .rmed, aes(label = n), vjust = -1.1, size = 2.7) +
+  scale_fill_manual(values = c(`FALSE` = "#111111", `TRUE` = "white"), guide = "none") +
+  labs(x = "Time since dose", y = "log2( omeprazole / 5-OH )", tag = "B") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+.p_comb <- patchwork::wrap_plots(.p_det, .p_rat, ncol = 1, heights = c(2, 1.1))
+dir.create("thesis/graphics", showWarnings = FALSE, recursive = TRUE)
+ggsave("thesis/graphics/flagship_detect_combined.png", .p_comb,
+       width = 9.4, height = 7.0, dpi = 200)
+.p_comb
+```
+
+```{r fig-ratio-vs-time, fig.width=9.2, fig.height=4.6}
+#| echo: false
+if (exists("tt") && nrow(tt) > 10) {
+  tp <- tt |>
+    dplyr::group_by(subject, day, tmin) |>          # one point per draw, not per injection
+    dplyr::summarise(l2 = median(l2), .groups = "drop") |>
+    dplyr::mutate(series = paste(subject, day),
+                  panel  = paste0("Study day ", day,
+                                  ifelse(day == min(day), "  (first dose)", "  (second dose)")))
+  # A ratio needs BOTH compounds detected, and early in the interval the
+  # metabolite often is not there yet, so the panel is badly unbalanced: 30 min
+  # rests on 2 subjects against 13 at 4 h. Without the counts a reader takes the
+  # left end of the median line for the cohort. Points on <5 subjects are drawn
+  # hollow and the line dashed there.
+  med <- tp |> dplyr::group_by(panel, tmin) |>
+    dplyr::summarise(l2 = median(l2), n = dplyr::n_distinct(subject), .groups = "drop") |>
+    dplyr::mutate(sparse = n < 5)
+
+  ggplot(tp, aes(tmin, l2)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey70") +
+    geom_line(aes(group = series), colour = "grey72", linewidth = 0.45) +
+    geom_point(colour = "grey45", size = 1, alpha = 0.8) +
+    geom_line(data = med, colour = "#111111", linewidth = 1.1) +
+    geom_point(data = med, aes(fill = sparse), colour = "#111111", size = 2.4,
+               shape = 21, stroke = 0.9) +
+    geom_text(data = med, aes(label = n), vjust = -1.15, size = 2.9, colour = "#111111") +
+    scale_fill_manual(values = c(`FALSE` = "#111111", `TRUE` = "white"), guide = "none") +
+    facet_wrap(~ panel) +
+    scale_x_continuous(trans = "log10",
+                       breaks = c(5, 30, 60, 120, 240, 360, 480),
+                       labels = c("5 m", "30 m", "1 h", "2 h", "4 h", "6 h", "8 h")) +
+    labs(x = "Time since dose (log scale). Pre-dose draws at t = 0 carry no drug, so no ratio exists there",
+         y = "log2( omeprazole / 5-OH-omeprazole )",
+         title = "log2(omeprazole / 5-OH) across the dosing interval, both doses, MSV000084008",
+         subtitle = paste("Numbers are subjects contributing a ratio at that draw;",
+                          "hollow points rest on fewer than 5")) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          strip.background = element_rect(fill = "grey93", colour = NA),
+          strip.text = element_text(face = "bold", size = 10.5),
+          plot.title = element_text(face = "bold", size = 12))
+}
+```
+
+Urine is worth a sentence of its own, because it fails and succeeds in different
+channels. Omeprazole is extensively metabolised before renal excretion, so the
+parent is found in $4$ of $140$ urine files while 5-hydroxyomeprazole is found
+in $110$ --- and the parent channel there is not merely empty but misleading,
+since $96$ per cent of the peaks the picker first accepted at that mass were the
+isobaric sulfide. Two things follow for anyone mining archives for exposure.
+Which compound to search for depends on the matrix: in urine the metabolite is
+the marker and the parent is a trap. And urine is the one matrix where
+propagation earns almost nothing --- the tandem search already found the
+metabolite in $106$ of $112$ files and the extraction adds three --- because
+propagation works at the edge of the measurable range, and an abundant renal
+metabolite is not at that edge.
+
+## Does it agree with the authors' own measurement?
+
+The genotype above is a *prediction* of metabolic capacity. The deposit also
+carries a *measurement*: `PharmKinetics_CYP2C19`, the per-subject value the
+original authors determined by targeted HPLC-MS/MS (MRM 346 $\to$ 198 and 362
+$\to$ 214), which our extraction never sees. It is the strongest external check
+available here, because it is per-subject and comes from the deposit rather than
+from a number transcribed out of a paper.
+
+```{r vs-published-pk}
+#| echo: false
+.pk <- both |>
+  dplyr::filter(grepl("plasma", tolower(specimen)),
+                is.finite(pharmkinetics_cyp2c19)) |>
+  dplyr::group_by(subject_id, timepoint) |>
+  dplyr::summarise(ours = median(log2_ratio),
+                   theirs = dplyr::first(pharmkinetics_cyp2c19),
+                   rank = dplyr::first(pheno_rank), .groups = "drop")
+.gm <- do.call(rbind, lapply(sort(unique(.pk$timepoint)), function(d) {
+  q <- .pk[.pk$timepoint == d, ]
+  data.frame(`study day` = d, subjects = nrow(q),
+             `their geometric mean` = round(exp(mean(log(q$theirs))), 2),
+             `published (Table 1)` = c("1" = 1.4, "9" = 1.2)[[as.character(d)]],
+             check.names = FALSE)
+}))
+knitr::kable(.gm, row.names = FALSE, caption = paste(
+  "The deposit column reproduces the paper's own cohort values, which is how we",
+  "know it is the Table 1 parameter and not some other measure."))
+
+.sub <- .pk |> dplyr::group_by(subject_id) |>
+  dplyr::summarise(ours = mean(ours), theirs = mean(theirs),
+                   rank = dplyr::first(rank), .groups = "drop")
+.ot <- cor.test(.sub$ours, .sub$theirs, method = "spearman", exact = FALSE)
+.og <- cor.test(.sub$ours, .sub$rank, method = "spearman", exact = FALSE)
+.tg <- cor.test(.sub$theirs, .sub$rank, method = "spearman", exact = FALSE)
+knitr::kable(data.frame(
+  comparison = c("ours vs theirs", "ours vs genotype rank",
+                 "theirs vs genotype rank"),
+  rho = sprintf("%+.3f", c(.ot$estimate, .og$estimate, .tg$estimate)),
+  p = signif(c(.ot$p.value, .og$p.value, .tg$p.value), 2)),
+  row.names = FALSE,
+  caption = paste("Spearman over", nrow(.sub), "volunteers."))
+```
+
+The three correlations are consistent, but only once the direction of their
+parameter is pinned down, and Table 1's label is not a reliable guide to it. The
+row reads `OME/5-OH OME (AUC)`, yet the numbers behave as the reciprocal, on
+three independent grounds:
+
+- Table 1 reports caffeine and midazolam as oral clearances and lists omeprazole
+  between them. The Results then read the fall in all three together --- *"the
+  decrease in the LS-GMRs ... suggest a decrease in CYP1A2, CYP2C19, and CYP3A4
+  activities"* --- and the Discussion repeats it, *"reflecting decreased
+  activities of CYP1A2, CYP2C19, and CYP3A, respectively"*. A clearance falls
+  when activity falls; a parent-over-metabolite ratio would *rise*. For either
+  sentence to hold, the omeprazole parameter has to move with activity as the
+  two clearances do. The paper offers no other reading of its direction.
+- Their values rise along the genotype ladder (rho =
+  `r sprintf("%+.3f", .tg$estimate)`), which parent-over-metabolite cannot do
+  and metabolite-over-parent must.
+- Their own star alleles order their own values. DM014 (`*2/*3`, two
+  loss-of-function alleles) holds the cohort's two lowest values, 0.28 and 0.34;
+  DM010 (`*17/*17`, two gain-of-function alleles) holds the highest, 3.91; the
+  `*1/*2` heterozygotes cluster just above DM014. Read as parent-over-metabolite
+  that ordering would make the cohort's poorest metaboliser its most efficient.
+
+The paper does describe phenotyping generically as *"oral clearance or
+parent:metabolite area under the curve (AUC) ratios"*, so the label is not a
+one-off slip --- but the numbers, the genotypes and the activity sentence all
+point the other way, and it is the numbers we join to.
+
+Read as metabolite-over-parent, theirs is the reciprocal of ours, so agreement
+has to appear as a negative rank correlation --- and it does, at
+**`r sprintf("%+.3f", .ot$estimate)`** over `r nrow(.sub)` volunteers (p =
+`r signif(.ot$p.value, 2)`), close to what the same ratio achieves against the
+genotype itself. Two independent read-outs of one enzyme, one predicted from DNA
+and one measured by a targeted assay, land on the same ordering of the same
+people from spectra neither of them saw.
+
+What the comparison cannot do is reproduce their absolute level. Without an
+isotope-labelled internal standard our response-factor offset is uncalibrated,
+so the ranking is what transfers, not the number.
+
+# MS1 propagation gain
+
+How many extra genotype-linked measurements the MS1 EIC recovers beyond what the
+targeted MS2 data already provided.
+
+One caution about the denominator, because it is easy to inflate this number.
+The **SIRIUS-confirmed seed files are not the MS2 baseline**: they are a capped,
+curated subset sent for confirmation, so dividing MS1 detections by seeds
+compares two different populations and overstates the gain several-fold. The
+honest baseline is the set of files MASST matched, which is what `05` Part A
+reports corpus-wide. Those figures are quoted there rather than repeated here,
+because a number copied between notebooks is a number that will eventually
+disagree with itself. Seeds are reported here only to show how few confirmed
+anchors the propagation starts from.
+
+```{r propagation-gain}
+for (d in cyp_ds) {
+  r    <- readRDS(sprintf("artifacts/per_dataset/%s.rds", d))
+  seed <- length(unique(basename(c(r$cfg$confirmed_files_parent,
+                                   r$cfg$confirmed_files_metabolite))))
+  detf  <- sum(pf$dataset_id == d & pf$detection_tier != "neither", na.rm = TRUE)
+  bothf <- sum(pf$dataset_id == d & pf$detection_tier == "both",    na.rm = TRUE)
+  cat(sprintf("  %s: %d confirmed anchors -> %d files with a detection (%d with both)\n",
+              d, seed, detf, bothf))
+}
+```
+
+```{r tbl-propagation}
+#| echo: false
+# Propagation in a cohort where the answer is known: every volunteer received
+# omeprazole, so a post-dose file is one where the compound is expected. MS2
+# reaches the files it happened to fragment; the picker reaches those plus the
+# rest. Pre-dose and 5 min are shown too: the drug is not yet absorbed, so both
+# routes should be empty there.
+.hk2 <- function(ds, role) h_all$k[h_all$ATTRIBUTE_DatasetAccession == ds &
+                                   h_all$role == role]
+.grab <- function(ds, pat) {
+  .rr <- readRDS(sprintf("artifacts/per_dataset/%s.rds", ds))
+  # gate the isobars here too, or this table credits propagation with peaks the
+  # corpus tables reject: in urine 86 of 90 parent peaks sit at the metabolite's
+  # retention time, not omeprazole's
+  .g <- resolve_isobars(.rr$metrics_par, .rr$metrics_met,
+                        read.csv("artifacts/hits-confirmed-all.csv",
+                                 stringsAsFactors = FALSE), ds, .rr$rt_anchor)
+  .a <- as.data.frame(.g$par); .a$k <- norm_file_key(.a$file)
+  .b <- as.data.frame(.g$met); .b$k <- norm_file_key(.b$file)
+  .z <- .rs[which(.rs$deposit_id == ds & grepl(pat, tolower(.rs$specimen))), ]
+  data.frame(tmin = .z$timepoint_mins,
+             par_ms2 = .z$k %in% .hk2(ds, "parent"),
+             met_ms2 = .z$k %in% .hk2(ds, "metabolite"),
+             par_pick = .a$par_detected[match(.z$k, .a$k)] %in% TRUE,
+             met_pick = .b$met_detected[match(.z$k, .b$k)] %in% TRUE)
+}
+.plas <- .grab("MSV000084008", "plasma")
+.urin <- .grab("MSV000082493", "urine")
+.skin <- .grab("MSV000082493", "skin|forehead")
+
+.row <- function(d, label) data.frame(
+  Stratum = label, Files = nrow(d),
+  `MS2 parent` = sum(d$par_ms2), `Picker parent` = sum(d$par_pick),
+  `MS2 metabolite` = sum(d$met_ms2), `Picker metabolite` = sum(d$met_pick),
+  check.names = FALSE)
+
+.lab <- c("0" = "plasma, pre-dose", "5" = "plasma, 5 min", "30" = "plasma, 30 min",
+          "60" = "plasma, 1 h", "120" = "plasma, 2 h", "240" = "plasma, 4 h",
+          "300" = "plasma, 5 h", "360" = "plasma, 6 h", "480" = "plasma, 8 h")
+.tab <- dplyr::bind_rows(
+  lapply(sort(unique(.plas$tmin[is.finite(.plas$tmin)])),
+         function(t) .row(.plas[.plas$tmin %in% t, ], .lab[[as.character(t)]])),
+  .row(.plas[which(.plas$tmin > 0), ], "plasma, all post-dose"),
+  .row(.urin[which(.urin$tmin > 0), ], "urine, all post-dose"),
+  .row(.skin[which(.skin$tmin > 0), ], "skin, all post-dose"))
+.tab$`Propagation multiplier` <- ifelse(
+  .tab$`MS2 parent` + .tab$`MS2 metabolite` == 0, "-",
+  sprintf("%.2f", (.tab$`Picker parent` + .tab$`Picker metabolite`) /
+                  pmax(1, .tab$`MS2 parent` + .tab$`MS2 metabolite`)))
+# The thesis table is built from this, so it is written on every render.
+write.csv(.tab, "artifacts/propagation_dosed_cohort.csv", row.names = FALSE)
+knitr::kable(.tab, caption = paste(
+  "Files with each compound detected by MS2 and by the MS1 picker, in a cohort where",
+  "every volunteer received omeprazole. Pre-dose and 5-minute draws precede absorption",
+  "and are empty by both routes. The multiplier is picker detections over MS2",
+  "detections, summed across the two compounds; it is undefined where MS2 finds",
+  "nothing, which is the case for the parent throughout urine."))
+```
+
+Urine is where propagation is worth least. Omeprazole is largely metabolised
+before renal excretion, so the tandem silence there is correct; the isobar gate
+of `03` cuts the extraction's parent count from $90$ to $4$, the rest having sat
+beside 5-OH-omeprazole rather than $9.6$ s after it.

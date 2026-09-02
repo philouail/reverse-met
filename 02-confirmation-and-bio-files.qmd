@@ -10,9 +10,6 @@ format:
     number-sections: true
     code-fold: show
     df-print: paged
-execute:
-  warning: false
-  message: false
 ---
 
 # Overview
@@ -20,9 +17,8 @@ execute:
 This document combines the three SIRIUS confirmation notebooks, narrows to the
 highest-tier confirmations where both parent and metabolite are present in the
 same assay, and produces the cross-dataset RT and m/z diagnostics for the EIC
-windows used next. It then builds, per surviving dataset, the list of
-biological MS files (excluding QCs / blanks / pooled standards) the EIC
-pipeline will load.
+windows used next. It then builds, per surviving dataset, the list of biological
+MS files (excluding QCs / blanks / pooled standards) the EIC pipeline will load.
 
 **Reads:**
 
@@ -39,7 +35,8 @@ pipeline will load.
 - `artifacts/datasets-confirmed.csv` - one row per `dataset_id`
 - `artifacts/bio_files_per_ds.rds` - named list: `dataset_id` -> character
   vector of biological MS file paths
-- `artifacts/bio_assays_per_ds.rds` - named list: `dataset_id` -> assay identifier
+- `artifacts/bio_assays_per_ds.rds` - named list: `dataset_id` -> assay
+  identifier
 
 ```{r setup}
 source("R/_setup.R")
@@ -56,13 +53,17 @@ deposit-level key to `deposit_id`, and attach the combined `dataset_id` and
 chromatography from `dataset_metadata_table.csv` via a `(deposit_id, assay)`
 join.
 
-The count here is **12**, not the 14 curated in `01`: SIRIUS confirmed the
-omeprazole / 5-OH pair in 12 datasets and rejected two (MSV000086975 and
-MSV000085256) where MASST flagged features at the target masses but the MS2
-supported a different, isobaric formula. Both are correct rejections: SIRIUS's
-top formula for the parent is fluorinated and sulfur-free (C17H16FN3O4 for
-086975, C14H16F3N4O3 for 085256), not omeprazole's C17H19N3O3S, so these are
-isobaric look-alikes rather than the target.
+Twelve datasets arrive here, not the fifteen curated in `01`, and the three that
+drop do so for two different reasons:
+
+- `MSV000086975` and `MSV000085256` are isobaric look-alikes. MASST flagged
+  features at the target masses, but SIRIUS's top formula for the parent is
+  fluorinated and sulfur-free --- C17H16FN3O4 and C14H16F3N4O3 respectively, not
+  omeprazole's C17H19N3O3S. Both are correct rejections.
+- `MSV000091951` is not a look-alike. Omeprazole is genuinely confirmed there
+  (22 features, structure rank 1, Tanimoto around 0.98), but no metabolite
+  feature ever confirms, so it fails the both-roles filter below and cannot
+  yield a ratio.
 
 ```{r load-confirmed}
 conf_all <- rbind(
@@ -98,40 +99,46 @@ print(table(unique(conf_all[, c("dataset_id", "chromatography")])$chromatography
 
 # Filter cascade
 
-Both parent/metabolite hits per assay and a shared adduct were already
-required upstream, so the remaining filters narrow to what is *interpretable*
-after SIRIUS: highest tier per dataset+role, both roles still present after
-annotation.
+Both parent and metabolite hits per assay were already required upstream, so the
+remaining filter narrows to what is *interpretable* after SIRIUS: both roles
+still present after annotation. That is the only condition applied here. Two
+conditions deliberately are not: the two compounds need not share an adduct
+(`01` explains why such a rule deletes evidence of presence rather than
+protecting the ratio), and each (dataset, role) is not collapsed to its best
+tier --- see below.
 
-## Highest confidence tier per (dataset, role)
+## Every confirmed tier is kept
 
 SIRIUS returns a formula rank and a structure rank per feature; we bin them into
 tiers (set in the confirmation notebooks):
 
-- **strict** — formula rank 1 and structure rank 1;
-- **standard** — formula rank ≤ 3 and structure rank ≤ 5;
-- **liberal** — formula rank ≤ 15 and structure rank ≤ 15;
-- **not_confirmed** — beyond liberal; dropped before the confirmed CSVs.
+- **strict**: formula rank 1 and structure rank 1;
+- **standard**: formula rank ≤ 3 and structure rank ≤ 5;
+- **liberal**: formula rank ≤ 15 and structure rank ≤ 15;
+- **not_confirmed**: beyond liberal; dropped before the confirmed CSVs.
 
-A feature can match at several tiers, so we keep only the highest tier reached
-per (dataset, role).
+Every confirmed feature is kept, at whatever tier it reached. Collapsing each
+(dataset, role) to its best tier would mean one `strict` parent feature in a
+deposit discarding every `standard` parent feature in that same deposit ---
+including rank-1 identifications on other files. That is the right rule for
+choosing an **RT anchor**, where the most confident evidence should set the
+window, and the wrong rule for everything else, where a confirmed feature is a
+confirmed feature. The tier restriction now lives in
+`derive_extraction_config()`, which is the only consumer that needs it; the
+`confidence` column flows through here unchanged so any downstream analysis can
+still stratify or weight by tier.
 
-```{r filter-best-confidence}
+```{r keep-confidence-tier}
 CONF_ORDER <- c(strict = 1, standard = 2, liberal = 3, not_confirmed = 4)
-
-conf_best <- conf_all |>
-  dplyr::group_by(dataset_id, role) |>
-  dplyr::filter(CONF_ORDER[as.character(confidence)] ==
-                  min(CONF_ORDER[as.character(confidence)])) |>
-  dplyr::ungroup()
+conf_best  <- conf_all
 ```
 
 ## Both roles confirmed (any tier above not_confirmed)
 
-A `dataset_id` is kept only if both `parent` and `metabolite` have at
-least one feature at `strict`, `standard`, or `liberal`. The
-`confidence` column flows through unchanged so downstream code can
-stratify or weight by tier in the meta-analysis.
+A `dataset_id` is kept only if both `parent` and `metabolite` have at least one
+feature at `strict`, `standard`, or `liberal`. The `confidence` column flows
+through unchanged so downstream code can stratify or weight by tier in the
+meta-analysis.
 
 ```{r filter-both-roles}
 conf_final <- conf_best |>
@@ -187,61 +194,45 @@ plot_rt_windows <- function(df, title) {
           strip.background = element_rect(fill = "grey92"))
 }
 
-plot_rt_windows(conf_final, "Per-dataset RT windows - all confirmed features")
+.p_rt <- plot_rt_windows(conf_final, "Per-dataset RT windows - all confirmed features")
+# This is the chapter figure too, so it is written from here rather than
+# redrawn.
+dir.create("thesis/graphics", showWarnings = FALSE, recursive = TRUE)
+ggsave("thesis/graphics/flagship_rt_windows_raw.png", .p_rt, width = 9, height = 5, dpi = 200)
+.p_rt
 ```
 
 Chromatography labels come from the deposit / ReDU metadata and paper constants
-(`01`), not from RT. Absolute RT is not comparable across datasets (it depends on
-each method's gradient), so the spread within a phase facet is expected, not
-evidence of mislabelling. Two datasets are RT outliers worth checking against their
-source methods:
+(`01`), not from RT. Absolute RT is not comparable across datasets (it depends
+on each method's gradient), so the spread within a phase facet is expected, not
+evidence of mislabelling. Two datasets are RT outliers worth checking against
+their source methods:
 
-- **MTBLS11656** — confirmed RT ≈ 523 s, very late for RP (every other RP dataset
+- **MTBLS11656**: confirmed RT ≈ 523 s, very late for RP (every other RP dataset
   sits at 88–203 s);
-- **MSV000092754** — confirmed RT ≈ 107 s, unusually early for HILIC (every other
+- **MSV000092754**: confirmed RT ≈ 107 s, unusually early for HILIC (every other
   HILIC dataset here sits at 279–507 s).
 
 ## MS2 trigger RT versus MS1 chromatographic apex
 
-The confirmed retention time above is the RT of the MS2 scan that matched, i.e.
-where data-dependent acquisition (DDA) fired. DDA triggers as soon as a precursor
-is intense enough, so the MS2 scan can sit anywhere on the chromatographic peak
-(rising edge, apex, or far down the tail) and scatters from file to file. The RT
-that the `03` extraction windows must centre on is the MS1 chromatographic **apex**,
-which is stable.
+The retention time recorded above is that of the MS2 scan that matched, not of
+the compound. Data-dependent acquisition fires as soon as a precursor is intense
+enough and can re-fire while it stays intense, so the scans that confirm one
+feature scatter across its chromatographic peak and well down its tail. The RT
+`03` must centre an extraction window on is the MS1 apex, which is stable where
+the trigger time is not.
 
-MSV000088255's metabolite makes the point. Its nine confirmed MS2 scans span 81 s
-(256–337 s), which would force a 91 s extraction window, yet the real
-5-hydroxyomeprazole peak sits in a 13 s band in every file. Each MS1 apex below was
-read off the file's own EIC and **checked manually**:
-
-| Confirmed MS2 RT (s) | MS1 apex (s) | DDA offset (s) |
-|---:|---:|---:|
-| 256 | 267 | +11 |
-| 261 | 269 |  +8 |
-| 265 | 270 |  +5 |
-| 269 | 258 | −11 |
-| 290 | 271 | −19 |
-| 293 | 268 | −25 |
-| 306 | 270 | −36 |
-| 310 | 270 | −40 |
-| 337 | 270 | −67 |
-
-The DDA offset reaches 67 s (one scan fired on the tail while the 62-million-count
-apex sat at 270 s), yet every apex lands within 258–271 s. `03` therefore anchors
-each extraction window on the MS1 apex rather than the MS2 RT: for every confirmed
-hit it finds the MS1 peak nearest the MS2 scan and takes that apex, then brackets
-the robust consensus of those apexes. Hits where DDA fired too far for a reliable
-automatic snap are corrected by hand in `curation/rt_apex_overrides.csv`,
-audited against the per-hit EIC plots saved under `rt_snap/`.
+That is measured rather than assumed, and it is measured in `03`, which is where
+the MS1 chromatograms exist: see *Checks that can catch us being wrong*, which
+plots every confirmed MS2 scan in MSV000088255 against the apex of the peak it
+fired on.
 
 # m/z deviation
 
-The observed precursor m/z should match the inferred adduct's theoretical
-m/z within the instrument's mass accuracy; deviation in ppm is
-`(observed - theoretical) / theoretical * 1e6`. A well-calibrated Orbitrap is
-within +/- 5 ppm; above +/- 10 ppm suggests a calibration issue or a
-mis-assigned adduct.
+The observed precursor m/z should match the inferred adduct's theoretical m/z
+within the instrument's mass accuracy; deviation in ppm is `(observed -
+theoretical) / theoretical * 1e6`. A well-calibrated Orbitrap is within +/- 5
+ppm; above +/- 10 ppm suggests a calibration issue or a mis-assigned adduct.
 
 ```{r mz-deviation, fig.width = 9, fig.height = 4}
 role_formula <- setNames(compound_spec$formula, compound_spec$role)
@@ -300,42 +291,22 @@ ds_summary
 
 # Biological file selection
 
-For each surviving `dataset_id` we build the list of biological MS files
-(excluding QC injections, blanks, pooled QCs, and reference standards).
-The three repositories carry this information differently:
-
-- **MassIVE (GNPS / Pan-ReDU)**: per-deposit TSV from Pan-ReDU
-  (auto-cached from `redu.gnps2.org`) or a submitter-provided CSV.
-  Both carry a `SampleType` column and a `filename` column. The TSV
-  has full relative paths; the submitter CSV has bare stems and is
-  reconstructed against the MASST `file_path` directory + extension.
-- **MetaboLights (EBI, ISA-Tab)**: the study file `s_{id}.txt` lists
-  sample names and factors; the spectral file names live in the assay
-  file `a_{id}_*.txt`. We use `mtbls_assay_data()`
-  for one assay at a time (each `dataset_id` is already scoped to one
-  assay) and restrict to sample rows that are biological per `s_*.txt`.
-- **Metabolomics Workbench (mwTab)**: each analysis file
-  `<deposit>_AN*.txt` carries the `SUBJECT_SAMPLE_FACTORS` block. Each
-  subject's `RAW_FILE_NAME` is a space-separated list, one position per
-  analysis in the deposit's canonical `MS_run` order. We use
-  `mwb_metadata()$MS_run` to find the
-  current analysis's position and pick the matching file from each
-  subject.
-
-`EXCL_ST` in `R/metadata.R` defines the regex of sample-type strings
-treated as non-biological across all three loops.
+For each surviving `dataset_id` we build the list of biological MS files,
+excluding QC injections, blanks, pooled QCs and reference standards. The three
+repositories record that differently, so there is one loop per repository below.
+`EXCL_ST` in `R/metadata.R` defines the regex of sample-type strings treated as
+non-biological in all three.
 
 ```{r init-lists}
 bio_files_per_ds  <- list()
 bio_assays_per_ds <- list()
-# Per file, does a metadata source cover it? Files without metadata are extracted
-# for the record (only if they carry a confirmed hit) but excluded downstream.
+# Per file, does a metadata source cover it? Files without metadata are
+# extracted for the record (only if they carry a confirmed hit) but excluded
+# downstream.
 bio_meta_per_ds   <- list()
 ```
 
-## MassIVE
-
-The extraction set comes from the **deposit's own file inventory**
+The MassIVE extraction set comes from the **deposit's own file inventory**
 (`massive_list_files` via `select_bio_files_massive()`), de-duplicated by
 normalised name across all of the deposit's file trees. This matters because a
 metadata catalogue alone under-covers a deposit: MSV000082493's 341-file blood
@@ -348,15 +319,18 @@ A file enters the set if it is **either**:
 
 - covered by a metadata source (Pan-ReDU ∪ submitter table, reconciled in `01`),
   with QC injections, blanks and reference standards removed by the *declared*
-  sample-type column — never by file name (`EXCL_ST` on `SampleType` /
+  sample-type column, never by file name (`EXCL_ST` on `SampleType` /
   `MS_SampleType`); **or**
 - carrying a confirmed MASST hit, whatever tree it sits in, so no confirmed
   exposure is ever lost.
 
-Files that are neither are not downloaded. `bio_meta_per_ds` flags each kept file:
-`has_metadata = TRUE` is analysable downstream; a confirmed-hit-only file
+Files that are neither are not downloaded. `bio_meta_per_ds` flags each kept
+file: `has_metadata = TRUE` is analysable downstream; a confirmed-hit-only file
 (`FALSE`) is extracted for the presence record but excluded from stratified
-analysis.
+analysis. The metadata side is a per-deposit TSV from Pan-ReDU, auto-cached from
+`redu.gnps2.org`, or a submitter-provided CSV; both carry `SampleType` and
+`filename`, and where the CSV holds bare stems they are reconstructed against
+the MASST `file_path` directory and extension.
 
 ```{r bio-files-massive}
 # Loadable basename of a confirmed-hit file (strip the MsBackend cache prefix).
@@ -393,7 +367,11 @@ for (i in seq_len(nrow(msv_rows))) {
 }
 ```
 
-## MetaboLights
+MetaboLights keeps the two halves apart: the study file `s_{id}.txt` lists
+sample names and factors, while the spectral file names live in the assay file
+`a_{id}_*.txt`. Each `dataset_id` is already scoped to one assay, so
+`mtbls_assay_data()` is called for one assay at a time and restricted to the
+sample rows `s_*.txt` marks as biological.
 
 ```{r bio-files-mtbls}
 mtbls_rows <- ds_summary[startsWith(ds_summary$deposit_id, "MTBLS"), ]
@@ -429,14 +407,18 @@ for (i in seq_len(nrow(mtbls_rows))) {
   files <- files[!is.na(files) & nchar(files) > 0]
 
   bio_files_per_ds [[ds]] <- files
-  # MetaboLights files come from the deposit's own ISA-Tab manifest, so every one
-  # already carries metadata (QC excluded above): all TRUE.
+  # MetaboLights files come from the deposit's own ISA-Tab manifest, so every
+  # one already carries metadata (QC excluded above): all TRUE.
   bio_meta_per_ds  [[ds]] <- stats::setNames(rep(TRUE, length(files)), files)
   bio_assays_per_ds[[ds]] <- an
 }
 ```
 
-## Metabolomics Workbench
+The Workbench packs it into one file. Each analysis file `<deposit>_AN*.txt`
+carries a `SUBJECT_SAMPLE_FACTORS` block in which a subject's `RAW_FILE_NAME` is
+a space-separated list, one position per analysis in the deposit's canonical
+`MS_run` order. `mwb_metadata()$MS_run` gives the current analysis's position,
+and the matching file is taken from each subject.
 
 ```{r bio-files-mwb}
 mwb_rows <- ds_summary[startsWith(ds_summary$deposit_id, "ST"), ]
@@ -493,7 +475,7 @@ for (i in seq_len(nrow(mwb_rows))) {
 }
 ```
 
-## Summary
+What the three loops leave, per dataset:
 
 ```{r bio-summary}
 #| echo: false
@@ -515,7 +497,7 @@ bio_counts
 
 What `03` needs: the confirmed features (`hits-confirmed-all.csv`), the
 per-dataset summary (`datasets-confirmed.csv`), and the three per-dataset lists
-that drive extraction — the biological files to load (`bio_files_per_ds.rds`),
+that drive extraction: the biological files to load (`bio_files_per_ds.rds`),
 their assay (`bio_assays_per_ds.rds`), and the has-metadata flag per file
 (`bio_meta_per_ds.rds`).
 
