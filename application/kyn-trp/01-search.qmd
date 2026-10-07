@@ -1,0 +1,310 @@
+---
+title: "01 - Search"
+subtitle: "Step 1: one structure query per target"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+Each target is resolved to its reference MS/MS spectra, and their matches
+against the public repositories are read from FASSTrecords. Library spectra that
+are not a plausible ion of their target are set aside, and only deposits that
+carry every target are kept.
+
+**Input:** `compound.csv` (the targets). The hits come from the FASSTrecords
+database, or from its cached extract `StructureMASST_output/fasstrecords_hits.csv`,
+which the search writes when the database is available.
+
+**Output:** `artifacts/hits_search.csv`, with the adduct of each hit, read by
+step 2.
+
+```{r setup}
+source("../../R/setup.R")
+source("../../R/masst.R")
+source("../../R/metadata.R")
+```
+
+# Targets
+
+```{r compound-spec}
+compound_spec
+```
+
+Tryptophan and kynurenine: indoleamine 2,3-dioxygenase converts tryptophan to
+kynurenine, and the balance between the two is the standard read-out of its
+activity, which rises with age.
+
+The search covers every deposit that carries both compounds. Which of them can
+test the hypothesis (human blood from adults, with an age) is decided from their
+metadata: step 2 first removes the deposits already known not to fit, then looks
+for the rest in every source, and step 3 keeps those that fit.
+
+# The search
+
+FASSTrecords (DOI 10.5281/zenodo.18199544) holds a reference library of MS/MS
+spectra and their precomputed matches against every public MS/MS spectrum in
+MassIVE, MetaboLights, the Metabolomics Workbench and NORMAN. For each target we take
+all library spectra with its InChIKey first block and keep their matches with a
+cosine of at least 0.7 over at least 3 peaks.
+
+The database is a fixed release, so the search is reproducible. The chunk below
+runs only when the database is available and the cached
+`StructureMASST_output/fasstrecords_hits.csv` is absent, or was queried for
+other targets than those in `compound.csv`; otherwise the cached file is read.
+The search writes the InChIKeys it queried next to it, in
+`fasstrecords_targets.csv`. The roles are taken from `compound.csv`, so renaming
+a target needs no new query. Delete the cached file to rebuild it. The search
+queries only the deposits that carry every target, so it also writes each
+target's deposits with a hit over the whole archive, in
+`fasstrecords_deposits.csv`, for the step summary.
+
+```{r discovery-fasstrecords}
+FASST_DB   <- Sys.getenv("FASST_DB", "E:/FASSTrecords/db/masst_records.sqlite")
+FASST_OUT  <- "StructureMASST_output/fasstrecords_hits.csv"
+FASST_KEYS <- "StructureMASST_output/fasstrecords_targets.csv"  # InChIKeys it was queried for
+FASST_DEPS <- "StructureMASST_output/fasstrecords_deposits.csv" # each target's deposits with a hit
+same_targets <- function(keys) setequal(keys, compound_spec$inchikey_block1)
+rebuild <- !file.exists(FASST_OUT) ||
+  (file.exists(FASST_KEYS) && !same_targets(read.csv(FASST_KEYS)$inchikey_first_block))
+IKEY <- stats::setNames(compound_spec$inchikey_block1, compound_spec$role)
+COSINE_MIN <- 0.7; PEAKS_MIN <- 3
+INVALID_SCAN <- 4294967295                             # "no scan" sentinel
+unq <- function(x) trimws(gsub('"', '', x))
+inl <- function(v) paste(v, collapse = ",")
+# Each target's library spectra.
+library_ids <- function(con) lapply(IKEY, function(k) dbGetQuery(con, sprintf(
+  "SELECT spectrum_id_int, spectrum_id, Adduct, Precursor_MZ
+     FROM library_table WHERE InChIKey_smiles_firstBlock = '%s'", k)))
+# Each target's deposits with a hit over the whole archive (step summary),
+# filtered as the hits below: plausible ions only, no "no scan" sentinel.
+deposits_per_target <- function(con, lib_ids) {
+  dplyr::bind_rows(lapply(compound_spec$role, function(role) {
+    lib <- lib_ids[[role]]
+    lib <- lib[!is.na(mapply(infer_adduct, lib$Precursor_MZ, role_formula[[role]],
+                             USE.NAMES = FALSE)), ]
+    if (!nrow(lib)) return(NULL)
+    dep <- unique(unq(dbGetQuery(con, sprintf(
+      "SELECT DISTINCT d.Dataset AS deposit
+         FROM masst_table m JOIN dataset_table d ON m.dataset_id_int = d.dataset_id_int
+        WHERE m.spectrum_id_int IN (%s) AND m.cosine >= %f AND m.matching_peaks >= %d
+          AND (m.scan_id IS NULL OR m.scan_id != %.0f)",
+      inl(lib$spectrum_id_int), COSINE_MIN, PEAKS_MIN, INVALID_SCAN))$deposit))
+    if (!length(dep)) return(NULL)
+    data.frame(inchikey_first_block = IKEY[[role]], deposit = dep)
+  }))
+}
+if (file.exists(FASST_DB) && rebuild) {
+  suppressPackageStartupMessages(library(RSQLite))
+  con <- dbConnect(SQLite(), FASST_DB)
+  lib_ids <- library_ids(con)
+  # Query only the deposits carrying every target: the others are dropped below
+  # anyway and would make the extract much larger.
+  scope <- Reduce(intersect, lapply(lib_ids, function(lib) {
+    if (!nrow(lib)) return(character(0))
+    dbGetQuery(con, sprintf(
+      "SELECT DISTINCT d.Dataset AS dataset
+         FROM masst_table m JOIN dataset_table d ON m.dataset_id_int = d.dataset_id_int
+        WHERE m.spectrum_id_int IN (%s) AND m.cosine >= %f AND m.matching_peaks >= %d",
+      inl(lib$spectrum_id_int), COSINE_MIN, PEAKS_MIN))$dataset
+  }))
+  if (!length(scope)) {
+    dbDisconnect(con)
+    stop("No deposit carries every target (library spectra per target: ",
+         paste(names(lib_ids), sapply(lib_ids, nrow), collapse = ", "), ")")
+  }
+  deposits <- deposits_per_target(con, lib_ids)
+  get_role <- function(role) {
+    lib <- lib_ids[[role]]; if (!nrow(lib)) return(NULL)
+    h <- dbGetQuery(con, sprintf(
+      "SELECT m.cosine AS Cosine, m.matching_peaks AS matching_peaks, m.scan_id AS scan_id,
+              m.spectrum_id_int AS spectrum_id_int, m.mri_id_int AS mri_id_int,
+              d.Dataset AS ATTRIBUTE_DatasetAccession, mr.mri AS mri
+         FROM masst_table m
+         JOIN dataset_table d ON m.dataset_id_int = d.dataset_id_int
+         JOIN mri_table    mr ON m.mri_id_int     = mr.mri_id_int
+        WHERE m.spectrum_id_int IN (%s) AND m.cosine >= %f AND m.matching_peaks >= %d%s",
+      inl(lib$spectrum_id_int), COSINE_MIN, PEAKS_MIN,
+      sprintf(" AND d.Dataset IN ('%s')", paste(scope, collapse = "','"))))
+    if (!nrow(h)) return(NULL)
+    h <- dplyr::left_join(h, lib[, c("spectrum_id_int","spectrum_id","Adduct","Precursor_MZ")],
+                          by = "spectrum_id_int")
+    h$ATTRIBUTE_DatasetAccession <- unq(h$ATTRIBUTE_DatasetAccession); h$mri <- unq(h$mri)
+    h$role <- role; h$inchikey_first_block <- IKEY[[role]]
+    h$USI <- paste0(h$mri, ":scan:", h$scan_id)
+    h$file_path <- sub("^mzspec:[^:]*:", "", h$mri)
+    h$`Matching Peaks` <- h$matching_peaks; h$lib_spectrum <- h$spectrum_id
+    h }
+  hits <- dplyr::bind_rows(lapply(compound_spec$role, get_role))
+  hits <- hits[hits$scan_id != INVALID_SCAN | is.na(hits$scan_id), ]
+  mids <- unique(hits$mri_id_int); chunks <- split(mids, ceiling(seq_along(mids) / 5000))
+  redu <- dplyr::bind_rows(lapply(chunks, function(ch) dbGetQuery(con, sprintf(
+    "SELECT mri_id_int, ChromatographyAndPhase, IonizationSourceAndPolarity, NCBITaxonomy, SampleType
+       FROM redu_table WHERE mri_id_int IN (%s)", inl(ch)))))
+  cln <- function(v) { v[is.na(v) | v %in% c("missing value","not applicable","")] <- NA; v }
+  for (cc in c("ChromatographyAndPhase","IonizationSourceAndPolarity","NCBITaxonomy","SampleType"))
+    redu[[cc]] <- cln(redu[[cc]])
+  redu <- redu[!duplicated(redu$mri_id_int), ]
+  hits <- dplyr::left_join(hits, redu, by = "mri_id_int")
+  dbDisconnect(con)
+  dir.create("StructureMASST_output", showWarnings = FALSE)
+  keep <- c("ATTRIBUTE_DatasetAccession","USI","file_path","scan_id","role","Cosine","Matching Peaks",
+            "Adduct","Precursor_MZ","inchikey_first_block","lib_spectrum","ChromatographyAndPhase",
+            "IonizationSourceAndPolarity","NCBITaxonomy","SampleType")
+  write.csv(hits[, keep], FASST_OUT, row.names = FALSE)
+  write.csv(data.frame(inchikey_first_block = compound_spec$inchikey_block1),
+            FASST_KEYS, row.names = FALSE)
+  write.csv(deposits, FASST_DEPS, row.names = FALSE)
+}
+```
+
+An extract cached before the search wrote each target's deposits gets them here,
+with the same queries, without being rebuilt.
+
+```{r deposits-per-target}
+if (file.exists(FASST_DB) && !file.exists(FASST_DEPS)) {
+  suppressPackageStartupMessages(library(RSQLite))
+  con <- dbConnect(SQLite(), FASST_DB)
+  write.csv(deposits_per_target(con, library_ids(con)), FASST_DEPS, row.names = FALSE)
+  dbDisconnect(con)
+}
+```
+
+```{r load-hits}
+all_hits <- read.csv(FASST_OUT, check.names = FALSE, stringsAsFactors = FALSE)
+for (j in seq_along(all_hits))
+  if (is.character(all_hits[[j]])) all_hits[[j]][is_missing_val(all_hits[[j]])] <- NA
+all_hits$scan_id <- as.integer(all_hits$scan_id)
+# The extract must be for the targets in compound.csv. One written before its list
+# of targets was kept is checked on the InChIKeys of its hits instead.
+keys <- if (file.exists(FASST_KEYS)) read.csv(FASST_KEYS)$inchikey_first_block else
+  all_hits$inchikey_first_block
+if (!same_targets(keys))
+  stop(FASST_OUT, " was queried for other targets than compound.csv lists; delete it ",
+       "and render again with the FASSTrecords database (FASST_DB) available")
+# Each hit takes its role from compound.csv, matched on the InChIKey.
+all_hits$role <- compound_spec$role[match(all_hits$inchikey_first_block,
+                                          compound_spec$inchikey_block1)]
+n_hits <- nrow(all_hits)
+cat("Total MASST hits loaded:", n_hits, "\n")
+print(table(factor(all_hits$role, compound_spec$role)))
+```
+
+# Library spectra of each target
+
+MASST reports, for each hit, the adduct and precursor m/z of the library
+spectrum it matched, not of the deposited spectrum. A library spectrum is kept
+only if its precursor m/z is a plausible ion of the target: the closest adduct
+among `r paste(ADDUCT_CANDIDATES, collapse = ", ")` within 25 ppm. That adduct,
+taken from the m/z rather than from the library label, is the one used from
+here on. A library spectrum that fits no adduct is set aside with all its hits,
+for example an isotope-labelled standard, which shares the target's InChIKey
+first block but not its mass.
+
+```{r library-spectra}
+libs <- unique(all_hits[, c("role", "lib_spectrum", "Adduct", "Precursor_MZ")])
+libs$adduct_inferred <- mapply(infer_adduct, libs$Precursor_MZ,
+                               role_formula[libs$role], USE.NAMES = FALSE)
+libs$hits <- as.vector(table(all_hits$lib_spectrum)[libs$lib_spectrum])
+
+# The library writes "[M+H]1+" where we write "[M+H]+".
+label <- sub("\\]1([+-])$", "]\\1", libs$Adduct)
+label <- sub("[M-H2O+H]", "[M+H-H2O]", label, fixed = TRUE)
+label <- sub("[M+NH3+H]", "[M+NH4]", label, fixed = TRUE)
+libs$status <- ifelse(is.na(libs$adduct_inferred), "set aside",
+               ifelse(label == libs$adduct_inferred, "label agrees",
+                      "label corrected"))
+
+all_hits$adduct_inferred <- libs$adduct_inferred[
+  match(all_hits$lib_spectrum, libs$lib_spectrum)]
+all_hits <- all_hits[!is.na(all_hits$adduct_inferred), ]
+```
+
+```{r library-spectra-summary}
+#| echo: false
+print(table(role = factor(libs$role, compound_spec$role), status = libs$status))
+cat("\nHits set aside:", sum(libs$hits[libs$status == "set aside"]),
+    "| hits with a corrected label:",
+    sum(libs$hits[libs$status == "label corrected"]), "\n")
+libs[libs$status != "label agrees", ]
+```
+
+`r sum(libs$status == "label corrected")` GNPS library spectra of tryptophan,
+`r paste(libs$lib_spectrum[libs$status == "label corrected"], collapse = " and ")`,
+are labelled [M+H]+, but their precursor m/z,
+`r paste(unique(sprintf("%.3f", libs$Precursor_MZ[libs$status == "label corrected"])), collapse = " and ")`,
+is that of
+`r paste(unique(libs$adduct_inferred[libs$status == "label corrected"]), collapse = " and ")`.
+Their matches lie in
+`r length(unique(all_hits$ATTRIBUTE_DatasetAccession[all_hits$lib_spectrum %in% libs$lib_spectrum[libs$status == "label corrected"]]))`
+deposits, and they now carry that ion. The `r sum(libs$status == "set aside")` library spectra set aside
+(listed above) are a tryptophan spectrum whose precursor m/z is too far from [M+H]+,
+which carries most of their hits, spectra of the dimers, spectra of the labelled
+standard tryptophan-d5, spectra recorded at nominal mass, and one spectrum at an
+unrelated mass.
+
+# Deposits carrying every target
+
+A deposit that carries only some of the targets cannot be used, so it is
+dropped here.
+
+```{r d-every}
+D_by_role <- lapply(stats::setNames(compound_spec$role, compound_spec$role), function(r)
+  unique(all_hits$ATTRIBUTE_DatasetAccession[all_hits$role == r]))
+D_every   <- Reduce(intersect, D_by_role)
+if (!length(D_every))
+  stop("No deposit carries every target once the library spectra are checked ",
+       "(deposits per target: ",
+       paste(names(D_by_role), lengths(D_by_role), collapse = ", "), ")")
+all_hits  <- all_hits[all_hits$ATTRIBUTE_DatasetAccession %in% D_every, ]
+cat(paste(names(D_by_role), "deposits:", lengths(D_by_role), collapse = " | "),
+    "| intersection:", length(D_every), "\n")
+```
+
+```{r write-hits}
+write.csv(all_hits, "artifacts/hits_search.csv", row.names = FALSE)
+```
+
+# Step summary
+
+The search returned `r format(n_hits, big.mark = ",")` hits, matching
+`r knitr::combine_words(paste(table(factor(libs$role, compound_spec$role)), c("library spectra of the", rep("of the", nrow(compound_spec) - 1)), compound_spec$role))`.
+Library spectra set aside: `r sum(libs$status == "set aside")`, with
+`r format(sum(libs$hits[libs$status == "set aside"]), big.mark = ",")` hits. Library
+spectra whose label was corrected: `r sum(libs$status == "label corrected")`, with
+`r format(sum(libs$hits[libs$status == "label corrected"]), big.mark = ",")` hits.
+
+The chapter's table counts deposits only, one unit per table.
+
+```{r step-summary}
+# Deposits with a hit, of any target: over the whole archive from FASST_DEPS,
+# else only those the cached extract was queried for.
+n_with_hit <- if (file.exists(FASST_DEPS))
+  length(unique(read.csv(FASST_DEPS)$deposit)) else length(Reduce(union, D_by_role))
+summary_step <- data.frame(
+  item  = c("deposits with a hit",
+            paste("deposits with", targets_phrase(nrow(compound_spec)))),
+  value = c(n_with_hit,
+            length(D_every)))
+# For the discussion's recap only (collect-tables.R keeps "recap:" items out of the
+# step table): the files with a hit, all in the deposits that carry every target.
+summary_step <- rbind(summary_step, data.frame(
+  item  = "recap: files",
+  value = length(unique(paste(all_hits$ATTRIBUTE_DatasetAccession,
+                              basename(all_hits$file_path))))))
+write.csv(summary_step, "artifacts/summary_step1.csv", row.names = FALSE)
+summary_step
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

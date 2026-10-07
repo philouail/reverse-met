@@ -1,0 +1,720 @@
+---
+title: "MASST Hit Confirmation: RuSirius"
+subtitle: "Per-deposit SIRIUS annotation of curated MASST hits (MassIVE)"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+This document takes the curated MASST hit table produced by
+`03-curation.qmd` (DIA deposits and deposits without metadata already
+removed) and runs SIRIUS annotation for every remaining MassIVE deposit.
+
+For each deposit, each target (one row of `compound.csv`, named by its `role`)
+is annotated in its own directory under `sirius_projects/`, in one SIRIUS
+project per batch of features (see `BATCH_SIZE` under *Helper functions*), and
+its results are gathered in one CSV under `results/`:
+
+```
+sirius_projects/
+  <dataset_id>/
+    <role>/                 e.g. parent/
+results/
+  <dataset_id>/
+    <role>_results.csv      e.g. parent_results.csv
+```
+
+Results are written to disk for manual review. A target that already has its
+results is not annotated again: adding a target to `compound.csv` sends only the
+new one to SIRIUS.
+
+# Setup
+
+```{r}
+#| include: false
+# This notebook lives in confirmation/; root.dir ".." makes its paths resolve
+# from application/<name>/.
+knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r setup}
+library(Spectra)
+library(MsBackendMassIVE)
+library(MetaboCoreUtils)
+library(RuSirius)
+library(dplyr)
+library(tidyr)
+# load_metadata(): the harmonised per-file metadata built in 02. Needed to label
+# each hit with its biofluid, which the optional cap (CONFIRM_CAP) stratifies on.
+source("../../R/metadata.R")
+```
+
+# Load curated hits
+
+`artifacts/hits_curated.csv` is written by `03-curation.qmd` after the DIA
+and no-metadata filters have been applied.
+
+```{r load-hits}
+hits_curated <- read.csv("artifacts/hits_curated.csv", check.names = FALSE)
+```
+
+# Filter to MassIVE deposits
+
+```{r filter-massive}
+hits_massive <- hits_curated[
+  startsWith(hits_curated$ATTRIBUTE_DatasetAccession, "MSV"), ]
+
+massive_datasets <- unique(hits_massive$ATTRIBUTE_DatasetAccession)
+# CONFIRM_ONLY="MSV000082493,MSV000084008" runs SIRIUS on those deposits only (empty: all);
+# the combined table written at the end still holds every deposit under results/.
+.only <- trimws(unlist(strsplit(Sys.getenv("CONFIRM_ONLY", ""), ",")))
+.only <- .only[nzchar(.only)]
+if (length(.only)) {
+  massive_datasets <- intersect(massive_datasets, .only)
+  cat("CONFIRM_ONLY set: restricted to", paste(massive_datasets, collapse = ", "), "\n")
+}
+cat(length(massive_datasets), "MassIVE datasets to process\n")
+```
+
+# Helper functions
+
+```{r helpers}
+# compound_spec comes from R/masst.R; the adduct of each hit was set in step 1.
+source("../../R/masst.R")
+PPM <- 25
+RT_TOL <- 3
+
+# Cap on the hits sent to SIRIUS per (role x biofluid); off by default (CONFIRM_CAP=Inf).
+# Per biofluid, because a top-N by cosine favours one matrix and leaves others unanchored.
+CAP_PER_ROLE_BIOFLUID <- {
+  .v <- Sys.getenv("CONFIRM_CAP", "Inf")
+  if (identical(tolower(.v), "inf")) Inf else as.numeric(.v)
+}
+
+# Biofluid of each hit, from the harmonised metadata built in 02 (body_site, never the
+# file name); a file without one falls in its own "unknown" stratum.
+hit_biofluid <- function(hits_ds, ds) {
+  meta <- tryCatch(load_metadata(ds), error = function(e) {
+    # A repository that does not answer stops the render (is_network_error()).
+    if (is_network_error(e)) stop(e)
+    NULL
+  })
+  if (is.null(meta) || !"body_site" %in% names(meta))
+    return(rep("unknown", nrow(hits_ds)))
+  key <- basename(as.character(meta$file))
+  bs  <- as.character(meta$body_site)
+  out <- bs[match(basename(as.character(hits_ds$file_path)), key)]
+  ifelse(is.na(out) | !nzchar(out), "unknown", out)
+}
+
+slice_role <- function(hits_ds, sp, sp_file, sp_scan, role) {
+  role_formula <- compound_spec$formula[compound_spec$role == role]
+  h <- hits_ds[hits_ds$role == role & !is.na(hits_ds$rt), ]
+  if (!nrow(h)) {
+    return(list())
+  }
+
+  # Subset the deposit's spectra once per file, not once per feature.
+  sp_by_file <- stats::setNames(
+    lapply(unique(h$file), function(f) sp[sp_file == f]), unique(h$file))
+
+  lapply(seq_len(nrow(h)), function(i) {
+    hi <- h[i, ]
+    mz_rng <- hi$Precursor_MZ * c(1 - PPM * 1e-6, 1 + PPM * 1e-6)
+    rt_rng <- hi$rt + c(-RT_TOL, RT_TOL)
+
+    sp_f <- filterRt(sp_by_file[[hi$file]], rt_rng)
+    ms1 <- filterMsLevel(sp_f, 1L)
+    ms2 <- filterPrecursorMzRange(filterMsLevel(sp_f, 2L), mz_rng)
+    # Drop MS2 scans with no peaks: they carry nothing and crash RuSirius at import.
+    ms2 <- ms2[lengths(ms2) > 0]
+
+    int_at_mz <- vapply(
+      peaksData(ms1),
+      function(pm) {
+        keep <- pm[, "mz"] >= mz_rng[1] & pm[, "mz"] <= mz_rng[2]
+        if (any(keep)) max(pm[keep, "intensity"]) else 0
+      },
+      numeric(1)
+    )
+    ms1_top <- if (length(ms1) && max(int_at_mz) > 0) {
+      ms1[which.max(int_at_mz)]
+    } else {
+      ms1[integer(0)]
+    }
+
+    out <- c(ms1_top, ms2)
+    out$adduct <- rep(hi$adduct_inferred, length(out))
+    out$group_idx <- rep(i, length(out))
+    out
+  })
+}
+
+# Each role runs in batches of CONFIRM_BATCH features (100 unless set, Inf for one piece),
+# each checkpointed so a restart never redoes a finished batch; the results do not change.
+BATCH_SIZE <- {
+  .v <- Sys.getenv("CONFIRM_BATCH", "100")
+  if (identical(tolower(.v), "inf")) Inf else as.numeric(.v)
+}
+
+# The wall time of each SIRIUS run, downloads excluded, for artifacts/sirius_times.csv.
+timed_sirius <- function(sp_slices, adduct_list, project_path, study_id) {
+  t0  <- Sys.time()
+  res <- run_sirius_once(sp_slices, adduct_list, project_path, study_id)
+  f   <- "artifacts/sirius_times.csv"
+  row <- data.frame(date = format(t0, "%Y-%m-%d %H:%M"), run = project_path,
+                    features = length(sp_slices),
+                    seconds = round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1))
+  write.table(row, f, sep = ",", row.names = FALSE, col.names = !file.exists(f),
+              append = file.exists(f))
+  res
+}
+
+run_sirius_role <- function(sp_slices, adduct_list, project_path, study_id) {
+  if (!is.finite(BATCH_SIZE))
+    return(timed_sirius(sp_slices, adduct_list, project_path, study_id))
+  n <- length(sp_slices)
+  if (!n) return(data.frame())
+  starts <- seq(1, n, by = BATCH_SIZE)
+  ids_in <- function(idx)
+    as.character(unique(unlist(lapply(sp_slices[idx], function(s) s$group_idx))))
+  dir.create(project_path, recursive = TRUE, showWarnings = FALSE)
+  parts <- vector("list", length(starts))
+  for (b in seq_along(starts)) {
+    idx  <- starts[b]:min(starts[b] + BATCH_SIZE - 1, n)
+    ckpt <- file.path(project_path, sprintf("batch%03d_results.csv", b))
+    if (file.exists(ckpt)) {
+      prev <- tryCatch(read.csv(ckpt, colClasses = "character"),
+                       error = function(e) data.frame())
+      # Reused only if every feature in it belongs to this batch; a checkpoint
+      # from a differently cut run is recomputed rather than trusted.
+      if (!nrow(prev) || all(prev$xcms_fts %in% ids_in(idx))) {
+        message("  ", study_id, " batch ", b, "/", length(starts), ": checkpoint reused")
+        parts[[b]] <- prev
+        next
+      }
+    }
+    message("  ", study_id, " batch ", b, "/", length(starts),
+            ": features ", min(idx), "-", max(idx))
+    # The batch's project directory must exist before Sirius() opens it, or import() fails
+    # later with an unrelated error.
+    bdir <- file.path(project_path, sprintf("batch%03d", b))
+    dir.create(bdir, recursive = TRUE, showWarnings = FALSE)
+    res_b <- timed_sirius(sp_slices[idx], adduct_list[idx], bdir,
+                             sprintf("%s_b%03d", study_id, b))
+    write.csv(res_b, ckpt, row.names = FALSE)
+    parts[[b]] <- tryCatch(read.csv(ckpt, colClasses = "character"),
+                           error = function(e) data.frame())
+  }
+  parts <- parts[vapply(parts, nrow, integer(1)) > 0]
+  if (!length(parts)) return(data.frame())
+  dplyr::bind_rows(parts)
+}
+
+run_sirius_once <- function(sp_slices, adduct_list, project_path, study_id) {
+  nonempty    <- vapply(sp_slices, length, integer(1)) > 0
+  n_dropped   <- sum(!nonempty)
+  sp_slices   <- sp_slices[nonempty]
+  adduct_list <- adduct_list[nonempty]
+  if (n_dropped > 0)
+    message("  Dropped ", n_dropped,
+            " empty slice(s): MassIVE index out of sync with file content")
+  # A feature with no MS2 left cannot be annotated (RuSirius would import it at mass 0),
+  # so it is not sent.
+  has_ms2     <- vapply(sp_slices, function(s) any(msLevel(s) >= 2L), logical(1))
+  if (any(!has_ms2))
+    message("  ", sum(!has_ms2), " feature(s) without MS2 not sent to SIRIUS")
+  sp_slices   <- sp_slices[has_ms2]
+  adduct_list <- adduct_list[has_ms2]
+  if (!length(sp_slices)) return(data.frame())
+
+  # No credentials are passed: SIRIUS uses the GUI's cached login, which a failed Login()
+  # would wipe. Wait a little for the login, and stop if it does not come.
+  srs <- Sirius(projectId = study_id, path = paste0(getwd(), "/", project_path))
+  logged_in <- FALSE
+  for (i in 1:6) {
+    logged_in <- isTRUE(tryCatch(srs@api$login_and_account_api$IsLoggedIn(),
+                                 error = function(e) FALSE))
+    if (logged_in) break
+    Sys.sleep(10)
+  }
+  if (!logged_in) {
+    shutdown(srs)
+    stop("SIRIUS is not logged in: log in through the SIRIUS GUI, then render again.")
+  }
+
+  pol   <- ifelse(endsWith(trimws(unlist(adduct_list)), "+"), "pos", "neg")
+  first <- TRUE
+  for (p in unique(pol)) {
+    idx  <- which(pol == p)
+    sp_p <- concatenateSpectra(sp_slices[idx])
+    srs  <- import(
+      sirius = srs,
+      spectra = sp_p,
+      adduct = adduct_list[idx],
+      ms_column_name = "group_idx",
+      deleteExistingFeatures = first
+    )
+    first <- FALSE
+  }
+  run(
+    srs,
+    formulaIdParams = formulaIdParam(),
+    structureDbSearchParams = structureDbSearchParam(
+      structureSearchDbs = "ALL"
+    ),
+    predictParams = predictParam(),
+    wait = TRUE
+  )
+  res <- results(
+    srs,
+    result.type = "structureDb",
+    return.type = "data.frame",
+    topFormula = 15,
+    topStructure = 15
+  )
+  shutdown(srs)
+  res
+}
+```
+
+# Per-deposit SIRIUS annotation
+
+```{r per-dataset-loop}
+hits_rt_list <- list()
+
+
+for (ds in massive_datasets) {
+  message("\n--- Processing ", ds, " ---")
+  hits_ds <- hits_massive[hits_massive$ATTRIBUTE_DatasetAccession == ds, ]
+
+  dir_res       <- file.path("results", ds)
+  roles_present <- unique(hits_ds$role)
+  expected_csv  <- file.path(dir_res, paste0(roles_present, "_results.csv"))
+  sirius_done   <- length(expected_csv) && all(file.exists(expected_csv))
+  rt_path       <- file.path(dir_res, "hits_rt.csv")
+  rt_done       <- file.exists(rt_path) &&
+                   all(c("mz", "adduct_inferred", "source_file", "assay") %in%
+                       names(read.csv(rt_path, nrows = 1, check.names = FALSE)))
+
+  if (sirius_done && rt_done) {
+    message("  Already analyzed, skipping")
+    next
+  }
+  if (sirius_done) message("  SIRIUS results found, rerunning RT mapping only")
+
+  # Cap per (role x biofluid), top cosine first; see CAP_PER_ROLE_BIOFLUID.
+  if (nrow(hits_ds) && is.finite(CAP_PER_ROLE_BIOFLUID)) {
+    hits_ds$biofluid <- hit_biofluid(hits_ds, ds)
+    before <- table(hits_ds$role, hits_ds$biofluid)
+    hits_ds <- do.call(rbind, lapply(
+      split(hits_ds, list(hits_ds$role, hits_ds$biofluid), drop = TRUE),
+      function(d) if (nrow(d) <= CAP_PER_ROLE_BIOFLUID) d
+                  else d[order(-d$Cosine)[seq_len(CAP_PER_ROLE_BIOFLUID)], ]))
+    after <- table(hits_ds$role, hits_ds$biofluid)
+    message("  Hits per role x biofluid before cap:")
+    for (r in rownames(before))
+      message("    ", r, ": ", paste(sprintf("%s=%d", colnames(before), before[r, ]),
+                                     collapse = "  "))
+    message("  Sent to SIRIUS after per-biofluid cap (", CAP_PER_ROLE_BIOFLUID, "/stratum):")
+    for (r in rownames(after))
+      message("    ", r, ": ", paste(sprintf("%s=%d", colnames(after), after[r, ]),
+                                     collapse = "  "))
+  }
+
+  for (r in compound_spec$role)
+    dir.create(file.path("sirius_projects", ds, r), recursive = TRUE,
+               showWarnings = FALSE)
+  dir.create(dir_res, recursive = TRUE, showWarnings = FALSE)
+
+  wanted <- unique(basename(hits_ds$file_path))
+  massive_sync_data_files(ds, fileName = wanted)
+  sp       <- Spectra(backendInitialize(MsBackendMassIVE(), massiveId = ds,
+                                        offline = TRUE))
+  sp_file  <- basename(dataOrigin(sp))
+  # The MsBackend prefixes cached file names (<deposit/zip>_<name>); map them back to the
+  # bare names in `wanted`, the names hits_ds$file uses.
+  .u   <- unique(sp_file)
+  .map <- setNames(vapply(.u, function(f) {
+    hit <- wanted[f == wanted | endsWith(f, paste0("_", wanted))]
+    if (length(hit)) hit[which.max(nchar(hit))] else f
+  }, character(1)), .u)
+  sp_file  <- unname(.map[sp_file])
+  sp_scan  <- acquisitionNum(sp)
+
+  hits_ds$file    <- basename(hits_ds$file_path)
+  hit_idx         <- match(
+    paste(hits_ds$file, hits_ds$scan_id, sep = "::"),
+    paste(sp_file,      sp_scan,          sep = "::")
+  )
+  hits_ds$rt <- rtime(sp)[hit_idx]
+  hits_ds$mz <- precursorMz(sp)[hit_idx]
+  # Provenance: the cached file (study-ID-prefixed) each rt was read from, so a hit
+  # resolved against another deposit's data shows its prefix.
+  hits_ds$origin <- basename(dataOrigin(sp))[hit_idx]
+
+  ppm_err  <- abs(hits_ds$mz - hits_ds$Precursor_MZ) / hits_ds$Precursor_MZ * 1e6
+  mismatch <- is.na(hit_idx) | is.na(hits_ds$mz) | (!is.na(ppm_err) & ppm_err > PPM)
+  hits_ds$scan_verified <- ifelse(mismatch, "mismatch", "ok")
+
+  if (any(mismatch)) {
+    message("  ", sum(mismatch), " hit(s) with scan_id/precursorMz mismatch, ",
+            "attempting mz fallback")
+    for (j in which(mismatch)) {
+      hi_j   <- hits_ds[j, ]
+      sp_j   <- sp[sp_file == hi_j$file]
+      pmz_j  <- precursorMz(sp_j)
+      pint_j <- precursorIntensity(sp_j)
+      cands  <- which(!is.na(pmz_j) &
+                      abs(pmz_j - hi_j$Precursor_MZ) /
+                        hi_j$Precursor_MZ * 1e6 < PPM)
+      if (!length(cands)) {
+        hits_ds$rt[j]            <- NA_real_
+        hits_ds$mz[j]            <- NA_real_
+        hits_ds$scan_verified[j] <- "mz_not_found"
+        message("    row ", j, ": no scan with matching mz, skipping")
+      } else {
+        # Anchor on the most intense precursor, at the peak's apex; every candidate would
+        # stretch the RT window with the peak's tails.
+        best <- cands[which.max(pint_j[cands])]
+        hits_ds$rt[j]            <- rtime(sp_j)[best]
+        hits_ds$mz[j]            <- pmz_j[best]
+        hits_ds$origin[j]        <- basename(dataOrigin(sp_j))[best]
+        hits_ds$scan_verified[j] <- if (length(cands) == 1) "mz_fallback"
+                                    else                    "mz_fallback_apex"
+        message("    row ", j, ": ", length(cands),
+                " cand(s), picked apex at rt = ",
+                round(rtime(sp_j)[best], 1), "s")
+      }
+    }
+  }
+
+  # Keep one row per distinct scan: many library spectra match one scan and the copies get
+  # the same annotation. Precursor_MZ is the library's, so it is left out of the key.
+  ok <- !is.na(hits_ds$rt)
+  if (any(ok)) {
+    dup <- duplicated(hits_ds[ok, c("role", "file", "origin", "rt", "mz",
+                                    "adduct_inferred", "assay")])
+    if (any(dup)) {
+      message("  ", sum(dup), " duplicate row(s) collapsed; ",
+              sum(ok) - sum(dup), " distinct scan(s) go to SIRIUS")
+      hits_ds <- hits_ds[-which(ok)[dup], ]
+    }
+  }
+
+  rt_valid <- hits_ds[!is.na(hits_ds$rt),
+                      c("role", "rt", "mz", "adduct_inferred", "origin", "assay")]
+  # source_file keeps the study-ID prefix of the file the rt came from (provenance).
+  names(rt_valid)[names(rt_valid) == "origin"] <- "source_file"
+  rt_valid$xcms_fts <- ave(seq_len(nrow(rt_valid)), rt_valid$role,
+                           FUN = seq_along)
+  # Stored SIRIUS results are numbered by this table's rows: stop if those rows changed
+  # (fewer, other or reordered scans) rather than attach results to the wrong spectra.
+  rt_old <- if (rt_done) read.csv(rt_path, check.names = FALSE)
+  for (r in compound_spec$role) {
+    res_csv <- file.path(dir_res, paste0(r, "_results.csv"))
+    if (!file.exists(res_csv)) next
+    res_ids <- read.csv(res_csv)$xcms_fts
+    new_r   <- rt_valid[rt_valid$role == r, ]
+    same    <- all(res_ids %in% new_r$xcms_fts)
+    if (same && rt_done) {
+      old_r <- rt_old[rt_old$role == r, ]
+      same  <- isTRUE(all.equal(c(old_r$rt, old_r$mz), c(new_r$rt, new_r$mz)))
+    }
+    if (!same)
+      stop(ds, ": hits_rt no longer matches the SIRIUS results in ", dir_res,
+           "; move them aside to recompute")
+  }
+  hits_rt_list[[ds]] <- rt_valid[, c("role", "xcms_fts", "rt", "mz",
+                                     "adduct_inferred", "source_file", "assay")]
+  write.csv(hits_rt_list[[ds]], file.path(dir_res, "hits_rt.csv"),
+            row.names = FALSE)
+
+  # One SIRIUS run per target, in compound.csv order, into results/<id>/<role>_results.csv;
+  # a target that has its results keeps them.
+  if (!sirius_done) for (r in compound_spec$role) {
+    res_csv <- file.path(dir_res, paste0(r, "_results.csv"))
+    if (file.exists(res_csv)) next
+    sp_r <- slice_role(hits_ds, sp, sp_file, sp_scan, r)
+    if (!length(sp_r)) {
+      message("  No ", r, " spectra, skipping ", r, " SIRIUS run")
+      next
+    }
+    adduct_list_r <- lapply(sp_r, function(s) s$adduct[1])
+    res_r <- run_sirius_role(sp_r, adduct_list_r,
+                             file.path("sirius_projects", ds, r), study_id = r)
+    write.csv(res_r, res_csv, row.names = FALSE)
+    message("  ", toupper(substring(r, 1, 1)), substring(r, 2), " done: ",
+            nrow(res_r), " rows written")
+  }
+}
+
+message("All datasets processed.")
+```
+
+# Evaluate SIRIUS matches
+
+## Helper functions
+
+Each SIRIUS feature is assigned a **confidence level** based on where the target
+formula and structure rank in the SIRIUS output.
+
+```{r tier-ranks}
+# The highest formula rank and structure rank each confidence tier accepts.
+TIER_RANKS <- rbind(strict   = c(formula = 1,  structure = 1),
+                    standard = c(formula = 3,  structure = 5),
+                    liberal  = c(formula = 15, structure = 15))
+```
+
+| Confidence | Formula rank | Structure rank |
+|------------|-------------|----------------|
+| strict     | `r TIER_RANKS["strict", "formula"]` | `r TIER_RANKS["strict", "structure"]` |
+| standard   | ≤ `r TIER_RANKS["standard", "formula"]` | ≤ `r TIER_RANKS["standard", "structure"]` |
+| liberal    | ≤ `r TIER_RANKS["liberal", "formula"]` | ≤ `r TIER_RANKS["liberal", "structure"]` |
+| not_confirmed | target formula absent or ranks beyond liberal thresholds | |
+
+```{r resolve-helpers}
+library(dplyr)
+library(ggplot2)
+
+# Is a feature within a tier's rank limits (TIER_RANKS)?
+in_tier <- function(formula_rank, structure_rank, tier)
+  formula_rank   <= TIER_RANKS[tier, "formula"] &
+  structure_rank <= TIER_RANKS[tier, "structure"]
+
+CONFIDENCE_LEVELS <- c("strict", "standard", "liberal", "not_confirmed")
+CONFIDENCE_COLOURS <- c(
+  strict      = "#1A7837",
+  standard    = "#74C476",
+  liberal     = "#FEC44F",
+  not_confirmed = "#D7191C"
+)
+
+#' Resolve target features in one SIRIUS results table (one dataset, one role)
+resolve_features <- function(res,
+                             target_formula,
+                             target_ikey_prefix) {
+
+  target_rows <- res |>
+    filter(molecularFormula == target_formula,
+           !is.na(inchiKey),
+           startsWith(inchiKey, target_ikey_prefix)) |>
+    group_by(xcms_fts) |>
+    slice_min(rank.y, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    transmute(
+      xcms_fts,
+      formula_rank   = rank.x,
+      formula_score  = round(siriusScoreNormalized, 3),
+      structure_rank = rank.y,
+      tanimoto       = round(tanimotoSimilarity, 3),
+      csi_score      = round(csiScore, 1),
+      adduct,
+      structure_name = structureName,
+      target_present = TRUE
+    )
+
+  res |>
+    distinct(xcms_fts) |>
+    left_join(target_rows, by = "xcms_fts") |>
+    mutate(
+      target_present = !is.na(formula_rank),
+      confidence = case_when(
+        in_tier(formula_rank, structure_rank, "strict")   ~ "strict",
+        in_tier(formula_rank, structure_rank, "standard") ~ "standard",
+        in_tier(formula_rank, structure_rank, "liberal")  ~ "liberal",
+        TRUE                                              ~ "not_confirmed"
+      ),
+      confidence = factor(confidence, levels = CONFIDENCE_LEVELS)
+    ) |>
+    arrange(confidence, formula_rank, structure_rank)
+}
+
+#' Run resolve_features across all (dataset, role) result CSVs
+resolve_all <- function(results_dir = "results", compound_spec) {
+
+  datasets <- list.dirs(results_dir, recursive = FALSE, full.names = FALSE)
+  datasets <- datasets[startsWith(datasets, "MSV")]
+  all_rows <- list()
+
+  for (ds in datasets) {
+    for (i in seq_len(nrow(compound_spec))) {
+      role     <- compound_spec$role[i]
+      csv_path <- file.path(results_dir, ds, paste0(role, "_results.csv"))
+      if (!file.exists(csv_path)) next
+      res <- read.csv(csv_path, check.names = FALSE)
+      if (!nrow(res)) next
+
+      resolve_features(
+        res,
+        target_formula     = compound_spec$formula[i],
+        target_ikey_prefix = compound_spec$inchikey_block1[i]
+      ) |>
+        mutate(dataset_id = ds, role = role, .before = xcms_fts) ->
+        all_rows[[paste(ds, role, sep = "::")]]
+    }
+  }
+
+  features <- bind_rows(all_rows)
+
+  summary_tbl <- features |>
+    group_by(dataset_id, role) |>
+    summarise(
+      n_total          = n(),
+      n_target_present = sum(target_present, na.rm = TRUE),
+      n_strict         = sum(confidence == "strict",      na.rm = TRUE),
+      n_standard       = sum(confidence == "standard",    na.rm = TRUE),
+      n_liberal        = sum(confidence == "liberal",     na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  list(features = features, summary = summary_tbl)
+}
+```
+
+## Run evaluation
+
+```{r resolve-run}
+resolved    <- resolve_all(results_dir = "results", compound_spec = compound_spec)
+features    <- resolved$features
+summary_tbl <- resolved$summary
+summary_tbl
+```
+
+## Plots
+
+### Confidence levels per deposit and role
+
+```{r plot-confidence, fig.width=9, fig.height=4}
+features |>
+  count(dataset_id, role, confidence) |>
+  ggplot(aes(x = dataset_id, y = n, fill = confidence)) +
+  geom_col() +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5),
+            size = 3, colour = "white", fontface = "bold") +
+  facet_wrap(~role) +
+  scale_fill_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  labs(x = NULL, y = "Number of features", fill = "Confidence",
+       title = "SIRIUS confirmation confidence per dataset") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+```
+
+### Formula and structure rank coloured by confidence
+
+```{r plot-ranks, fig.width=6, fig.height=5}
+features |>
+  filter(target_present) |>
+  ggplot(aes(x = formula_rank, y = structure_rank,
+             colour = confidence, shape = role)) +
+  annotate("rect", xmin = 0.5, xmax = 1.5, ymin = 0.5, ymax = 1.5,
+           fill = "#1A7837", alpha = 0.08) +
+  annotate("rect", xmin = 0.5, xmax = 3.5, ymin = 0.5, ymax = 5.5,
+           fill = "#74C476", alpha = 0.06) +
+  annotate("rect", xmin = 0.5, xmax = 6, ymin = 0.5, ymax = 5,
+           fill = "#FEC44F", alpha = 0.04) +
+  geom_jitter(size = 3, width = 0.2, height = 0.2, alpha = 0.9) +
+  scale_colour_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  scale_x_continuous(breaks = c(1, 3, 5)) +
+  scale_y_continuous(breaks = c(1, 5)) +
+  labs(x = "Formula rank", y = "Structure rank",
+       colour = "Confidence", shape = "Role",
+       title = "Rank of target among confirmed features") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+### Score scatter coloured by confidence
+
+```{r plot-scores, fig.width=7, fig.height=4}
+features |>
+  filter(target_present) |>
+  ggplot(aes(x = tanimoto, y = formula_score,
+             colour = confidence, shape = role)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  labs(x = "Tanimoto similarity", y = "Normalised formula score",
+       colour = "Confidence", shape = "Role",
+       title = "Score distribution (target-present features)") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+
+# RT summary
+
+## Join retention times
+
+```{r rt-join}
+# Load hits_rt.csv for every resolved deposit the loop above skipped, or the join
+# below leaves their source_file, rt and mz NA and 05 cannot anchor them.
+missing <- setdiff(unique(features$dataset_id), names(hits_rt_list))
+for (ds in missing) {
+  p <- file.path("results", ds, "hits_rt.csv")
+  if (file.exists(p)) hits_rt_list[[ds]] <- read.csv(p, check.names = FALSE)
+}
+
+rt_tbl   <- bind_rows(hits_rt_list, .id = "dataset_id")
+features <- features |>
+  left_join(rt_tbl, by = c("dataset_id", "role", "xcms_fts"))
+```
+
+## RT range per deposit and role
+
+```{r rt-summary-table}
+rt_summary <- features |>
+  filter(!is.na(rt)) |>
+  group_by(dataset_id, role, confidence) |>
+  summarise(
+    n         = n(),
+    rt_min    = round(min(rt), 1),
+    rt_median = round(median(rt), 1),
+    rt_max    = round(max(rt), 1),
+    rt_range  = round(max(rt) - min(rt), 1),
+    .groups   = "drop"
+  )
+rt_summary
+```
+
+## RT distribution across deposits
+
+```{r rt-plot, fig.width=9, fig.height=4}
+features |>
+  filter(!is.na(rt)) |>
+  ggplot(aes(x = dataset_id, y = rt,
+             colour = confidence, shape = role)) +
+  geom_jitter(size = 3, width = 0.15, alpha = 0.85) +
+  facet_wrap(~role) +
+  scale_colour_manual(values = CONFIDENCE_COLOURS, drop = FALSE) +
+  labs(x = NULL, y = "Retention time (s)",
+       colour = "Confidence", shape = "Role",
+       title = "RT of confirmed features across MassIVE datasets (s)") +
+  theme_bw() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+```
+
+# Write confirmed hits
+
+Hits with `strict`, `standard`, or `liberal` SIRIUS confidence are kept as
+MassIVE-confirmed; the `confidence` and `rt` (seconds) columns are preserved for
+downstream stratification and RT-window alignment.
+
+```{r write-confirmed}
+hits_confirmed_massive <- features |>
+  filter(confidence %in% c("strict", "standard", "liberal"))
+
+write.csv(hits_confirmed_massive, "artifacts/hits-confirmed-massive.csv",
+          row.names = FALSE)
+```
+
+

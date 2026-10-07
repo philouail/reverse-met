@@ -1,0 +1,7 @@
+"dataset","role","file","apex_rt","reason"
+"ST002044_AN003326","metabolite","ST002044_rawdata_D141_NEG.mzML",158.2,"late run (tryptophan 17 s late too); apex 1.4 s past the window, its three strict MS2 spectra sit on it"
+"MSV000092757","parent","pos_inf_non_9011_male_52_193_G_A2.mzXML",85.1,"late run; the picker chose noise at 65 s over the real peak"
+"MSV000092757","parent","pos_inf_non_9965_Male_42_267_R_B5.mzXML",80.7,"late run; the picked region swallowed the real peak"
+"MSV000092757","parent","pos_inf_prog_8582_female_53_192_B_H7.mzXML",82.8,"late run; apex 2.2 s past the window"
+"MSV000092757","parent","pos_inf_non_7275_female_44_192_B_A7.mzXML",70.4,"kept on noise at 62.9 s; the real peak is at 70.4 s"
+"MSV000092757","parent","pos_inf_non_8629_male_65_192_B_H9.mzXML",82.1,"kept on noise at 72.1 s; the real peak is at 82.1 s"

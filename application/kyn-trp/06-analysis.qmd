@@ -1,0 +1,1109 @@
+---
+title: "06 - Analysis"
+subtitle: "Step 6: tryptophan and kynurenine against age"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+Tryptophan is broken down to kynurenine by indoleamine 2,3-dioxygenase, an enzyme
+that inflammation induces, and the kynurenine to tryptophan ratio is the usual
+read-out of its activity. That activity rises with age. The hypothesis tested
+here, stated before any result, is therefore that **the kynurenine to tryptophan
+ratio rises with age**.
+
+The test is one model per matrix: the log2 ratio against age in adult plasma, and
+the same in adult serum. Each model pools the assays of its matrix with a term for
+each assay, so that each assay keeps its own level and the slope is read within
+assays. Sex and health status enter both models. Plasma and serum are kept apart
+because the ratio need not sit at the same level in both, and because a person
+sampled in both would count twice in one model over both. Each model is fitted
+once more on its healthy units alone. The notebook then asks which assays show
+the rise on their own. Before any of this, where several assays measured the same
+samples, only one of them is kept.
+
+**Input:** `artifacts/sample_table_perfile.csv` (step 5, one row per file with
+each target's detection and peak area), `artifacts/bio_files_per_ds.rds` and
+`artifacts/bio_meta_per_ds.rds` (step 5, the extracted files and whether a
+metadata source covers each), `artifacts/datasets-confirmed.csv` and
+`artifacts/hits-confirmed-all.csv` (step 4), and `artifacts/related_deposits.csv`
+(step 2).
+
+**Output:** `artifacts/assay_choice.csv`, the assay kept from each set of
+samples; `artifacts/ratio_covariate_pooled.csv` and
+`artifacts/ratio_covariate_per_assay.csv`, the fits of each matrix and of each
+assay alone in each matrix; `artifacts/summary_step6.csv`;
+`figures/ratio_vs_age_by_matrix.png`, one row per matrix; and
+`figures/ratio_vs_age_healthy.png` (and `.pdf`), the healthy units alone; and
+`figures/loo_assay_by_matrix.png` (and `.pdf`), each matrix's model without each of
+its assays in turn.
+
+```{r setup}
+#| warning: false
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
+source("../../R/metadata.R")   # norm_file_key(), as_num(), short_ds()
+source("../../R/analysis.R")   # the step 6 helpers
+
+MATRICES      <- c("plasma", "serum")   # blood, one model each
+ADULT_MIN_AGE <- 18
+# A model is fitted (a matrix, its healthy units, or one assay alone) when it has
+# this many units over this many years of age.
+MIN_UNITS <- 8
+MIN_SPAN  <- 10
+# Values that mean healthy, as a list: a pattern such as "healthy|control" also
+# matches QC. Chagas uninf_prog is left out: the deposit does not define it.
+HEALTHY <- c("healthy", "control", "healthy control", "uninfected", "uninf_non")
+# Health values that mark an injection, not a sample (the Chagas panel's QC,
+# blanks and standard mix). Such files come from no person and are left out.
+NOT_SAMPLE <- c("qc", "blank", "blank_tube", "6mix")
+# The three health levels, in the order of the tables.
+LEVELS <- c("healthy", "not healthy", "not recorded")
+
+# How the model terms read in tables and titles.
+TERM_NAMES <- c(agen = "age", sex2 = "sex", health = "health", study = "assay")
+
+# How a slope and a p-value read in the prose and the step summary.
+fmt   <- function(r) sprintf("%+.3f (%.3f to %.3f)", r$slope, r$lo, r$hi)
+fmt_p <- function(p) formatC(p, digits = 2, format = "fg", flag = "#")
+# A list for the text: "A", "A and B", "A, B and C".
+and_list <- function(x) if (length(x) < 3) paste(x, collapse = " and ") else
+  paste(paste(head(x, -1), collapse = ", "), "and", tail(x, 1))
+# Numbers in the displayed tables, to three significant digits.
+rounded <- function(d) { num <- vapply(d, is.double, TRUE); d[num] <- lapply(d[num], signif, 3); d }
+
+FIG_DIR <- "figures"; dir.create(FIG_DIR, showWarnings = FALSE)
+figp    <- function(f) file.path(FIG_DIR, f)
+```
+
+# Load the inputs
+
+```{r load}
+pf        <- read.csv("artifacts/sample_table_perfile.csv", stringsAsFactors = FALSE)
+datasets  <- read.csv("artifacts/datasets-confirmed.csv", stringsAsFactors = FALSE)
+related   <- read.csv("artifacts/related_deposits.csv", stringsAsFactors = FALSE)
+conf      <- read.csv("artifacts/hits-confirmed-all.csv", check.names = FALSE,
+                      stringsAsFactors = FALSE)
+bio_files <- readRDS("artifacts/bio_files_per_ds.rds")
+bio_meta  <- readRDS("artifacts/bio_meta_per_ds.rds")
+
+# Stops if step 5 has no file list for an assay of the per-file table: the two
+# come from different renders, and step 6 must wait for both.
+pf$has_metadata <- has_metadata(pf, bio_meta)
+
+# Assay labels: the accession, or the full assay id where an accession has several.
+lab <- function(x) short_ds(x, datasets$dataset_id)
+```
+
+# One assay per set of samples
+
+Some samples were measured more than once, by assays with different LC-MS set-ups.
+The assays of one Metabolomics Workbench deposit share their sample names, and
+step 2 declares the other sets (`related_deposits.csv`): the Chagas serum panel, run
+on a HILIC and on a reverse-phase column, and the plasma samples of MSV000082630,
+measured again on another instrument as MSV000086158. Counting each would count
+a subject more than once, so one assay of each set is kept: the one in which MS1
+detects both targets in the most files; on a tie, the one with more files in which
+MS2 confirms both; still tied, the first assay id. The files are counted as step 5
+counts them, over every extracted file, before the restriction to files with
+metadata.
+
+```{r keep-one}
+choice <- keep_one_assay(pf, datasets, related, conf, bio_files)
+write.csv(choice, "artifacts/assay_choice.csv", row.names = FALSE)
+
+# The sets with more than one assay, the kept one first.
+multi <- choice[choice$group %in% choice$group[duplicated(choice$group)], ]
+multi$chromatography <- datasets$chromatography[match(multi$dataset_id, datasets$dataset_id)]
+knitr::kable(data.frame(set = lab(multi$group), assay = lab(multi$dataset_id),
+                        column = multi$chromatography, files = multi$files,
+                        both_ms1 = multi$ms1_both, both_ms2 = multi$ms2_both,
+                        kept = multi$kept),
+             col.names = c("set", "assay", "chromatography", "files",
+                           "files with both targets (MS1)",
+                           "files with both targets (MS2)", "kept"),
+             caption = "Assays that measured the same samples")
+
+describe <- function(i) sprintf("%s (%s)", lab(multi$dataset_id[i]), multi$chromatography[i])
+kept_txt <- vapply(split(seq_len(nrow(multi)), factor(multi$group, unique(multi$group))), function(i)
+  sprintf("%s is kept over %s", describe(i[multi$kept[i]]),
+          and_list(describe(i[!multi$kept[i]]))), "")
+n_out <- sum(!choice$kept)
+n_in  <- sum(choice$kept)
+
+pf <- pf[pf$dataset_id %in% choice$dataset_id[choice$kept], ]
+```
+
+`r if (nrow(multi)) paste0(paste(kept_txt, collapse = "; "), ".") else "No two assays measured the same samples."`
+`r n_out` `r if (n_out == 1) "assay is" else "assays are"` set aside, and
+`r n_in` `r if (n_in == 1) "goes" else "go"` on to the analysis.
+
+# Analysis units
+
+Only files a metadata source covers are analysed. A file gives a ratio where both
+targets are detected with a peak area; a truncated peak is detected but has no
+area, so it gives none. The ratio is kynurenine over tryptophan, on a log2 scale.
+Files are then reduced to units: one per subject and matrix, so that a study
+sampling each person many times does not outweigh one sampling once. A unit's
+ratio is the median over its files that give one; its age, sex and health are
+the values its files record, whether or not a file gives a ratio, and are left
+missing where its files disagree. Where a file names no subject, that file is
+its own unit. A subject sampled in both
+plasma and serum therefore gives two units, one in each matrix, and each goes to
+the model of its own matrix. The models use
+adult blood units: plasma or serum, aged `r ADULT_MIN_AGE` or older.
+
+The deposits write health in their own words. Each value gets a level:
+healthy where it is one of the healthy words
+(`r and_list(sprintf('"%s"', HEALTHY))`), not recorded where it is missing or a
+placeholder such as "not collected", and not healthy for any other value, such
+as a disease name or "infected". The Chagas panel's "uninf_prog" is not among
+the healthy words: the deposit does not say what it means, so it is not taken
+as healthy. A value that marks a QC, blank or mix injection
+(`r and_list(sprintf('"%s"', NOT_SAMPLE))`) is not a health status: such a file
+comes from no person and is left out. The table lists every value found in the
+files analysed, with the level it gets, so the mapping can be checked.
+
+```{r frame}
+# Three levels: "healthy" for a value in `healthy`, "not recorded" where missing
+# or a placeholder (is_missing_val()), else "not healthy".
+health_level <- function(x, healthy) {
+  s <- tolower(trimws(as.character(x)))
+  ifelse(is_missing_val(x), "not recorded",
+         ifelse(s %in% tolower(healthy), "healthy", "not healthy"))
+}
+
+pf <- pf[pf$has_metadata, ]
+# QC, blank and mix injections are not samples.
+not_sample   <- tolower(trimws(pf$health_status)) %in% NOT_SAMPLE
+n_not_sample <- sum(not_sample)
+pf <- pf[!not_sample, ]
+pf$fk     <- norm_file_key(pf$file)
+# Kynurenine (the metabolite) over tryptophan (the parent), on step 5's peak
+# areas: `area` is "auc", or "auc0" in the check on the area baseline.
+file_l2   <- function(d, area = "auc")
+  ifelse(d$par_detected %in% TRUE & d$met_detected %in% TRUE,
+         log2(d[[paste0("met_", area)]] / d[[paste0("par_", area)]]), NA_real_)
+pf$l2     <- file_l2(pf)
+pf$site   <- canon_site(pf$body_site)
+pf$sex2   <- harmonise_sex(pf$sex)
+pf$agen   <- as_num(pf$age)
+pf$health <- health_level(pf$health_status, HEALTHY)
+pf$subj   <- nz(pf$subject_id)
+pf$study  <- pf$dataset_id
+
+# Every health value as recorded, the level it gets, and where it is found.
+health_map <- pf |>
+  mutate(value = ifelse(is.na(health_status) | !nzchar(trimws(health_status)),
+                        "(empty)", health_status)) |>
+  group_by(value, level = health) |>
+  summarise(files = n(),
+            assays = paste(lab(sort(unique(study), method = "radix")), collapse = ", "),
+            .groups = "drop") |>
+  arrange(level, value)
+knitr::kable(health_map, col.names = c("health as recorded", "level", "files", "assays"),
+             caption = "The health values of the files analysed, and their level")
+```
+
+`r if (n_not_sample) paste0(n_not_sample, if (n_not_sample == 1) " file is" else " files are", " left out as QC, blank or mix injections.") else "No file carries a QC, blank or mix value."`
+
+```{r sleep-study}
+# Sleep study, by hand: "unhealthy (NOS)" marks draws under sleep deprivation, so
+# only files its own metadata labels healthy are kept, and the person is healthy.
+SLEEP_STUDY <- "MSV000082630"
+# Each label and the disease the deposit writes with it.
+SLEEP_LABELS <- c("healthy" = "no disease reported", "unhealthy (NOS)" = "sleep deprivation")
+in_sleep <- pf$study == SLEEP_STUDY
+# The deposit's own table, one row per file of the deposit analysed here.
+own <- read.delim(file.path("dataset_metadata", paste0(SLEEP_STUDY, "_metadata.tsv")),
+                  stringsAsFactors = FALSE)
+own <- own[match(pf$fk[in_sleep], norm_file_key(own$filename)), ]
+# The per-file health must be the deposit's own HealthStatus, file by file, and
+# each label must come with its disease.
+if (!identical(nz(own$HealthStatus), nz(pf$health_status[in_sleep])))
+  stop(SLEEP_STUDY, ": the per-file health is not the deposit's own HealthStatus")
+labelled <- own$HealthStatus %in% names(SLEEP_LABELS)
+if (!identical(own$DOIDCommonName[labelled], unname(SLEEP_LABELS[own$HealthStatus[labelled]])))
+  stop(SLEEP_STUDY, ": a health label does not come with its disease")
+sleep_kept   <- in_sleep & pf$health == "healthy"
+n_sleep      <- sum(in_sleep)
+n_sleep_kept <- sum(sleep_kept)
+sleep_people <- n_distinct(pf$subj[sleep_kept])
+# People of the deposit with no file labelled healthy: they drop out.
+sleep_lost   <- setdiff(pf$subj[in_sleep], pf$subj[sleep_kept])
+pf <- pf[!in_sleep | sleep_kept, ]
+```
+
+`r SLEEP_STUDY`, a sleep study of healthy volunteers, labels its files "healthy"
+or "unhealthy (NOS)" in its own metadata. Its disease column reads "no disease
+reported" with the first label and "sleep deprivation" with the second, so the
+second marks the draws taken under sleep deprivation, the study's intervention.
+For this deposit only, a person's ratio therefore comes from their files
+labelled healthy, and the person is healthy: of its `r n_sleep` files a metadata
+source covers, `r n_sleep_kept` are kept, from `r sleep_people` people.
+`r if (length(sleep_lost)) paste0(length(sleep_lost), if (length(sleep_lost) == 1) " person has" else " people have", " no file labelled healthy and drop", if (length(sleep_lost) == 1) "s", " out.")`
+
+```{r units}
+# One unit per subject and matrix, keeping the subject. Units are formed over all
+# files before those without a ratio drop, so age, sex and health use every file.
+ru <- unitise(pf, fields = "subj")
+# Units whose files disagree on age, sex or health, which they then lack.
+ru_disagree <- disagree_text(ru, TERM_NAMES)
+ru <- ru[is.finite(ru$l2), ]
+
+# Adult blood units with an age. The models use those with a sex recorded.
+aged   <- ru[ru$site %in% MATRICES & is.finite(ru$agen) & ru$agen >= ADULT_MIN_AGE, ]
+no_sex <- aged[is.na(aged$sex2), ]
+blood  <- aged[!is.na(aged$sex2), ]
+# The matrices with units in the models, in the order of MATRICES.
+mats   <- intersect(MATRICES, blood$site)
+
+ids   <- sort(unique(ru$study), method = "radix")
+count <- function(u) as.integer(table(factor(u$study, levels = ids)))
+ages  <- function(s, d = blood) {
+  a <- d$agen[d$study == s]
+  if (length(a)) sprintf("%g to %g", min(a), max(a)) else "-"
+}
+per_site <- do.call(cbind, lapply(MATRICES, function(m) count(aged[aged$site == m, ])))
+knitr::kable(data.frame(
+  assay      = lab(ids),
+  with_ratio = count(ru),
+  per_site,
+  with_sex   = count(blood),
+  unit       = vapply(ids, function(s)
+                 paste(sort(unique(aged$kind[aged$study == s]), method = "radix"),
+                       collapse = " and "), ""),
+  ages       = vapply(ids, ages, "", d = aged)),
+  row.names = FALSE,
+  col.names = c("assay", "units with a ratio",
+                sprintf("adult %s units with an age", MATRICES),
+                "of which a sex is recorded", "unit", "ages"),
+  caption = "Units per assay, from every unit with a ratio to those in the models")
+
+# The same adult blood units by matrix, assay, sex and health.
+SH_COLS <- c("female", "male", "sex not recorded",
+             "healthy", "not healthy", "health not recorded")
+sh_rows <- function(d) {
+  s   <- sort(unique(d$study), method = "radix")
+  tab <- function(v, lv) unclass(table(factor(d$study, s), factor(v, lv)))
+  x   <- cbind(tab(ifelse(is.na(d$sex2), "not recorded", d$sex2),
+                   c("female", "male", "not recorded")),
+               tab(d$health, LEVELS))
+  x   <- rbind(x, colSums(x))
+  colnames(x) <- SH_COLS
+  data.frame(matrix = d$site[1], assay = c(lab(s), "total"), x,
+             check.names = FALSE, row.names = NULL)
+}
+by_sh <- bind_rows(lapply(split(aged, factor(aged$site, intersect(MATRICES, aged$site))),
+                          sh_rows))
+knitr::kable(by_sh, row.names = FALSE,
+             caption = "Adult blood units with an age, by matrix, sex and health")
+
+n_site   <- table(factor(aged$site, MATRICES))
+n_sex    <- table(factor(ifelse(is.na(aged$sex2), "not recorded", aged$sex2),
+                         c("female", "male", "not recorded")))
+n_health <- table(factor(aged$health, LEVELS))
+
+# What adding sex to the models costs: the units with no sex recorded, and the
+# assays left with no unit at all.
+lost_assays  <- setdiff(unique(aged$study), blood$study)
+sex_loss_txt <- if (nrow(no_sex) == 0) {
+  "Every one has a sex recorded, so adding sex to the models loses no unit."
+} else {
+  n <- table(factor(lab(no_sex$study)))
+  paste0("Adding sex to the models loses the ", nrow(no_sex),
+         if (nrow(no_sex) == 1) " unit" else " units", " with no sex recorded (",
+         paste(sprintf("%s: %d", names(n), n), collapse = ", "), ")",
+         if (length(lost_assays)) paste0(", and with them ", and_list(lab(lost_assays)),
+                                         ", which records no sex at all") else
+           ", and no assay", ".")
+}
+
+# People with a unit in both matrices, keyed by deposit and subject: plasma and
+# serum of one Workbench deposit can be two assays.
+named   <- blood[!is.na(blood$subj), ]
+person  <- paste(datasets$deposit_id[match(named$study, datasets$dataset_id)], named$subj)
+in_both <- names(which(tapply(named$site, person, n_distinct) >= 2))
+both_assays <- sort(unique(named$study[person %in% in_both]), method = "radix")
+
+# The health levels each model holds.
+levels_in <- function(d) {
+  l <- intersect(LEVELS, d$health)
+  if (length(l) == length(LEVELS)) "all three levels" else
+    paste(if (length(l) == 1) "the level" else "the levels", and_list(sprintf('"%s"', l)))
+}
+lv <- vapply(mats, function(m) levels_in(blood[blood$site == m, ]), "")
+levels_txt <- if (!length(mats)) "" else if (length(mats) > 1 && length(unique(lv)) == 1) {
+  paste0("Both models hold units of ", lv[[1]], ".")
+} else {
+  paste0("The ", mats[1], " model holds units of ", lv[[1]],
+         if (length(mats) > 1) paste0("; the ", mats[-1], " model, units of ", lv[-1],
+                                      collapse = ""), ".")
+}
+# Assays in the models with units that are single files: no subject is named.
+file_assays <- sort(unique(blood$study[blood$kind == "file"]), method = "radix")
+```
+
+`r if (nzchar(ru_disagree)) paste0("The files of some units disagree on age, sex or health, which these units then lack: ", ru_disagree, ".") else "No unit's files disagree on age, sex or health."`
+Of the `r nrow(aged)` adult blood units with an age, from
+`r n_distinct(aged$study)` assays, `r n_site[["plasma"]]` are plasma and
+`r n_site[["serum"]]` serum; `r n_sex[["female"]]` are women and
+`r n_sex[["male"]]` men. `r sex_loss_txt`
+`r if (length(in_both)) paste0(length(in_both), if (length(in_both) == 1) " person has" else " people have", " a unit in both plasma and serum (", and_list(lab(both_assays)), "), one in each matrix, so neither model counts them twice.") else "No person has a unit in both plasma and serum."`
+By health, `r n_health[["healthy"]]` units are healthy,
+`r n_health[["not healthy"]]` not healthy and `r n_health[["not recorded"]]` have
+no health recorded. `r levels_txt`
+`r if (length(file_assays)) paste0("Where no subject is named, in ", and_list(lab(file_assays)), ", each file is a unit, so repeat files of one person count there as separate units.")`
+
+# The ratio against age
+
+## One model per matrix
+
+The level of the ratio depends on the method as much as on the blood: each
+assay's column, instrument and ionisation shift all of its files alike. A term
+per assay absorbs that shift, so the slope is estimated within assays and pooled
+across them, and a difference between assays is never read as an effect of age.
+
+Plasma and serum get one model each. Serum is what is left once the blood has
+clotted, plasma what is left when clotting is blocked, so the ratio need not sit
+at the same level in both; and a person sampled in both would count twice in one
+model over both matrices. In each matrix, the model, in words: a unit's log2
+ratio is the level of its assay, plus a change $b$ for each year of age, plus a
+shift for its sex and a shift for its health (healthy, not healthy or not
+recorded), plus what the model leaves unexplained. As a formula, for unit $i$ of
+one matrix, fitted by least squares:
+
+$$
+\log_2\left(\frac{\text{kynurenine}}{\text{tryptophan}}\right)_i
+= \text{assay}_i + b \cdot \text{age}_i + \text{sex}_i + \text{health}_i
++ \varepsilon_i
+$$
+
+The slope $b$, the change in the log2 ratio per year of age, fitted once in
+plasma and once in serum, is the number the hypothesis is about: it predicts
+$b > 0$. A matrix measured by one assay only has no assay term: its level is the
+model's intercept. Sex and health enter where they vary inside at least one assay
+of the matrix. A level found in only some assays is compared inside those; a
+level that never varies inside an assay is part of that assay's term. A matrix is
+fitted where it has at least `r MIN_UNITS` units spanning at least `r MIN_SPAN`
+years of age. The table also holds, for each matrix, the fit on its healthy units
+only, where health drops out (see below).
+
+```{r per-matrix}
+# A term enters only where it varies inside an assay. Assay comes before health,
+# so a level found in one assay only is absorbed by the assay term.
+varies    <- function(d, v) any(tapply(d[[v]], d$study, n_distinct) >= 2)
+age_terms <- function(d) c("agen", if (varies(d, "sex2")) "sex2",
+                           if (n_distinct(d$study) >= 2) "study",
+                           if (varies(d, "health")) "health")
+# The terms of a fit, in the order of TERM_NAMES.
+terms_of <- function(m) TERM_NAMES[intersect(names(TERM_NAMES), attr(terms(m), "term.labels"))]
+# Enough units over enough years of age for a slope.
+fittable   <- function(d) nrow(d) >= MIN_UNITS && diff(range(d$agen)) >= MIN_SPAN
+fit_matrix <- function(d) if (fittable(d)) lm(reformulate(age_terms(d), "l2"), data = d)
+fit_row <- function(m, d, mat, label) {
+  ci <- confint(m)["agen", ]
+  data.frame(matrix = mat, model = label, units = nrow(d), assays = n_distinct(d$study),
+             terms = and_list(terms_of(m)),
+             slope = coef(m)[["agen"]], lo = ci[[1]], hi = ci[[2]],
+             p = summary(m)$coefficients["agen", 4])
+}
+healthy   <- blood[blood$health == "healthy", ]   # healthy, with a sex recorded
+by_mat    <- function(d) setNames(lapply(mats, function(m) d[d$site == m, ]), mats)
+units_m   <- by_mat(blood)
+healthy_m <- by_mat(healthy)
+# One model per matrix on all its units, and one on its healthy units; NULL where
+# too few units, or too narrow a span of age, to fit.
+m_all     <- lapply(units_m, fit_matrix)
+m_healthy <- lapply(healthy_m, fit_matrix)
+fit_rows  <- function(ms, ds, label) bind_rows(lapply(names(ms), function(m)
+  if (!is.null(ms[[m]])) fit_row(ms[[m]], ds[[m]], m, label)))
+pooled <- bind_rows(fit_rows(m_all, units_m, "all units"),
+                    fit_rows(m_healthy, healthy_m, "healthy units only"))
+write.csv(pooled, "artifacts/ratio_covariate_pooled.csv", row.names = FALSE)
+knitr::kable(rounded(pooled), row.names = FALSE,
+             col.names = c("matrix", "fit", "units", "assays", "terms", "slope per year",
+                           "95% CI low", "95% CI high", "p"),
+             caption = "The log2 ratio against age in each matrix, with a term per assay")
+
+# The row of one fit: the matrix and "all units" or "healthy units only".
+fit_of <- function(mat, label = "all units") pooled[pooled$matrix == mat & pooled$model == label, ]
+direction <- function(r) if (r$lo > 0) {
+  "The interval lies above zero: the ratio rises with age, the direction the hypothesis predicts."
+} else if (r$hi < 0) {
+  "The interval lies below zero: the ratio falls with age, against the hypothesis."
+} else {
+  "The interval includes zero, so the direction is not resolved."
+}
+# The shift of one level in a fit, as estimate (95% CI; p); NULL where the assay
+# terms absorb it.
+shift <- function(m, term) {
+  co <- summary(m)$coefficients
+  if (!term %in% rownames(co)) return(NULL)
+  ci <- confint(m)[term, ]
+  sprintf("%+.3f (%.3f to %.3f; p = %s)", co[term, 1], ci[[1]], ci[[2]], fmt_p(co[term, 4]))
+}
+# What the model of one matrix says: its slope, then the sex and health shifts.
+say_matrix <- function(mat) {
+  r <- fit_of(mat)
+  if (!nrow(r)) return(paste0("In ", mat, ", the ", nrow(units_m[[mat]]),
+                              " units are too few, or span too few years, to be fitted."))
+  sex_shift <- shift(m_all[[mat]], "sex2male")
+  ill_shift <- shift(m_all[[mat]], "healthnot healthy")
+  paste0("In ", mat, ", the log2 ratio changes by ", fmt(r),
+         " per year of age (slope and 95% confidence interval; p = ", fmt_p(r$p),
+         "), from ", r$units, " units in ", r$assays,
+         if (r$assays == 1) " assay. " else " assays. ", direction(r),
+         if (!is.null(sex_shift)) paste0(" At the same age, in the same assay and of the same health, men differ from women by ", sex_shift, " log2."),
+         if (!is.null(ill_shift)) paste0(" Units not healthy differ from healthy ones by ", ill_shift, " log2."))
+}
+```
+
+`r paste(vapply(mats, say_matrix, ""), collapse = "\n\n")`
+
+## Each assay alone
+
+A slope pooled over assays can be carried by one assay. Each assay is therefore
+fitted alone in each matrix where it has at least `r MIN_UNITS` units spanning at
+least `r MIN_SPAN` years of age: a least-squares slope of the ratio on age, and
+the same slope adjusted for sex and health where these vary inside the assay.
+The units are those of the models above.
+
+```{r per-assay}
+fit_one <- function(u) {
+  if (!fittable(u)) return(NULL)
+  adj <- c(sex = if (n_distinct(u$sex2) >= 2) "sex2",
+           health = if (n_distinct(u$health) >= 2) "health")
+  m   <- lm(l2 ~ agen, data = u)
+  co  <- summary(m)$coefficients
+  ci  <- confint(m)["agen", ]
+  ca  <- summary(lm(reformulate(c("agen", adj), "l2"), data = u))$coefficients
+  data.frame(dataset_id = u$study[1], matrix = u$site[1], assay = lab(u$study[1]),
+             n = nrow(u), lo_x = min(u$agen), hi_x = max(u$agen),
+             slope = co["agen", 1], lo = ci[[1]], hi = ci[[2]], p = co["agen", 4],
+             r2 = summary(m)$r.squared,
+             adjusted_for = if (length(adj)) and_list(names(adj)) else "none",
+             slope_adj = ca["agen", 1], p_adj = ca["agen", 4])
+}
+# Fit each assay of `d` alone in each matrix, and say where its interval lies
+# relative to zero.
+fit_each <- function(d) {
+  d   <- d[order(match(d$site, MATRICES), d$study, method = "radix"), ]
+  key <- paste(d$site, d$study)
+  out <- bind_rows(lapply(split(d, factor(key, unique(key))), fit_one))
+  if (nrow(out)) out$alone <- ifelse(out$lo > 0, "rise", ifelse(out$hi < 0, "fall", "no"))
+  out
+}
+per_cols <- c("matrix", "assay", "units", "age from", "age to", "slope per year",
+              "95% CI low", "95% CI high", "p", "R2", "adjusted for",
+              "adjusted slope", "adjusted p", "shown alone")
+
+per_dep <- fit_each(blood)
+write.csv(per_dep, "artifacts/ratio_covariate_per_assay.csv", row.names = FALSE)
+knitr::kable(rounded(per_dep[, -1]), row.names = FALSE, col.names = per_cols,
+             caption = "The log2 ratio against age inside each assay, in each matrix")
+
+# Assays in a matrix, as the text names them: "MSV000085256 (plasma, 59 to 74)",
+# with the ages the assay covers there.
+pair_txt <- function(mat, s) and_list(sprintf("%s (%s, %s)", lab(s), mat,
+  mapply(function(m, x) ages(x, blood[blood$site == m, ]), mat, s)))
+said   <- function(r) pair_txt(r$matrix, r$dataset_id)
+pick   <- function(r, what) r[r$alone %in% what, ]
+rises  <- pick(per_dep, "rise")
+falls  <- pick(per_dep, "fall")
+others <- pick(per_dep, "no")
+pairs  <- unique(blood[order(match(blood$site, MATRICES), blood$study, method = "radix"),
+                       c("site", "study")])
+unfit  <- pairs[!paste(pairs$site, pairs$study) %in% paste(per_dep$matrix, per_dep$dataset_id), ]
+# Assays fitted in both matrices.
+twice  <- unique(per_dep$dataset_id[duplicated(per_dep$dataset_id)])
+```
+
+`r nrow(rises)` of the `r nrow(per_dep)` assay fit`r if (nrow(per_dep) != 1) "s"`
+`r if (nrow(rises) == 1) "shows" else "show"` the rise on
+`r if (nrow(rises) == 1) "its" else "their"` own`r if (nrow(rises)) paste0(": ", said(rises))`.
+`r if (length(twice)) paste0("An assay that measured both matrices is fitted once in each (", and_list(lab(twice)), ").")`
+`r if (nrow(falls)) paste0(said(falls), if (nrow(falls) == 1) " shows" else " show", " a fall with age, against the hypothesis.")`
+`r if (nrow(others)) paste0("In ", said(others), ", the interval includes zero.")`
+`r if (nrow(unfit)) paste0("Too few units or too narrow a span of age to be fitted alone: ", pair_txt(unfit$site, unfit$study), ".")`
+The ages in brackets are those each assay covers in that matrix. The model of a
+matrix uses the ages of all its assays together, while each assay keeps its own
+level.
+
+The figure has one row per matrix. On the left, every unit of that matrix's
+model is shown as its ratio adjusted for the other terms of the model (a
+component-plus-residual plot), so the line is the matrix's slope and the band
+spans the slopes in its 95% confidence interval. On the right, the slope inside
+each assay of that matrix fitted alone, with its interval and the ages it
+covers, against the slope of the matrix's model.
+
+```{r age-figure}
+#| echo: false
+# One figure row for matrix `mat`. Left: units of model `m` on `d`, adjusted ratio,
+# slope and 95% band. Right: slopes of assays fitted alone (`per`) vs `est`.
+aged_ids  <- sort(unique(aged$study), method = "radix")
+assay_col <- setNames(scales::hue_pal()(length(aged_ids)), lab(aged_ids))
+age_figure <- function(m, d, per, est, mat, tags, xlim = NULL) {
+  b_age <- coef(m)[["agen"]]
+  se    <- summary(m)$coefficients["agen", 2]
+  x0    <- mean(d$agen)
+  y0    <- mean(d$l2)
+  d$assay   <- lab(d$study)
+  d$partial <- resid(m) + b_age * (d$agen - x0) + y0
+  # The band: every slope in the 95% interval, drawn through the mean age.
+  tq   <- qt(0.975, df.residual(m))
+  xs   <- seq(min(d$agen), max(d$agen), length.out = 100)
+  band <- data.frame(x = xs, y = y0 + b_age * (xs - x0),
+                     lo = y0 + b_age * (xs - x0) - tq * se * abs(xs - x0),
+                     hi = y0 + b_age * (xs - x0) + tq * se * abs(xs - x0))
+  adjusted <- setdiff(terms_of(m), "age")
+  title_A  <- paste0(tags[1], "   ", mat,
+                     if (length(adjusted)) paste(", adjusted for", and_list(adjusted)))
+
+  pA <- ggplot(d, aes(agen, partial)) +
+    geom_ribbon(data = band, aes(x = x, ymin = lo, ymax = hi), inherit.aes = FALSE,
+                fill = "grey70", alpha = 0.5) +
+    geom_point(aes(colour = assay), size = 1.1, alpha = 0.55) +
+    scale_colour_manual(values = assay_col) +
+    geom_line(data = band, aes(x = x, y = y), inherit.aes = FALSE, linewidth = 0.9) +
+    labs(x = "age (years)", y = expression(log[2]*(kynurenine / tryptophan)),
+         colour = NULL, title = title_A) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "bottom", legend.text = element_text(size = 7),
+          panel.grid.minor = element_blank()) +
+    guides(colour = guide_legend(ncol = 2, override.aes = list(size = 2, alpha = 1)))
+
+  fb <- rbind(
+    if (nrow(per)) data.frame(
+      label = sprintf("%s  (n = %d, %g-%g)", per$assay, per$n, per$lo_x, per$hi_x),
+      slope = per$slope, lo = per$lo, hi = per$hi, kind = "within one assay"),
+    # The chapter counts these units as subjects; the keys keep "units".
+    data.frame(label = sprintf("%s model: %s  (n = %d)", mat,
+                               sub("units", "subjects", est$model), est$units),
+               slope = est$slope, lo = est$lo, hi = est$hi,
+               kind = "model of the matrix"))
+  fb$label <- factor(fb$label, levels = unique(rev(fb$label)))
+  pB <- ggplot(fb, aes(slope, label, colour = kind, shape = kind)) +
+    geom_vline(xintercept = 0, linetype = 2, colour = "grey55") +
+    geom_errorbar(aes(xmin = lo, xmax = hi), orientation = "y", width = 0.25) +
+    geom_point(size = 2) +
+    scale_colour_manual(values = c("within one assay" = "grey25",
+                                   "model of the matrix" = "#B2182B"),
+                        breaks = unique(fb$kind), name = NULL) +
+    scale_shape_manual(values = c("within one assay" = 16,
+                                  "model of the matrix" = 18),
+                       breaks = unique(fb$kind), name = NULL) +
+    coord_cartesian(xlim = xlim) +
+    labs(x = "slope per year of age (log2), 95% CI", y = NULL,
+         title = paste0(tags[2], "   ", mat, ", each assay alone")) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+  patchwork::wrap_plots(pA, pB, ncol = 2, widths = c(1, 1.15))
+}
+# The figure: one row per fitted matrix, panels lettered in reading order, all
+# slopes on one scale. `label` is "all units" or "healthy units only".
+age_rows <- function(ms, ds, per, label) {
+  fitted <- names(ms)[!vapply(ms, is.null, TRUE)]
+  xlim   <- range(0, per$lo, per$hi, pooled$lo[pooled$model == label],
+                  pooled$hi[pooled$model == label])
+  patchwork::wrap_plots(lapply(seq_along(fitted), function(i) {
+    mat <- fitted[i]
+    age_figure(ms[[mat]], ds[[mat]], if (nrow(per)) per[per$matrix == mat, ] else per,
+               fit_of(mat, label), mat, LETTERS[2 * i - 1:0], xlim)
+  }), ncol = 1)
+}
+n_rows   <- sum(!vapply(m_all, is.null, TRUE))
+n_rows_h <- sum(!vapply(m_healthy, is.null, TRUE))
+```
+
+```{r fig-ratio-age, fig.width = 10, fig.height = 5 * max(1, n_rows)}
+#| echo: false
+if (n_rows) {
+  p <- age_rows(m_all, units_m, per_dep, "all units")
+  print(p)
+  ggsave(figp("ratio_vs_age_by_matrix.png"), p, width = 10, height = 5 * n_rows, dpi = 200)
+}
+```
+
+## Each assay left out
+
+A pooled slope can also hang on one assay. The model of each matrix is
+therefore fitted again once without each of its assays, with the same terms and
+rules as above. The table gives the model of each matrix first, then each fit
+without one assay.
+
+```{r leave-one-out}
+# The model of one matrix, then the same model once without each of its assays
+# (left_out is NA for the model itself); a fit whose units are too few is left out.
+loo_rows <- function(mat) {
+  d <- units_m[[mat]]
+  bind_rows(lapply(c(NA_character_, sort(unique(d$study), method = "radix")), function(s) {
+    u <- d[!d$study %in% s, ]
+    m <- fit_matrix(u)
+    assay <- if (is.na(s)) "none" else lab(s)
+    if (!is.null(m)) mutate(fit_row(m, u, mat, if (is.na(s)) "all assays" else paste("without", assay)),
+                            left_out = s, assay = assay)
+  }))
+}
+fitted_m <- names(m_all)[!vapply(m_all, is.null, TRUE)]
+loo <- bind_rows(lapply(fitted_m, loo_rows))
+loo$side <- ifelse(loo$lo > 0, "lies above zero", ifelse(loo$hi < 0, "lies below zero", "includes zero"))
+# Numbers of this section: three significant digits in the table, two in the text.
+sig_n <- function(x, digits = 2) formatC(x, digits = digits, format = "fg", flag = "#")
+knitr::kable(data.frame(loo$matrix, loo$assay, loo$units, loo$assays, sig_n(loo$slope, 3),
+                        paste(sig_n(loo$lo, 3), "to", sig_n(loo$hi, 3)),
+                        formatC(loo$p, digits = 2, format = "g", flag = "#")),
+             col.names = c("matrix", "assay left out", "units", "assays", "slope per year",
+                           "95% CI", "p"),
+             caption = "The model of each matrix, and the same model without each of its assays")
+
+# What leaving out one assay does in one matrix: the range of the slopes, and
+# where the interval lies.
+say_loo <- function(mat) {
+  r     <- loo[loo$matrix == mat, ]
+  refit <- r[!is.na(r$left_out), ]
+  if (!nrow(refit)) return(paste0("In ", mat, ", no fit is left once an assay is left out."))
+  off <- refit[refit$side != "lies above zero", ]
+  paste0("In ", mat, ", the slope is ", sig_n(r$slope[is.na(r$left_out)]),
+         " per year with all assays and between ", sig_n(min(refit$slope)), " and ",
+         sig_n(max(refit$slope)), " with one assay left out; ",
+         if (!nrow(off)) paste0("the interval stays above zero in all ", nrow(refit), " of these fits.")
+         else paste0("the interval ", paste(unique(off$side), collapse = " or "), " in ", nrow(off),
+                     " of these ", nrow(refit), " fits: ", and_list(paste("without", off$assay)), "."))
+}
+loo_h <- 1.2 + 0.35 * max(1, table(loo$matrix))
+```
+
+`r paste(vapply(fitted_m, say_loo, ""), collapse = " ")` In the figure, the
+model of each matrix is a square and each fit without one assay a dot, each with
+its 95% interval.
+
+```{r fig-leave-one-out, fig.width = 8, fig.height = loo_h}
+#| echo: false
+# One panel per matrix: the model and each fit without one assay, coloured by
+# where the interval lies; dashed at zero, grey at the model's slope.
+if (nrow(loo)) {
+  fd <- loo
+  fd$label    <- factor(fd$model, rev(unique(fd$model[order(!is.na(fd$left_out), fd$left_out,
+                                                            method = "radix")])))
+  fd$matrix   <- factor(fd$matrix, fitted_m)
+  fd$interval <- paste("interval", fd$side)
+  fd$main     <- is.na(fd$left_out)
+  side_col    <- c("interval lies above zero" = "#2166AC", "interval includes zero" = "#B2182B",
+                   "interval lies below zero" = "grey30")
+  p_loo <- ggplot(fd, aes(slope, label)) +
+    geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+    geom_vline(data = fd[fd$main, ], aes(xintercept = slope), colour = "grey75") +
+    geom_errorbar(aes(xmin = lo, xmax = hi, colour = interval), orientation = "y", width = 0.25) +
+    geom_point(aes(colour = interval, shape = main), size = 2.2) +
+    scale_shape_manual(values = c(`TRUE` = 15, `FALSE` = 16), guide = "none") +
+    scale_colour_manual(values = side_col, breaks = intersect(names(side_col), fd$interval),
+                        name = NULL) +
+    facet_wrap(~ matrix, scales = "free_y", nrow = 1) +
+    labs(x = "change in log2 kynurenine/tryptophan per year of age (95% CI)", y = NULL) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "bottom", panel.grid.minor = element_blank())
+  print(p_loo)
+  ggsave(figp("loo_assay_by_matrix.png"), p_loo, width = 8, height = loo_h, dpi = 200)
+  ggsave(figp("loo_assay_by_matrix.pdf"), p_loo, width = 8, height = loo_h)
+}
+```
+
+## Healthy units only
+
+This section's figure is in the chapter's appendix, with the figure of each
+assay left out. Disease can move the ratio on its own, since inflammation induces the
+enzyme, and the units that are not healthy are not spread evenly over the
+assays or over age. The model of each matrix is therefore repeated on its
+healthy units alone, where health drops out.
+
+```{r healthy}
+per_h <- fit_each(healthy)
+if (nrow(per_h))
+  knitr::kable(rounded(per_h[, -1]), row.names = FALSE, col.names = per_cols,
+               caption = "Healthy units only: the log2 ratio against age inside each assay, in each matrix")
+# Healthy units with no sex: not in these fits.
+n_h_nosex <- sum(no_sex$health == "healthy")
+h_rises <- pick(per_h, "rise")
+h_falls <- pick(per_h, "fall")
+# What the healthy units of one matrix say: where they come from, and the slope.
+say_healthy <- function(mat) {
+  d <- healthy_m[[mat]]
+  if (!nrow(d)) return(paste0("In ", mat, ", no unit is healthy."))
+  n <- table(factor(d$study, sort(unique(d$study), method = "radix")))
+  r <- fit_of(mat, "healthy units only")
+  head <- paste0("In ", mat, ", the ", nrow(d), " healthy units come from ", length(n),
+                 if (length(n) == 1) " assay (" else " assays (",
+                 paste(sprintf("%s: %d", lab(names(n)), n), collapse = ", "), ")")
+  if (!nrow(r)) return(paste0(head, ": too few, or spanning too few years, to be fitted."))
+  paste0(head, ". On them, the log2 ratio changes by ", fmt(r),
+         " per year of age (p = ", fmt_p(r$p), "). ", direction(r))
+}
+```
+
+`r paste(vapply(mats, say_healthy, ""), collapse = "\n\n")`
+
+`r if (n_h_nosex) paste0("Another ", n_h_nosex, " healthy ", if (n_h_nosex == 1) "unit has no sex and is" else "units have no sex and are", " left out.")`
+Of the `r nrow(per_h)` assay fit`r if (nrow(per_h) != 1) "s"` with enough healthy
+units, `r nrow(h_rises)` `r if (nrow(h_rises) == 1) "shows" else "show"` the rise
+and `r nrow(h_falls)` a fall. The figure is drawn as the one above, on the
+healthy units only.
+
+```{r fig-ratio-age-healthy, fig.width = 10, fig.height = 5 * max(1, n_rows_h)}
+#| echo: false
+if (n_rows_h) {
+  p_h <- age_rows(m_healthy, healthy_m, per_h, "healthy units only")
+  print(p_h)
+  ggsave(figp("ratio_vs_age_healthy.png"), p_h, width = 10, height = 5 * n_rows_h, dpi = 200)
+  ggsave(figp("ratio_vs_age_healthy.pdf"), p_h, width = 10, height = 5 * n_rows_h)
+}
+```
+
+# Step summary
+
+The results of this step, as the chapter's table shows them.
+
+```{r step-summary}
+# One value of the fit of a matrix, or "not fitted".
+fit_value <- function(mat, label, f) {
+  r <- fit_of(mat, label)
+  if (nrow(r)) f(r) else "not fitted"
+}
+per_matrix_items <- function(mat) data.frame(
+  item  = paste0(mat, ": ", c(
+    "assays in the model",
+    "units in the model",
+    "change in log2 kynurenine/tryptophan per year of age (95% CI)",
+    "p",
+    "healthy units",
+    "change per year on the healthy units (95% CI)")),
+  value = c(n_distinct(units_m[[mat]]$study), nrow(units_m[[mat]]),
+            fit_value(mat, "all units", fmt),
+            fit_value(mat, "all units", function(r) fmt_p(r$p)),
+            nrow(healthy_m[[mat]]),
+            fit_value(mat, "healthy units only", fmt)))
+summary_step <- rbind(
+  data.frame(item  = c("assays set aside (same samples, another set-up)",
+                       "people with a unit in both plasma and serum"),
+             value = c(sum(!choice$kept), length(in_both))),
+  do.call(rbind, lapply(mats, per_matrix_items)),
+  data.frame(item  = c("assay fits that show the rise", "assay fits that show a fall"),
+             value = c(sprintf("%d of %d", nrow(rises), nrow(per_dep)),
+                       sprintf("%d of %d", nrow(falls), nrow(per_dep)))))
+write.csv(summary_step, "artifacts/summary_step6.csv", row.names = FALSE)
+summary_step
+```
+
+# Checks on repeated sampling
+
+These checks are not part of the chapter's results, and the step summary above
+does not use them. A unit above takes the median ratio over its person's files.
+Where a person was sampled at several time points or visits, the later samples
+can follow an illness or a treatment, and the median then mixes them with the
+first. Here each person keeps only the files of the first time point, where the
+deposit's own metadata record when each sample was taken, and both matrix models
+are fitted again.
+
+## First time point only
+
+The order of a person's samples is read only from the deposit's own metadata
+table (`dataset_metadata/<deposit>_metadata.tsv`), matched to the per-file table
+file by file, never from the file names. MSV000096564 records the date and time
+each sample was collected, its time point in step 2
+(`artifacts/metadata_entities.csv`). MSV000084556 records the time point in the
+subject (PD001_T1, PD001_T2, PD001_T3), which step 2 removes to name the person.
+MSV000094097 records the diet phase of each sample in ATTRIBUTE_Diet, a column
+step 2 does not map: "Before" is the first time point and "After" the later one.
+In these deposits, a unit keeps the files of its earliest time, all of them
+where several files share it, and its ratio is again their median. A file with
+no time recorded is left out. Units are then formed, and kept, as above.
+
+```{r first-time-point}
+# How a deposit's own table orders a person's files: the column it is read from,
+# what it records, and how a value becomes a time, earliest first.
+step2  <- read.csv("artifacts/metadata_entities.csv", stringsAsFactors = FALSE)
+col_of <- function(d, field) step2[[field]][match(d, step2$deposit_id)]
+FIRST_TIME <- list(
+  # The date and time each sample was collected: step 2's time point.
+  MSV000096564 = list(
+    column = col_of("MSV000096564", "col_timepoint"),
+    how    = "date and time of collection",
+    time   = function(x) as.numeric(as.POSIXct(x, format = "%m/%d/%Y %H:%M", tz = "UTC"))),
+  # The subject as recorded, which ends in the time point: step 2's subject,
+  # before step 2 removes the time point.
+  MSV000084556 = list(
+    column = col_of("MSV000084556", "col_subject_id"),
+    how    = "time point that ends the recorded subject, as in PD001_T2",
+    time   = function(x) as_num(sub("^.*_T([0-9]+)$", "\\1", x))),
+  # The diet phase of each sample, a column step 2 does not map: "Before" the
+  # diet, then "After" it. Any other value is no time.
+  MSV000094097 = list(
+    column = "ATTRIBUTE_Diet",
+    how    = "diet phase, Before then After",
+    time   = function(x) unname(c(Before = 1, After = 2)[x])))
+
+# Blood files, each with the value and the time its deposit's own table records
+# (NA in the other deposits).
+bf <- pf[pf$site %in% MATRICES, ]
+bf$deposit  <- datasets$deposit_id[match(bf$study, datasets$dataset_id)]
+bf$unit     <- ifelse(is.na(bf$subj), paste("file", bf$study, bf$fk),
+                      paste(bf$study, bf$subj, bf$site))
+bf$recorded <- NA_character_
+bf$time     <- NA_real_
+for (d in names(FIRST_TIME)) {
+  own <- read.delim(file.path("dataset_metadata", paste0(d, "_metadata.tsv")),
+                    stringsAsFactors = FALSE)
+  i   <- bf$deposit == d
+  bf$recorded[i] <- own[[FIRST_TIME[[d]]$column]][match(bf$fk[i], norm_file_key(own$filename))]
+  bf$time[i]     <- FIRST_TIME[[d]]$time(bf$recorded[i])
+}
+# MSV000084556: the recorded subject, without its time point, is step 2's person.
+p84 <- bf$deposit == "MSV000084556"
+if (!identical(sub("_T[0-9]+$", "", bf$recorded[p84]), bf$subj[p84]))
+  stop("MSV000084556: the recorded subject is not the person step 2 names")
+# MSV000094097: files whose diet phase is recorded, and those whose file name
+# agrees (Basal before, Day15 after). The order comes from the table only.
+p94       <- bf$deposit == "MSV000094097"
+n94       <- sum(p94)
+n94_diet  <- sum(!is.na(bf$time[p94]))
+named94   <- ifelse(grepl("_Basal_", bf$file[p94]), "Before",
+                    ifelse(grepl("_Day15_", bf$file[p94]), "After", NA))
+n94_agree <- sum(named94 == bf$recorded[p94], na.rm = TRUE)
+
+# In these deposits, a unit keeps the files of its earliest recorded time, and a
+# file with no time recorded is left out. Every other unit keeps all its files.
+ordered   <- bf$deposit %in% names(FIRST_TIME)
+undated   <- ordered & is.na(bf$time)
+n_undated <- sum(undated)
+earliest  <- ave(bf$time, bf$unit, FUN = function(t) if (all(is.na(t))) NA else min(t, na.rm = TRUE))
+first     <- !ordered | (!undated & bf$time == earliest)
+
+# The deposits with repeated samples (a unit of several files): how the first
+# time point is found in each, and what the check keeps.
+n_files  <- ave(seq_len(nrow(bf)), bf$unit, FUN = length)
+repeated <- sort(unique(bf$deposit[n_files > 1]), method = "radix")
+as_is    <- setdiff(repeated, names(FIRST_TIME))
+time_rows <- bind_rows(lapply(repeated, function(d) {
+  i <- bf$deposit == d
+  data.frame(deposit = d,
+             how     = if (d %in% names(FIRST_TIME))
+                         sprintf("%s (%s)", FIRST_TIME[[d]]$how, FIRST_TIME[[d]]$column) else
+                         "not read: every file kept, as above",
+             people  = n_distinct(bf$subj[i]),
+             units   = n_distinct(bf$unit[i]),
+             several = sum(table(bf$unit[i]) > 1),
+             files   = sum(i),
+             kept    = sum(first[i]))
+}))
+knitr::kable(time_rows, row.names = FALSE,
+             col.names = c("deposit", "first time point from", "people", "blood units",
+                           "units with several files", "blood files", "files kept"),
+             caption = "How the first time point of a person is found, per deposit with repeated samples")
+
+# The sleep study is left unordered: its subject suffix is not labelled a time,
+# and its units keep only files labelled healthy (rule by hand above).
+if (!identical(as_is, SLEEP_STUDY))
+  stop("repeated samples left as they are in ", and_list(as_is), "; the text explains ",
+       SLEEP_STUDY, " only")
+p82     <- bf$deposit == SLEEP_STUDY
+own82   <- read.delim(file.path("dataset_metadata", paste0(SLEEP_STUDY, "_metadata.tsv")),
+                      stringsAsFactors = FALSE)
+rec82   <- own82$SubjectIdentifierAsRecorded[match(bf$fk[p82], norm_file_key(own82$filename))]
+n82     <- sum(p82)
+n82_num <- sum(grepl(col_of(SLEEP_STUDY, "const_subject_suffix"), rec82))
+if (n82_num != n82) stop(SLEEP_STUDY, ": a recorded subject does not end in a bare number")
+if (any(bf$health[p82] != "healthy")) stop(SLEEP_STUDY, ": a file not labelled healthy is in the units")
+# The recorded subjects of one person with several files, as an example.
+who82 <- sort(unique(bf$subj[p82][duplicated(bf$subj[p82])]))[1]
+ex82  <- sort(rec82[bf$subj[p82] == who82])
+
+# Slopes in this section's text, to two significant digits, so that a bound near
+# zero keeps its digits.
+sig     <- function(x, flag = "#") formatC(x, digits = 2, format = "fg", flag = flag)
+fmt_sig <- function(r) sprintf("%s (%s to %s)", sig(r$slope, "#+"), sig(r$lo), sig(r$hi))
+
+# The units of the first time point, filtered as the units of the models above.
+fu <- unitise(bf[first, ], fields = "subj")
+fu_disagree <- disagree_text(fu, TERM_NAMES)
+fu <- fu[is.finite(fu$l2) & is.finite(fu$agen) & fu$agen >= ADULT_MIN_AGE & !is.na(fu$sex2), ]
+fu_m <- by_mat(fu)
+m_fu <- lapply(fu_m, fit_matrix)
+first_pooled <- bind_rows(pooled[pooled$model == "all units", ],
+                          fit_rows(m_fu, fu_m, "first time point only"))
+first_pooled$model[first_pooled$model == "all units"] <- "all time points (median)"
+first_pooled <- first_pooled[order(match(first_pooled$matrix, MATRICES)), ]
+knitr::kable(rounded(transform(first_pooled, p = fmt_p(p))), row.names = FALSE,
+             col.names = c("matrix", "files of a person", "units", "assays", "terms",
+                           "slope per year", "95% CI low", "95% CI high", "p"),
+             caption = "The log2 ratio against age in each matrix: all time points and the first only")
+
+# The files set aside (later time points, or no time recorded), the assays whose
+# units change, and the units lost because their first time point gives no ratio.
+n_later  <- sum(!first & !undated)
+later_in <- sort(unique(bf$study[!first & !undated]), method = "radix")
+changed  <- sort(unique(bf$study[!first]), method = "radix")
+n_lost   <- length(setdiff(blood$unit, fu$unit))
+# Units whose health level differs from above: there a unit takes the health all
+# its files record, here that of the files of its first time point.
+hc <- merge(blood[, c("unit", "study", "health")], fu[, c("unit", "health")],
+            by = "unit", suffixes = c("_all", "_first"))
+hc <- hc[hc$health_all != hc$health_first, ]
+hc_n <- table(sprintf("%s, from %s to %s", lab(hc$study), hc$health_all, hc$health_first))
+say_first <- function(mat) {
+  a <- fit_of(mat)
+  b <- first_pooled[first_pooled$matrix == mat & first_pooled$model == "first time point only", ]
+  if (!nrow(b)) return(paste0("In ", mat, ", the units of the first time point are too few to be fitted."))
+  paste0("In ", mat, ", on the first time point, the log2 ratio changes by ", fmt_sig(b),
+         " per year of age (p = ", fmt_p(b$p), ", ", b$units, " units), against ",
+         fmt_sig(a), " (p = ", fmt_p(a$p), ", ", a$units, " units) over all time points. ",
+         direction(b))
+}
+```
+
+`r if (n_undated) paste0(n_undated, if (n_undated == 1) " blood file of " else " blood files of ", and_list(names(FIRST_TIME)), if (n_undated == 1) " has" else " have", " no time recorded and ", if (n_undated == 1) "is" else "are", " left out.") else paste0("Every blood file of ", and_list(names(FIRST_TIME)), " has its time recorded.")`
+In MSV000094097, ATTRIBUTE_Diet is filled for
+`r if (n94_diet == n94) "all" else paste(n94_diet, "of the")` `r n94` blood
+files, and in `r if (n94_agree == n94_diet) "every one of them" else paste(n94_agree, "of them")`
+the file name says the same: Basal for "Before", Day15 for "After". Its person
+is the one step 2 names, as in the models above.
+
+`r SLEEP_STUDY` is left out of the check, and its units stay as in the models
+above: its subject field carries a bare number in all `r n82` of its blood files
+kept above (`r and_list(ex82)` for one person), a number its metadata does not
+label as a time or a draw, and its people already use only the files its
+metadata labels healthy.
+
+`r n_later` blood files of later time points are set aside, in
+`r and_list(lab(later_in))`. `r if (n_lost) paste0(n_lost, if (n_lost == 1) " unit of the models drops out" else " units of the models drop out", " because the files of its first time point give no ratio.") else "Every unit of the models keeps a ratio."`
+A unit's age, sex and health now come from the files of its first time point
+only. `r if (nzchar(fu_disagree)) paste0("These files disagree on age, sex or health in some units, which then lack it: ", fu_disagree, ".") else "No unit's files disagree on them."`
+`r if (nrow(hc)) paste0("The health level changes for ", nrow(hc), if (nrow(hc) == 1) " unit (" else " units (", and_list(sprintf("%d in %s", hc_n, names(hc_n))), ").") else "No unit changes health level."`
+
+`r paste(vapply(mats, say_first, ""), collapse = "\n\n")`
+
+The assays whose units change, fitted alone in each matrix, on all their time
+points and on the first one only:
+
+```{r first-time-point-per-assay}
+per_all   <- per_dep[per_dep$dataset_id %in% changed, ]
+per_first <- fit_each(fu[fu$study %in% changed, ])
+both_per  <- bind_rows(mutate(per_all, files = "all time points (median)"),
+                       mutate(per_first, files = "first time point only"))
+both_per  <- both_per[order(match(both_per$matrix, MATRICES), both_per$assay, both_per$files,
+                            method = "radix"), ]
+knitr::kable(rounded(both_per[, c("matrix", "assay", "files", "n", "lo_x", "hi_x",
+                                  "slope", "lo", "hi", "p", "alone")]),
+             row.names = FALSE,
+             col.names = c("matrix", "assay", "files of a person", "units", "age from",
+                           "age to", "slope per year", "95% CI low", "95% CI high", "p",
+                           "shown alone"),
+             caption = "The log2 ratio against age inside each assay whose units change")
+all_rises   <- pick(per_all, "rise")
+first_rises <- pick(per_first, "rise")
+```
+
+Over all time points, `r nrow(all_rises)` of the `r nrow(per_all)` fits of these
+assays `r if (nrow(all_rises) == 1) "shows" else "show"` the rise on
+`r if (nrow(all_rises) == 1) "its" else "their"` own`r if (nrow(all_rises)) paste0(": ", said(all_rises))`.
+On the first time point only, `r nrow(first_rises)` of `r nrow(per_first)`
+`r if (nrow(first_rises) == 1) "does" else "do"``r if (nrow(first_rises)) paste0(": ", said(first_rises))`.
+
+# Check: the area baseline
+
+This check is not part of the chapter's results, and the step summary above
+does not use it. Step 5 measures a peak's area above a straight line between its
+two boundary scans. Where the scan just outside a boundary is empty, the signal
+rises from nothing there, and that line leaves out the part of the peak below
+the boundary scan. Step 5 therefore also records the area with the line started
+from zero on such a side (`auc0`). Here the model of each matrix, on all its
+units and on its healthy units only, is fitted again on log2 ratios built from
+that area. The files, the units and the terms stay as above; only the areas
+change.
+
+```{r check-baseline}
+# The two baselines, as the table names them.
+BASELINES <- c("between the boundary scans", "from zero beside an empty scan")
+# A per-file table written before step 5 recorded auc0 has no such columns.
+has_auc0 <- all(c("par_auc0", "met_auc0") %in% names(pf))
+if (has_auc0) {
+  # Each file's ratio on auc0, then the units and the fits as above.
+  pf0    <- pf
+  pf0$l2 <- file_l2(pf0, "auc0")
+  n_ratio <- sum(is.finite(pf$l2))
+  n_moved <- sum(is.finite(pf$l2) & pf0$l2 != pf$l2)
+  u0 <- unitise(pf0, fields = "subj")
+  u0 <- u0[is.finite(u0$l2) & u0$site %in% MATRICES & is.finite(u0$agen) &
+             u0$agen >= ADULT_MIN_AGE & !is.na(u0$sex2), ]
+  # auc0 is missing exactly where the area is, so the units are those of the models.
+  stopifnot(setequal(u0$unit, blood$unit))
+  units0   <- by_mat(u0)
+  healthy0 <- by_mat(u0[u0$health == "healthy", ])
+  alt <- bind_rows(fit_rows(lapply(units0, fit_matrix), units0, "all units"),
+                   fit_rows(lapply(healthy0, fit_matrix), healthy0, "healthy units only"))
+  by_base <- bind_rows(mutate(pooled, baseline = BASELINES[1]),
+                       mutate(alt, baseline = BASELINES[2]))
+  by_base <- by_base[order(match(by_base$matrix, MATRICES), by_base$model, method = "radix"), ]
+  # The slope of one matrix on all its units, on both baselines.
+  slope_p  <- function(r) sprintf("%+.3f (%.3f to %.3f; p = %s)", r$slope, r$lo, r$hi, fmt_p(r$p))
+  say_base <- function(mat) {
+    r <- by_base[by_base$matrix == mat & by_base$model == "all units", ]
+    if (nrow(r) < 2) return(paste0("in ", mat, ", too few units to fit"))
+    sprintf("by %s in %s with the line between the boundary scans and by %s with the line from zero",
+            slope_p(r[1, ]), mat, slope_p(r[2, ]))
+  }
+  # Where the 95% interval of each fit lies, on each baseline.
+  side <- function(lo, hi) ifelse(lo > 0, "above zero", ifelse(hi < 0, "below zero", "across zero"))
+  fits <- merge(pooled, alt, by = c("matrix", "model"), suffixes = c("", "0"))
+  fits <- fits[order(match(fits$matrix, MATRICES), fits$model, method = "radix"), ]
+  fits$side  <- side(fits$lo, fits$hi)
+  fits$side0 <- side(fits$lo0, fits$hi0)
+  same <- fits$side == fits$side0
+  on   <- c("all units" = "on all units", "healthy units only" = "on the healthy units only")
+  # The fits whose interval lies the same way on both baselines, grouped by where it lies.
+  alike <- fits[same, ]
+  grp   <- split(alike$matrix, factor(paste(on[alike$model], alike$side, sep = "|"),
+                                      unique(paste(on[alike$model], alike$side, sep = "|"))))
+  alike_txt <- paste(vapply(names(grp), function(g) {
+    k <- strsplit(g, "|", fixed = TRUE)[[1]]
+    sprintf("%s in %s %s", k[2], and_list(grp[[g]]), k[1])
+  }, ""), collapse = "; ")
+  baseline_txt <- paste0(
+    "The line from zero changes the ratio of ", n_moved, " of the ", n_ratio,
+    " files that give one. On all units, the log2 ratio changes per year of age ",
+    paste(vapply(mats, say_base, ""), collapse = "; "), ". ",
+    if (any(same)) paste0("On both baselines, the 95% interval lies ", alike_txt, ". "),
+    if (any(!same)) paste0("It lies differently in ",
+      and_list(sprintf("%s %s: %s with the line between the boundary scans, %s with the line from zero",
+                       fits$matrix[!same], on[fits$model[!same]], fits$side[!same], fits$side0[!same])), "."))
+} else {
+  baseline_txt <- paste("The per-file table has no area on the second baseline (no par_auc0 or",
+                        "met_auc0 column): it was written before step 5 recorded one, so the",
+                        "check waits for step 5 to be rendered again.")
+}
+if (has_auc0)
+  knitr::kable(rounded(transform(by_base[, c("matrix", "model", "baseline", "units",
+                                             "slope", "lo", "hi", "p")], p = fmt_p(p))),
+               row.names = FALSE,
+               col.names = c("matrix", "fit", "area baseline", "units", "slope per year",
+                             "95% CI low", "95% CI high", "p"),
+               caption = "The log2 ratio against age in each matrix, on the two area baselines")
+```
+
+`r baseline_txt`
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

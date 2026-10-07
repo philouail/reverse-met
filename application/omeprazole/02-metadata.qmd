@@ -1,0 +1,577 @@
+---
+title: "02 - Metadata"
+subtitle: "Step 2: sample descriptions retrieved and harmonised"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+Each deposit that step 1 kept is described from its repository's own metadata,
+and the descriptions are mapped onto one per-sample schema. Each hit is also
+assigned to the assay it belongs to: from here on the unit is the *assay* (one
+analysis of a deposit; a MassIVE deposit counts as one), and later steps join on
+its identifier, `dataset_id`.
+
+**Input:** `artifacts/hits_search.csv`, plus per-deposit rules written in this
+notebook where the automatic route falls short, marked as manual work. The manual
+rules read files obtained by hand and kept in `dataset_metadata/` (they are
+tracked in git): `MSV000086975_metadata.tsv`, `MSV000085256_panredu.json`,
+`MSV000082433_panredu.json`, `s_MTBLS12231.txt` and the positive and negative
+mode assay files `a_MTBLS12231_*.txt`.
+
+**Output:** `artifacts/hits_assigned.csv`, `artifacts/metadata_entities.csv`,
+`artifacts/assay_metadata.csv` and `artifacts/related_deposits.csv`, plus `artifacts/rescue_samples.csv`
+and `artifacts/removed_step2.csv` (the deposits removed by the first pass).
+
+```{r setup}
+source("../../R/setup.R")
+source("../../R/masst.R")
+source("../../R/metadata.R")
+```
+
+```{r load-hits}
+all_hits <- read.csv("artifacts/hits_search.csv", check.names = FALSE,
+                     stringsAsFactors = FALSE)
+D_both <- unique(all_hits$ATTRIBUTE_DatasetAccession)
+D_entering <- D_both
+cat("Deposits:", length(D_both), "\n")
+```
+
+# What is already known
+
+Before anything is fetched, the deposits that the search index (ReDU) already
+describes are checked, with the same function as in the other application. A
+deposit is judged only when ReDU describes every file that carries a hit. The check
+then reads every file ReDU describes in the deposit, blanks and QCs set aside, and
+removes the deposit when none of these files is human and at least one is of
+another species (a file with no species recorded is ignored). This application is
+exploratory, so the species is the only thing checked in ReDU: no deposit is
+removed for its body site, and none for metadata that is missing. A deposit in a
+repository the `MsBackend` packages cannot read is removed, as in the other
+application. Everything else goes on to the other sources.
+
+```{r known-wrong}
+# Species only: no body-site check and no removal by hand.
+pass1 <- redu_first_pass(
+  all_hits,
+  fasst_db  = Sys.getenv("FASST_DB", "E:/FASSTrecords/db/masst_records.sqlite"),
+  redu_out  = "StructureMASST_output/redu_files.csv",
+  body_site = NULL,
+  by_hand   = NULL)
+removed_step2 <- pass1$removed
+D_both        <- pass1$deposits
+all_hits      <- pass1$hits
+write.csv(removed_step2, "artifacts/removed_step2.csv", row.names = FALSE)
+cat("ReDU describes every hit file of", pass1$n_described,
+    "deposits | removed:", nrow(removed_step2), "| deposits left:", length(D_both), "\n")
+table(removed_step2$reason)
+```
+
+# Sources
+
+The repositories share no metadata schema. MassIVE deposits are described by the
+submitter's own sample table, when there is one, and by Pan-ReDU; MetaboLights
+deposits by their ISA-Tab files and Metabolomics Workbench deposits by their
+mwTab files, both fetched with functions of `MsBackendMetaboLights` and
+`MsBackendMetabolomicsWorkbench`. Most fetched files are cached in
+`dataset_metadata/`. Placeholders such as "missing value" are read as missing.
+
+# Manual: metadata found by hand
+
+::: {.callout-warning title="Manual work"}
+The deposits listed here needed their metadata found by hand, because no source
+reached by the automatic route below describes them well enough. Each block reads
+one deposit's metadata from where it was found (a file in the deposit, a Pan-ReDU
+export or the ISA-Tab files) and maps its column names by hand.
+
+- **`MSV000082493` and `MSV000084008`**: the omeprazole probe cohort (Jarmusch
+  et al. 2020, *Clin Transl Sci*, PMC7485946). Healthy volunteers given a
+  modified Cooperstown CYP-probe cocktail on study days 1 and 9, with a 7-day
+  cefprozil course in between; plasma, urine, feces and skin. The metadata is in
+  neither deposit and in no catalogue: it is in the authors' GitHub repository,
+  `Materials/Metadata.txt` at commit `95586620`, and it carries the genotyped
+  CYP2C19 phenotype of every subject. The two accessions share this table:
+  plasma rows go to 084008, the rest to 082493.
+- **`MSV000086975`**: schizophrenia (PMID 34741130). A submitter TSV inside the
+  deposit.
+- **`MSV000085256`**: Alzheimer's disease (PMID 34244695). A Pan-ReDU export,
+  the deposit itself having come up short.
+- **`MSV000082433`**: Amerindian communities. A Pan-ReDU export. The one deposit
+  whose recorded country describes where the participants come from rather than
+  where the study ran.
+- **`MTBLS12231`**: COVID-19 (PMC12019401). The ISA-Tab sample file joined to its
+  positive and negative mode assay files. ISA-Tab allows duplicate column names,
+  so the first occurrence of each is used.
+
+The probe cohort is fetched first, because the automatic route below reads the
+files these blocks write into `dataset_metadata/`. All of them are written with
+the same columns into `artifacts/rescue_samples.csv`. The columns that exist only
+because the probe cohort has them are `timepoint` (study day), `timepoint_mins`
+(minutes after the dose), `pharmkinetics_cyp2c19` (the study's own per-subject
+CYP2C19 value), `cyp2c19_phenotype` and `cyp2c19_genotype`.
+MSV000084008 has no Pan-ReDU record and all its hit files are plasma, so its
+metadata is the plasma part of the shared table.
+:::
+
+```{r metadata-setup}
+MD <- "dataset_metadata"
+miss <- function(x) {
+  x[x %in% c("", "missing value", "not applicable", "not collected")] <- NA
+  x
+}
+```
+
+```{r fetch-82493}
+SRC_COMMIT <- "95586620ead4ac5241dc1e99a98e047c1f99b17b"
+SRC_URL <- sprintf(paste0("https://raw.githubusercontent.com/alan-jarmusch/",
+                          "UntargetedMS-DrugMetabolism/%s/Materials/Metadata.txt"),
+                   SRC_COMMIT)
+LOCAL <- "dataset_metadata/MSV000082493_metadata.tsv"
+if (!file.exists(LOCAL))
+  utils::download.file(SRC_URL, LOCAL, quiet = TRUE, mode = "wb")
+
+jm <- read.delim(LOCAL, check.names = FALSE, stringsAsFactors = FALSE,
+                na.strings = c("", "not applicable"))
+```
+
+```{r std-schema}
+std_cols <- c("deposit_id","file","subject_id","sex","age","health_status",
+              "specimen","timepoint","timepoint_mins","pharmkinetics_cyp2c19",
+              "cyp2c19_phenotype","cyp2c19_genotype","include")
+num_cols <- c("age", "timepoint_mins", "pharmkinetics_cyp2c19")
+blank <- function(n) setNames(as.data.frame(matrix(NA_character_, n, length(std_cols))), std_cols)
+```
+
+```{r jarmusch}
+jm_std <- data.frame(
+  file = jm$filename, subject_id = jm$ATTRIBUTE_Subject, sex = jm$ATTRIBUTE_sex,
+  age = as_num(jm$age), health_status = "healthy",
+  specimen = dplyr::case_when(grepl("plasma", jm$ATTRIBUTE_Body_Site, TRUE) ~ "plasma",
+                              grepl("^UA", jm$ATTRIBUTE_Body_Site) ~ "urine",
+                              grepl("fecal", jm$ATTRIBUTE_Body_Site, TRUE) ~ "feces",
+                              grepl("forehead|skin", jm$ATTRIBUTE_Body_Site, TRUE) ~ "skin",
+                              TRUE ~ NA_character_),
+  timepoint = jm$ATTRIBUTE_Study_Day,
+  timepoint_mins = as_num(jm$ATTRIBUTE_Time_Point_Mins),
+  pharmkinetics_cyp2c19 = as_num(jm$PharmKinetics_CYP2C19),
+  cyp2c19_phenotype = jm$PharmGeno_Phenotype_2C19,
+  cyp2c19_genotype = jm$PharmGeno_CYP2C19, include = jm$Include_Exclude,
+  stringsAsFactors = FALSE)
+jm_std <- jm_std[jm_std$include %in% "include" & !is.na(jm_std$specimen), ]
+d84008 <- cbind(deposit_id = "MSV000084008", jm_std[jm_std$specimen == "plasma", std_cols[-1]])
+d82493 <- cbind(deposit_id = "MSV000082493", jm_std[jm_std$specimen != "plasma", std_cols[-1]])
+```
+
+```{r probe-summary}
+#| echo: false
+cat("MSV000082493 + 084008:", nrow(jm_std), "biological samples of", nrow(jm), "files\n")
+cat("\nspecimen x study day:\n"); print(table(jm_std$specimen, jm_std$timepoint, useNA = "ifany"))
+cat("\nCYP2C19 genotyped phenotype:\n"); print(table(jm_std$cyp2c19_phenotype, useNA = "ifany"))
+cat("\nsubjects:", length(unique(jm_std$subject_id)), "\n")
+```
+
+```{r derive-84008}
+is_plasma <- grepl("plasma", jm$ATTRIBUTE_Body_Site, ignore.case = TRUE)
+plasma <- jm[is_plasma, , drop = FALSE]
+write.table(plasma, "dataset_metadata/MSV000084008_metadata.tsv",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+cat("MSV000084008_metadata.tsv <- plasma rows:", nrow(plasma), "of", nrow(jm), "\n")
+cat("body sites kept:", paste(sort(unique(plasma$ATTRIBUTE_Body_Site)), collapse = ", "), "\n")
+```
+
+```{r sz}
+sz <- read.delim(file.path(MD, "MSV000086975_metadata.tsv"), check.names = FALSE, stringsAsFactors = FALSE)
+sid <- strsplit(sz$`#SampleID`, "_", fixed = TRUE)
+d86975 <- blank(nrow(sz)); d86975$deposit_id <- "MSV000086975"
+d86975$file <- sz$Metabolomics_FileName; d86975$subject_id <- sz$`#SampleID`
+d86975$sex <- vapply(sid, function(p) if (length(p) >= 2) p[2] else NA_character_, character(1))
+d86975$age <- as_num(sz$AGE)
+d86975$health_status <- sz$Metadata          # HC / SZ
+d86975$specimen <- "plasma"; d86975$include <- "include"
+```
+
+```{r az}
+pj <- function(f) {
+  txt <- paste(readLines(file.path(MD, f), warn = FALSE), collapse = "")
+  objs <- regmatches(txt, gregexpr("\\{[^{}]*\\}", txt))[[1]]
+  g <- function(o, k) { m <- regmatches(o, regexpr(sprintf('"%s": "[^"]*"', k), o))
+    if (length(m)) sub('.*: "', "", sub('"$', "", m)) else NA_character_ }
+  data.frame(file = miss(vapply(objs, g, character(1), "filename")),
+             subject_id = miss(vapply(objs, g, character(1), "SubjectIdentifierAsRecorded")),
+             sex = miss(vapply(objs, g, character(1), "BiologicalSex")),
+             age = as_num(miss(vapply(objs, g, character(1), "AgeInYears"))),
+             health_status = miss(vapply(objs, g, character(1), "HealthStatus")),
+             specimen = miss(vapply(objs, g, character(1), "UBERONBodyPartName")),
+             row.names = NULL, stringsAsFactors = FALSE) }
+a <- pj("MSV000085256_panredu.json"); d85256 <- blank(nrow(a)); d85256$deposit_id <- "MSV000085256"
+d85256[names(a)] <- a; d85256$specimen <- ifelse(grepl("plasma", d85256$specimen, TRUE), "plasma",
+                                          ifelse(grepl("cerebro|CSF", d85256$specimen, TRUE), "CSF", d85256$specimen))
+d85256$include <- "include"
+```
+
+```{r amerindians}
+b <- pj("MSV000082433_panredu.json"); d82433 <- blank(nrow(b)); d82433$deposit_id <- "MSV000082433"
+d82433[names(b)] <- b; d82433$include <- "include"
+```
+
+```{r covid}
+col1 <- function(d, nm) d[[ which(names(d) == nm)[1] ]]
+s <- read.delim(file.path(MD, "s_MTBLS12231.txt"), check.names = FALSE, stringsAsFactors = FALSE)
+read_a <- function(p) { d <- read.delim(
+    file.path(MD, sprintf("a_MTBLS12231_LC-MS_%s_reverse-phase_metabolite_profiling.txt", p)),
+    check.names = FALSE, stringsAsFactors = FALSE)
+  # the raw column is empty here; pick whichever *Spectral Data File column is
+  # populated
+  fcols <- grep("Spectral Data File", names(d))
+  fcol  <- fcols[which.max(vapply(fcols, function(i)
+             sum(grepl("\\.(mzML|mzXML|raw|d|wiff)$", d[[i]])), integer(1)))]
+  data.frame(sample = col1(d, "Sample Name"), raw = basename(d[[fcol]]),
+             stringsAsFactors = FALSE) }
+amap <- rbind(read_a("positive"), read_a("negative"))
+sref <- data.frame(sample = col1(s, "Sample Name"),
+                   genetype = col1(s, "Factor Value[genetype]"),
+                   part = col1(s, "Characteristics[Organism part]"), stringsAsFactors = FALSE)
+mm <- dplyr::left_join(amap, sref, by = "sample")
+d12231 <- blank(nrow(mm)); d12231$deposit_id <- "MTBLS12231"
+d12231$file <- basename(mm$raw); d12231$subject_id <- mm$sample
+d12231$health_status <- mm$genetype; d12231$specimen <- mm$part
+d12231$include <- "include"
+```
+
+```{r combine}
+frames <- lapply(list(d82493, d84008, d86975, d85256, d82433, d12231), function(f) {
+  f$timepoint <- as.character(f$timepoint)
+  for (cc in setdiff(std_cols, num_cols)) f[[cc]] <- as.character(f[[cc]])
+  for (cc in num_cols) f[[cc]] <- as_num(f[[cc]])
+  f[, std_cols]
+})
+all_std <- dplyr::bind_rows(frames)
+write.csv(all_std, "artifacts/rescue_samples.csv", row.names = FALSE)
+
+cat("Rescue samples per deposit x specimen:\n"); print(table(all_std$deposit_id, all_std$specimen, useNA = "ifany"))
+cat("\nHealth stratifier availability per deposit:\n")
+for (d in unique(all_std$deposit_id)) {
+  x <- all_std[all_std$deposit_id == d, ]
+  cat(sprintf("  %-14s n=%-4d sex=%-3s age=%-3s health={%s}\n", d, nrow(x),
+      ifelse(any(!is.na(x$sex)),"Y","-"), ifelse(any(!is.na(x$age)),"Y","-"),
+      paste(sort(unique(na.omit(x$health_status))), collapse="/")))
+}
+```
+
+`r length(intersect(D_both, all_std$deposit_id))` of the
+`r length(unique(all_std$deposit_id))` deposits read by hand are among the
+deposits left for the question, and the step summary counts only these.
+
+# Submitter tables in the deposits
+
+Every MassIVE deposit is also looked up for the submitter's own table, as in the
+other application: any table file of the deposit, in any folder, with a column
+that names the deposit's own MS files; only the rows of those files are kept. A
+table found by hand above is used as it is.
+
+```{r submitter-tables}
+msv   <- D_both[startsWith(D_both, "MSV")]
+found <- vapply(msv, function(d) !is.null(fetch_massive_submitter_table(d)), logical(1))
+found <- found[!msv %in% all_std$deposit_id]
+cat("MassIVE deposits with a submitter table:", sum(found), "of", length(msv), "\n")
+```
+
+# Automatic harvest
+
+For every deposit, technical metadata (chromatography, ionisation, instrument,
+per assay) and biological metadata (which columns hold the subject, sex, age and
+so on) are read from the sources above. `harvest_metadata_coverage()` maps each
+deposit's own column names onto the shared fields.
+
+```{r auto-assess}
+#| code-fold: true
+tech_raw <- fetch_assay_metadata(D_both)
+coverage <- tibble::as_tibble(
+  dplyr::bind_rows(lapply(D_both, harvest_metadata_coverage))
+)
+write.csv(tech_raw, "artifacts/assay_metadata.csv", row.names = FALSE)
+```
+
+```{r auto-assess-display}
+#| echo: false
+coverage[, c("dataset_id", "n_samples", "n_canonical_mapped",
+             grep("^col_", names(coverage), value = TRUE))]
+```
+
+# Assays
+
+MetaboLights and Workbench deposits often hold several assays of the same
+samples under one accession. Each hit is assigned to its assay from the file it
+came from; MassIVE has no assay concept, so its deposits stay whole. A hit whose
+file matches no known assay is marked `_unmatched`.
+
+::: {.callout-warning title="Manual work"}
+The Workbench lists each sample's files without saying which analysis each one
+belongs to, so the first name is taken to belong to the first analysis, and so
+on. Where a deposit lists them in another order, the order is declared by hand in
+`MWB_FILE_ORDER` (`R/metadata.R`), checked against the deposit's folders and the
+retention times in its own results tables. File names found in two folders of a
+deposit cannot be told apart and are left out.
+:::
+
+```{r mwb-file-order}
+MWB_FILE_ORDER[intersect(names(MWB_FILE_ORDER), D_both)]
+```
+
+```{r assay-assignment}
+mtbls_st <- D_both[grepl("^(MTBLS|ST)", D_both)]
+assay_lookups  <- setNames(lapply(mtbls_st, assay_lookup_for),
+                           mtbls_st)
+
+all_hits$assay <- mapply(function(ds, fp) {
+  if (startsWith(ds, "MSV")) return(NA_character_)
+  file_to_assay(basename(fp), assay_lookups[[ds]])
+}, all_hits$ATTRIBUTE_DatasetAccession, all_hits$file_path,
+USE.NAMES = FALSE)
+
+all_hits$deposit_id <- all_hits$ATTRIBUTE_DatasetAccession
+all_hits$dataset_id <- make_dataset_id(all_hits$deposit_id, all_hits$assay)
+
+# MASST hits whose file basename doesn't resolve to any known assay
+mtbls_st_hits <- all_hits$deposit_id %in% mtbls_st
+unresolved    <- mtbls_st_hits & is.na(all_hits$assay)
+all_hits$dataset_id[unresolved] <- paste0(all_hits$deposit_id[unresolved],
+                                          "_unmatched")
+```
+
+```{r write-hits}
+write.csv(all_hits, "artifacts/hits_assigned.csv", row.names = FALSE)
+```
+
+# Manual: deposit-level facts and column names
+
+::: {.callout-warning title="Manual work"}
+Values that no per-file column carries, taken from the publication or the deposit
+description (`constants`), and column names that the automatic mapping misses
+(`custom_col_map`). `location_type` says whether `country` is where the study ran
+(`study_site`) or where the participants come from (`participant_origin`); only
+MSV000082433 is the latter.
+One fact comes from file names: MSV000094097 has no subject column in any of
+its metadata, and its file names are the only place its submitters say which
+person a file comes from (`OAD_001_Basal_P`, `OAD_001_Day15_S`), so the person is
+read from the start of the file name (`subject_from_file`). Without it, each
+person's plasma and serum at two time points would count as four people.
+:::
+
+```{r manual-annotations}
+constants <- list(
+  # No subject column anywhere; the file name starts with the person
+  # (OAD_001_Basal_P, OAD_001_Day15_S).
+  MSV000094097 = list(subject_from_file = "^([A-Z]*OAD_[0-9]+)_.*$"),
+  # --- study-site cohorts: `country` = recruitment location, not participant
+  # origin ---
+  MTBLS1866    = list(country = "Italy",          location_type = "study_site"),   # Barberis et al. 2020
+  MTBLS11656   = list(country = "China", body_site = "blood plasma",
+                      location_type = "study_site"),                                # Xinxiang/Zhengzhou 2017 (PMC11823611)
+  ST002044     = list(country = "India", body_site = "blood serum",
+                      location_type = "study_site"),                                # Kumar et al.; mwTab has no body_site col
+  ST002722     = list(country = "United States of America", body_site = "blood serum",
+                      location_type = "study_site"),                                # UCSD NAFLD Center 2014-2017
+  MSV000088255 = list(country = "United Kingdom", location_type = "study_site"),    # 100 spot urine, Glasgow, NHS 14/LO/188
+
+  # chromatography companions
+  MSV000092754 = list(chromatography = "HILIC"),                                    # HILIC companion of 092757
+  MSV000092757 = list(chromatography = "RP"),                                       # RP companion of 092754
+
+  # 082493/084008: omeprazole CYP2C19-probe cohort; genotype in
+  # rescue_samples.csv
+  MSV000082493 = list(country = "United States of America", location_type = "study_site",
+                      chromatography = "RP", health_status = "healthy"),
+  MSV000084008 = list(country = "United States of America", location_type = "study_site",
+                      chromatography = "RP", health_status = "healthy",
+                      body_site = "blood plasma"),
+  MSV000086975 = list(country = "United States of America", location_type = "study_site",
+                      chromatography = "RP", body_site = "blood plasma"),           # schizophrenia (PMID 34741130)
+  MSV000085256 = list(country = "United States of America", location_type = "study_site"),  # Alzheimer's (PMID 34244695)
+
+  # the one deposit whose location describes participant origin:
+  MSV000082433 = list(country = "Venezuela", location_type = "participant_origin",
+                      chromatography = "RP", health_status = "healthy")             # Amerindian communities
+)
+
+custom_col_map <- list(
+  # the Chagas pair's submitter tables (metadata/ in each deposit)
+  MSV000092754 = list(
+    subject_id    = "patient_id1",
+    sex           = "ATTRIBUTE_sex",
+    age           = "age",
+    health_status = "ATTRIBUTE_status"),
+  MSV000092757 = list(
+    subject_id    = "patient_id1",
+    sex           = "ATTRIBUTE_sex",
+    age           = "age",
+    health_status = "ATTRIBUTE_status"),
+  # native columns the DRAFT_CANDIDATES heuristic misses (082493/084008 need
+  # none)
+  MSV000086975 = list(subject_id = "#SampleID", age = "AGE", health_status = "Metadata")
+)
+```
+
+# One table per assay
+
+One row per assay, with the repository, the chromatography, the column
+mappings (`col_`) and the deposit-level facts (`const_`). Step 3 keeps the rows
+that survive curation.
+
+```{r build-metadata-table}
+#| code-fold: true
+entities <- unique(all_hits[!grepl("_unmatched$", all_hits$dataset_id),
+                            c("dataset_id", "deposit_id", "assay")])
+entities <- entities[order(entities$dataset_id, method = "radix"), ]
+
+tech_renamed <- tech_raw |>
+  dplyr::rename(deposit_id     = dataset_id,
+                chromatography = chrom_type) |>
+  dplyr::select(deposit_id, assay, repository, chromatography)
+
+is_msv <- startsWith(entities$deposit_id, "MSV")
+msv_meta <- entities[is_msv, ] |>
+  dplyr::left_join(tech_renamed |> dplyr::select(-assay),
+                   by = "deposit_id")
+# A MassIVE deposit can report a real chromatography for some runs and "Unknown"
+# for others, which gives it two rows here. Keep the real one.
+unknown  <- is.na(msv_meta$chromatography) | msv_meta$chromatography %in% c("Unknown", "")
+msv_meta <- msv_meta[order(msv_meta$dataset_id, unknown, method = "radix"), ]
+msv_meta <- msv_meta[!duplicated(msv_meta$dataset_id), ]
+nonmsv_meta <- entities[!is_msv, ] |>
+  dplyr::left_join(tech_renamed, by = c("deposit_id", "assay"))
+
+dataset_metadata <- dplyr::bind_rows(msv_meta, nonmsv_meta) |>
+  dplyr::left_join(coverage |> dplyr::rename(deposit_id = dataset_id),
+                   by = "deposit_id")
+
+const_fields <- unique(unlist(lapply(constants, names)))
+for (canon in const_fields) {
+  col <- paste0("const_", canon)
+  dataset_metadata[[col]] <- vapply(
+    dataset_metadata$deposit_id,
+    function(d) {
+      v <- constants[[d]][[canon]]
+      if (is.null(v)) NA_character_ else as.character(v)
+    },
+    character(1))
+}
+
+if ("const_chromatography" %in% names(dataset_metadata)) {
+  use_const <- !is.na(dataset_metadata$const_chromatography) &
+               (is.na(dataset_metadata$chromatography) |
+                dataset_metadata$chromatography == "" |
+                dataset_metadata$chromatography == "Unknown")
+  dataset_metadata$chromatography[use_const] <-
+    dataset_metadata$const_chromatography[use_const]
+}
+
+for (ds in names(custom_col_map)) {
+  ix <- which(dataset_metadata$deposit_id == ds)
+  if (!length(ix)) next
+  for (canon in names(custom_col_map[[ds]])) {
+    col_key <- paste0("col_", canon)
+    if (col_key %in% names(dataset_metadata)) {
+      dataset_metadata[[col_key]][ix] <- custom_col_map[[ds]][[canon]]
+    }
+  }
+}
+
+dataset_metadata <- dataset_metadata[
+  , c("dataset_id", "deposit_id", "assay", "repository", "chromatography",
+      "n_samples", "n_canonical_mapped",
+      grep("^col_",   names(dataset_metadata), value = TRUE),
+      grep("^const_", names(dataset_metadata), value = TRUE))]
+write.csv(dataset_metadata, "artifacts/metadata_entities.csv", row.names = FALSE)
+dataset_metadata
+```
+
+# Manual: related deposits
+
+```{r probe-shared-files}
+#| echo: false
+# Files with a hit under both accessions of the probe cohort, matched on the file
+# name without its folder and extension.
+file_stem <- function(p) sub("[.][^.]+$", "", basename(p))
+shared_probe <- intersect(
+  file_stem(all_hits$file_path[all_hits$deposit_id == "MSV000082493"]),
+  file_stem(all_hits$file_path[all_hits$deposit_id == "MSV000084008"]))
+```
+
+::: {.callout-warning title="Manual work"}
+An accession is not always a study. Accessions can be related in opposite ways,
+and the analysis has to know which is which.
+
+**MSV000082493 and MSV000084008 are two accessions of one study** (the same
+14-subject crossover, PMC7485946). The same physical files appear under both,
+with different paths and extensions, so they must be counted once.
+`r length(shared_probe)` of the files with a hit are under both, such as:
+
+```
+mzspec:MSV000082493:updates/2019-03-27_alan_jarmusch_6d15f636/peak/blood/DM003_1_360_RG10_01_43808.mzXML
+mzspec:MSV000084008:ccms_peak/blood/DM003_1_360_RG10_01_43808.mzML
+```
+
+**MSV000092754 and MSV000092757 are the opposite case.** They share their file
+names and subjects, but one is the HILIC run and the other reverse phase, so the
+same file name refers to a different measurement in each. They count as one
+study for pooling and must never be merged on file name.
+:::
+
+```{r related-deposits}
+related_deposits <- tibble::tribble(
+  ~dataset_id,    ~related_to,     ~relation,                  ~notes,
+  "MSV000084008", "MSV000082493",  "same_study_different_arm",
+  paste("Same 14-subject study (PMC7485946). 084008 re-deposits 082493's blood",
+        "arm under other paths and extensions. 082493 contributes feces/skin/urine here,",
+        "084008 blood. Do not treat as independent cohorts and do not count the",
+        "subjects twice: collapse on file name."),
+
+  "MSV000092757", "MSV000092754",  "same_samples_two_assays",
+  paste("Same Chagas serum panel measured twice, HILIC (092754) and",
+        "reverse phase (092757). The file names are shared but the files are",
+        "different measurements, not copies. One study for pooling; never merge",
+        "on file name.")
+)
+write.csv(related_deposits, "artifacts/related_deposits.csv", row.names = FALSE)
+related_deposits
+```
+
+# Step summary
+
+The results of this step, as the chapter's table shows them.
+
+```{r step-summary}
+# Only the first pass (What is already known) removes deposits here: the deposits
+# left for the question are those it keeps.
+summary_step <- data.frame(
+  item  = c("deposits entering", "deposits that may answer the research question",
+            "... sample table found by hand", "... information completed by hand",
+            "assays with a hit"),
+  value = c(length(D_entering),
+            length(D_both),
+            length(intersect(D_both, all_std$deposit_id)),
+            length(intersect(D_both, union(names(constants), names(custom_col_map)))),
+            nrow(dataset_metadata)))
+# For the discussion's recap only: the files with a hit in those deposits.
+summary_step <- rbind(summary_step, data.frame(
+  item  = "recap: files",
+  value = length(unique(paste(all_hits$ATTRIBUTE_DatasetAccession,
+                              basename(all_hits$file_path))))))
+write.csv(summary_step, "artifacts/summary_step2.csv", row.names = FALSE)
+summary_step
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
