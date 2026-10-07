@@ -1,14 +1,12 @@
-# R/metadata.R — per-dataset biological metadata, table-driven.
-# harvest_metadata_coverage(ds): auto-match canonical -> native column names.
-# load_metadata(dataset_id): apply the table's col_*/const_* spec to the native table.
+# Per-dataset biological metadata: harvest_metadata_coverage() matches canonical to native
+# columns; load_metadata() applies the table's col_*/const_* spec to the native table.
 
 CANONICAL_COLS <- c("file", "sample_name", "subject_id", "sex", "age",
                     "group", "health_status", "body_site", "country",
                     "treatment", "timepoint")
 
-# MIN_SUBMITTER_FIELDS: min canonical DRAFT_CANDIDATES fields a submitter-only file
-# must populate to be admitted (see msv_native_sample_table).
-# MSV_FILENAME_COLS: native raw-file-name columns; naming varies across submitter TSVs.
+# MIN_SUBMITTER_FIELDS: canonical fields a submitter-only file must fill to be kept.
+# MSV_FILENAME_COLS: native raw-file-name columns (naming varies across submitter TSVs).
 MIN_SUBMITTER_FIELDS <- 2L
 
 MSV_FILENAME_COLS <- c("filename", "Filename", "FileName",
@@ -25,14 +23,26 @@ make_dataset_id <- function(deposit_id, assay) {
   }, deposit_id, assay, USE.NAMES = FALSE)
 }
 
-# Candidate native columns per canonical field; matched case-insensitively full-string,
-# first hit wins. Covers ISA-Tab (MetaboLights), mwTab (Workbench), MassIVE "ATTRIBUTE_*",
-# and Pan-ReDU bare names.
+# Display label for a dataset_id: the accession without the assay boilerplate;
+# ids that would share a label keep their full id.
+short_ds <- function(x, ids = unique(x)) {
+  ids <- unique(as.character(ids))
+  s   <- sub("_AN[0-9]+$", "", sub("_LC-MS_.*$", "", ids))
+  lab <- stats::setNames(ifelse(s %in% s[duplicated(s)], ids, s), ids)
+  out <- unname(lab[as.character(x)])
+  ifelse(is.na(out), as.character(x), out)
+}
+
+# Candidate native columns per canonical field, matched case-insensitively on the full
+# name, first hit wins (ISA-Tab, mwTab, MassIVE ATTRIBUTE_*, Pan-ReDU).
 DRAFT_CANDIDATES <- list(
   subject_id    = c("Source Name", "Subject", "Subject ID", "SubjectID",
                     "ATTRIBUTE_Subject",
                     "ATTRIBUTE_SubjectIdentifierAsRecorded",
-                    "SubjectIdentifierAsRecorded", "UniqueSubjectID"),
+                    "SubjectIdentifierAsRecorded", "UniqueSubjectID",
+                    ".*_SubjectIdentifierAsRecorded",
+                    "ATTRIBUTE_Subject.*", "subject.?id", "subject",
+                    "patient.?id", "participant.?id", "donor.?id"),
   sample_name   = c("Sample Name", "SampleID", "Sample ID",
                     "ATTRIBUTE_SampleName", "qiita_sample_name", "filename"),
   group         = c("Comment\\[Patient status\\]",
@@ -58,7 +68,10 @@ DRAFT_CANDIDATES <- list(
                     "Characteristics\\[Body site\\]",
                     "ATTRIBUTE_BodySite", "ATTRIBUTE_Body_Site",
                     "ATTRIBUTE_Sampletype", "ATTRIBUTE_Sample_Type",
-                    "UBERONBodyPartName"),
+                    "UBERONBodyPartName", ".*BodyPartOntologyName",
+                    "ATTRIBUTE_Tissue", "ATTRIBUTE_Matrix", "ATTRIBUTE_Biofluid",
+                    "tissue", "matrix", "biofluid", "body.?site", "sample_type",
+                    "specimen.?type", "specimen"),
   # Sampling time: needed to reconstruct a PK curve and integrate per-subject AUC.
   timepoint     = c("ATTRIBUTE_Time_Point_Mins", "ATTRIBUTE_Time_Point",
                     "ATTRIBUTE_Timepoint", "ATTRIBUTE_Study_Day",
@@ -69,19 +82,27 @@ DRAFT_CANDIDATES <- list(
                     "Comment\\[Sex\\]",
                     "Comment\\[Gender\\]",
                     "Factors: Gender", "Factors: Sex",
-                    "ATTRIBUTE_Sex",
-                    "BiologicalSex"),
+                    "ATTRIBUTE_Sex", "ATTRIBUTE_Subject_Sex",
+                    "BiologicalSex",
+                    "ATTRIBUTE_Gender", "sex", "gender"),
   age           = c("Characteristics\\[Age\\]",
                     "Factor Value\\[Age\\]",
                     "Comment\\[Age\\]",
                     "Additional sample data: Age",
                     "ATTRIBUTE_Age",
-                    "AgeInYears"),
+                    "AgeInYears", ".*_AgeInYears",
+                    "ATTRIBUTE_Age.*", "age", "age.?\\(.*\\)", "age.?years?",
+                    "age_.*", ".*_age"),
   country       = c("Comment\\[Country\\]",
                     "Characteristics\\[Geographic location\\]",
                     "Characteristics\\[Country\\]",
                     "ATTRIBUTE_Country",
                     "Country"),
+  # Species: Pan-ReDU, ISA-Tab, the Workbench study (SUBJECT_SPECIES) and
+  # submitter tables. Not a canonical column: step 2 reads it for its inventory.
+  species       = c("NCBITaxonomy", "Characteristics\\[Organism\\]",
+                    "SUBJECT_SPECIES", "ATTRIBUTE_Organism", "ATTRIBUTE_Species",
+                    "organism", "species"),
   treatment     = c("Factor Value\\[Treatment\\]",
                     "Comment\\[Treatment\\]",
                     "Characteristics\\[Treatment\\]",
@@ -97,29 +118,74 @@ match_candidate <- function(native_cols, patterns) {
   NA_character_
 }
 
+# ---- repositories that do not answer --------------------------------------
+
+# Error-message words of a repository that did not answer (connection failure, timeout,
+# HTTP 429/502/503/504); a 404 is not one. Keep in sync with NETWORK in bench/rerun.sh.
+NETWORK_ERROR <- paste(
+  "Failed to perform HTTP request", "resolve host", "connect to server",
+  "Timeout (of [0-9]+ seconds )?was reached", "timed out", "Connection (was )?reset",
+  "Connection refused", "Recv failure", "Send failure", "receiving data",
+  "sending data", "Server returned nothing", "Transferred a partial file",
+  "SSL connect error", "(HTTP|error:?) ?(429|50[234])", "Too Many Requests",
+  "Bad Gateway", "Service Unavailable", "Gateway Time-?out", "not all .rnames. found",
+  sep = "|")
+
+# TRUE when `e` (error or warning) is a repository that did not answer; handlers re-raise
+# it so the render stops (and bench/rerun.sh retries) instead of writing a smaller result.
+is_network_error <- function(e)
+  grepl(NETWORK_ERROR, conditionMessage(e), ignore.case = TRUE)
+
+# url() (also behind read.table() on a URL) reports a network failure only as a warning;
+# raise that warning as the error.
+offline_as_error <- function(expr)
+  withCallingHandlers(expr, warning = function(w)
+    if (is_network_error(w)) stop(conditionMessage(w), call. = FALSE))
+
+# A study deposited twice (same_study_different_arm) counts each file once: TRUE for files
+# of `deposits` also in the relation's first-column deposit; files_of(d) lists d's files.
+is_copy <- function(files, deposits, files_of,
+                    related_csv = "artifacts/related_deposits.csv") {
+  out <- logical(length(files))
+  if (!file.exists(related_csv)) return(out)
+  r <- read.csv(related_csv, stringsAsFactors = FALSE)
+  r <- r[r$relation == "same_study_different_arm", , drop = FALSE]
+  for (i in seq_len(nrow(r))) {
+    in_copy <- deposits == r$related_to[i]
+    out[in_copy] <- norm_file_key(files[in_copy]) %in% norm_file_key(files_of(r$dataset_id[i]))
+  }
+  out
+}
+
 # ---- harvest --------------------------------------------------------------
 
 native_sample_table <- function(deposit_id) {
   if (startsWith(deposit_id, "MTBLS")) {
-    # Cached ISA-Tab study table first, same as the assay table in
-    # expand_files_mtbls(): a render must not depend on EBI being reachable.
+    # Cached ISA-Tab study table first, so a render does not depend on EBI being reachable;
+    # step 5 reads the s_<id>.txt copy too.
     cache <- file.path(META_DIR, paste0("s_", deposit_id, ".txt"))
-    if (file.exists(cache)) read.delim(cache, check.names = FALSE,
-                                       stringsAsFactors = FALSE) else
-      as.data.frame(MsBackendMetaboLights::mtbls_sample_data(deposit_id),
-                    check.names = FALSE)
+    if (!file.exists(cache)) {
+      s <- offline_as_error(MsBackendMetaboLights::mtbls_sample_data(deposit_id))
+      dir.create(META_DIR, showWarnings = FALSE, recursive = TRUE)
+      write.table(s, cache, sep = "\t", quote = FALSE, row.names = FALSE)
+    }
+    read.delim(cache, check.names = FALSE, stringsAsFactors = FALSE)
   } else if (startsWith(deposit_id, "ST")) {
-    MsBackendMetabolomicsWorkbench::mwb_metadata(deposit_id)$sample_annotation
+    # The cached copy first, as for MetaboLights (mwb_metadata_cached()).
+    md <- mwb_metadata_cached(deposit_id)
+    s  <- md$sample_annotation
+    # Species and sample type are stated once per study, not per sample.
+    s$SUBJECT_SPECIES <- md$MS_run$SUBJECT_SPECIES[1]
+    s$SAMPLE_TYPE     <- md$MS_run$SAMPLE_TYPE[1]
+    s
   } else if (startsWith(deposit_id, "MSV")) {
     msv_native_sample_table(deposit_id)
   } else NULL
 }
 
-# MassIVE: full outer join of Pan-ReDU and submitter TSV on filename stem, then drop
-# submitter-only rows absent from massive_list_files(). Pan-ReDU under-covers deposits
-# (misses 082493's 341-file blood collection + its CYP2C19 columns); the inventory check
-# keeps phantom protection while recovering annotated files. NULL if both sources missing.
-msv_native_sample_table <- function(deposit_id) {
+# MassIVE: Pan-ReDU joined with the submitter TSV on file stem; submitter-only rows need the
+# file in the deposit listing and min_fields filled (0 keeps all). NULL if neither exists.
+msv_native_sample_table <- function(deposit_id, min_fields = MIN_SUBMITTER_FIELDS) {
   pr <- fetch_panredu_metadata(deposit_id)
 
   fs <- list.files("dataset_metadata",
@@ -132,7 +198,11 @@ msv_native_sample_table <- function(deposit_id) {
   } else NULL
   if (!is.null(local)) names(local) <- make.unique(names(local))
 
-  if (is.null(pr) && is.null(local)) return(NULL)
+  if (is.null(pr) && is.null(local)) {
+    # Nothing found is not the same as Pan-ReDU not answering.
+    if (panredu_failed(deposit_id)) stop("Pan-ReDU did not answer")
+    return(NULL)
+  }
   if (is.null(local)) return(pr)
   if (is.null(pr))    return(local)
 
@@ -160,6 +230,7 @@ msv_native_sample_table <- function(deposit_id) {
     real <- tryCatch(
       tolower(tools::file_path_sans_ext(basename(massive_real_ms_files(deposit_id)))),
       error = function(e) {
+        if (is_network_error(e)) stop(e)
         message("  massive_list_files failed for ", deposit_id,
                 "; keeping Pan-ReDU rows only")
         NULL
@@ -168,33 +239,45 @@ msv_native_sample_table <- function(deposit_id) {
              else extra[extra$.stem %in% real, , drop = FALSE]
   }
   if (nrow(extra)) {
-    # Keep a submitter-only row only if >= MIN_SUBMITTER_FIELDS canonical fields resolve
+    # Keep a submitter-only row only if >= min_fields canonical fields resolve
     # to a real value (is_missing_val treats ReDU/MIxS placeholders as absent).
     n_fields <- rowSums(vapply(DRAFT_CANDIDATES, function(pat) {
       cl <- match_candidate(names(extra), pat)
       if (is.na(cl) || !nzchar(cl) || !cl %in% names(extra))
         rep(FALSE, nrow(extra)) else !is_missing_val(extra[[cl]])
     }, logical(nrow(extra))))
-    keep  <- n_fields >= MIN_SUBMITTER_FIELDS
+    keep  <- n_fields >= min_fields
     thin  <- sum(!keep)
     extra <- extra[keep, , drop = FALSE]
     if (thin)
       message("  ", deposit_id, ": dropped ", thin,
-              " submitter-only files with < ", MIN_SUBMITTER_FIELDS,
+              " submitter-only files with < ", min_fields,
               " usable metadata fields")
   }
   if (nrow(extra)) {
     extra$filename <- extra[[local_fcol]]
     message("  ", deposit_id, ": +", nrow(extra),
             " submitter-only files not in Pan-ReDU")
-    out <- dplyr::bind_rows(out, extra)
+    # The two sources can type the same column differently (a year as text in one,
+    # a number in the other), which bind_rows refuses; stack them as text.
+    as_text <- function(d) { d[] <- lapply(d, as.character); d }
+    out <- dplyr::bind_rows(as_text(out), as_text(extra))
   }
   out$.stem <- NULL
   out
 }
 
 harvest_metadata_coverage <- function(deposit_id) {
-  s <- native_sample_table(deposit_id)
+  # Unreadable metadata gives n_samples NA (not 0) so step 3 can tell it from "nothing
+  # found"; a repository that does not answer stops the render.
+  s <- tryCatch(native_sample_table(deposit_id), error = function(e) {
+    if (is_network_error(e)) stop(e)
+    message("  metadata not reachable for ", deposit_id, ": ", conditionMessage(e))
+    FALSE
+  })
+  if (isFALSE(s))
+    return(data.frame(dataset_id = deposit_id, n_samples = NA_integer_,
+                      n_canonical_mapped = 0L, stringsAsFactors = FALSE))
   if (is.null(s) || !nrow(s)) {
     return(data.frame(
       dataset_id   = deposit_id,
@@ -203,19 +286,17 @@ harvest_metadata_coverage <- function(deposit_id) {
       stringsAsFactors = FALSE
     ))
   }
-  cols <- names(s)
-  mapped <- vapply(names(DRAFT_CANDIDATES),
-                   function(f) match_candidate(cols, DRAFT_CANDIDATES[[f]]),
-                   character(1))
-
-  # Demote a mapping to NA when its column holds only REDU/MIxS placeholders (see REDU_MISSING).
-  has_value <- function(col_name) {
-    if (is.na(col_name) || !col_name %in% names(s)) return(FALSE)
-    any(!is_missing_val(s[[col_name]]))
-  }
-  mapped <- vapply(mapped,
-                   function(c) if (has_value(c)) c else NA_character_,
-                   character(1))
+  # For each field, the first candidate column that holds a real value: a column of
+  # REDU/MIxS placeholders only (see REDU_MISSING) passes to the next candidate.
+  has_value <- function(col_name) any(!is_missing_val(s[[col_name]]))
+  mapped <- vapply(names(DRAFT_CANDIDATES), function(f) {
+    for (pat in DRAFT_CANDIDATES[[f]]) {
+      hits <- grep(paste0("^", pat, "$"), names(s), value = TRUE, ignore.case = TRUE)
+      hits <- hits[vapply(hits, has_value, logical(1))]
+      if (length(hits)) return(hits[1])
+    }
+    NA_character_
+  }, character(1))
 
   row <- data.frame(
     dataset_id         = deposit_id,
@@ -233,7 +314,7 @@ read_metadata_table <- function(
     path = "artifacts/dataset_metadata_table.csv") {
   if (!file.exists(path))
     stop("Metadata table not found: ", path,
-         "\n  Render 01-masst-curation.qmd first; it builds this artifact.")
+         "\n  Render 03-curation.qmd first; it builds this artifact.")
   read.csv(path, check.names = FALSE, stringsAsFactors = FALSE)
 }
 
@@ -255,6 +336,21 @@ apply_spec_to_native <- function(native, spec) {
       out[[canon]] <- v
     } else {
       out[[canon]] <- NA
+    }
+  }
+  # A deposit that suffixes each subject id with the visit (MSV000084556: FD001_T1,
+  # FD001_T2, ...) declares the suffix in step 2, so that one person is one subject.
+  if (!is.null(spec$const_subject_suffix) && !is.na(spec$const_subject_suffix))
+    out$subject_id <- sub(spec$const_subject_suffix, "", out$subject_id)
+  # A deposit that names each person only in its file names declares in step 2 a pattern
+  # whose first bracket is the person (MSV000094097: OAD_001_Basal_P).
+  pat <- spec$const_subject_from_file
+  if (!is.null(pat) && !is.na(pat)) {
+    fcol <- match_candidate(names(native), MSV_FILENAME_COLS)
+    if (!is.na(fcol)) {
+      f   <- basename(as.character(native[[fcol]]))
+      hit <- is.na(out$subject_id) & grepl(pat, f)
+      out$subject_id[hit] <- sub(pat, "\\1", f[hit])
     }
   }
   out
@@ -286,10 +382,8 @@ load_metadata <- function(dataset_id,
            stop("Unknown deposit_id prefix: ", deposit_id)
 
   for (k in CANONICAL_COLS) if (!k %in% names(out)) out[[k]] <- NA
-  # `age` and `timepoint` are numeric by intent but come from free-text cells, and
-  # deposited metadata puts non-numbers in them (MSV000082493 carries a literal
-  # "FALSE" in ATTRIBUTE_Time_Point_Mins). Normalise here so every consumer sees a
-  # number or NA, rather than each one re-deciding and a stray string reaching a CSV.
+  # age and timepoint come from free-text cells that can hold non-numbers (a literal "FALSE"):
+  # normalise here so every consumer sees a number or NA.
   for (k in c("age", "timepoint")) out[[k]] <- as_num(out[[k]])
   out[, CANONICAL_COLS]
 }
@@ -297,14 +391,11 @@ load_metadata <- function(dataset_id,
 expand_files_mtbls <- function(deposit_id, assay, native, s_canon, spec) {
   if (is.null(assay) || !nzchar(assay))
     stop("MTBLS load_metadata() requires `assay` (the a_*.txt file name).")
-  # Prefer the copy `01` already cached in dataset_metadata/. Re-fetching here
-  # made every render depend on EBI being reachable, and when its FTP timed out
-  # the caller's tryCatch silently swapped a 35-column table for a 25-column
-  # stub -- which surfaced two chunks later as an rbind column mismatch, not as
-  # a network error. Downloads still go through the MsBackend package.
+  # Prefer the copy `02` already cached in dataset_metadata/, so that a render does not
+  # depend on EBI being reachable; otherwise the table is fetched with MsBackendMetaboLights.
   cache <- file.path(META_DIR, assay)
   a_tbl <- if (file.exists(cache)) read.delim(cache, check.names = FALSE) else
-    MsBackendMetaboLights::mtbls_assay_data(deposit_id, assayName = assay)
+    offline_as_error(MsBackendMetaboLights::mtbls_assay_data(deposit_id, assayName = assay))
   fcol <- if ("Derived Spectral Data File" %in% names(a_tbl) &&
               any(nzchar(trimws(as.character(
                 a_tbl[["Derived Spectral Data File"]])))))
@@ -329,9 +420,7 @@ expand_files_mtbls <- function(deposit_id, assay, native, s_canon, spec) {
 expand_files_mwb <- function(deposit_id, assay, native, s_canon, spec) {
   if (is.null(assay) || !nzchar(assay))
     stop("ST load_metadata() requires `assay` (the AN file name).")
-  md <- MsBackendMetabolomicsWorkbench::mwb_metadata(deposit_id)
-  an_ids    <- md$MS_run$ANALYSIS_ID
-  an_labels <- paste0(deposit_id, "_", an_ids, ".txt")
+  an_labels <- paste0(deposit_id, "_", mwb_analysis_order(deposit_id), ".txt")
   an_idx    <- match(assay, an_labels)
   if (is.na(an_idx))
     stop("Assay ", assay, " not found in MS_run for ", deposit_id)
@@ -362,7 +451,70 @@ expand_files_massive <- function(deposit_id, native, s_canon, spec) {
   out
 }
 
-# ===== Pan-ReDU (was panredu.R) =====
+# ===== what ReDU already knows (step 2, first pass) =====
+
+# Deposits removed on ReDU alone, judged only when ReDU describes every hit file (a missing species
+# or body site never removes one): not_human, no_blood (with `body_site`), not_reachable, `by_hand`.
+redu_first_pass <- function(all_hits, fasst_db, redu_out, body_site = NULL,
+                            by_hand = NULL) {
+  deposits <- unique(all_hits$ATTRIBUTE_DatasetAccession)
+  if (file.exists(fasst_db)) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), fasst_db, flags = RSQLite::SQLITE_RO)
+    r <- DBI::dbGetQuery(con, "SELECT ATTRIBUTE_DatasetAccession AS deposit_id, filename,
+                                      NCBITaxonomy AS species, UBERONBodyPartName AS body_site,
+                                      SampleType AS sample_type FROM redu_table")
+    DBI::dbDisconnect(con)
+    r$deposit_id <- trimws(gsub('"', "", r$deposit_id))
+    write.csv(r[r$deposit_id %in% deposits, ], redu_out, row.names = FALSE)
+  }
+  r <- read.csv(redu_out, stringsAsFactors = FALSE)
+  r <- r[r$deposit_id %in% deposits, ]
+
+  # Deposits with a hit file that ReDU does not describe: not judged here.
+  file_key  <- function(f) tolower(sub("[.][^.]*$", "", basename(f)))
+  hit_files <- unique(all_hits[, c("ATTRIBUTE_DatasetAccession", "file_path")])
+  described <- paste(hit_files$ATTRIBUTE_DatasetAccession, file_key(hit_files$file_path)) %in%
+               paste(r$deposit_id, file_key(r$filename))
+  partly    <- unique(hit_files$ATTRIBUTE_DatasetAccession[!described])
+
+  r <- r[!grepl("blank|qc|standard", r$sample_type, ignore.case = TRUE), ]
+  n_described <- length(setdiff(unique(r$deposit_id), partly))
+  known <- data.frame(deposit_id = character(), reason = character())
+  if (nrow(r)) {
+    r$described     <- 1
+    r$human         <- grepl("9606|homo sapiens", r$species, ignore.case = TRUE)
+    r$other_species <- !is_missing_val(r$species) & !r$human
+    # Without `body_site` no file counts as another site, so no deposit is no_blood.
+    if (is.null(body_site)) {
+      r$blood <- FALSE
+      r$other_site <- FALSE
+    } else {
+      r$blood      <- grepl(body_site, r$body_site, ignore.case = TRUE)
+      r$other_site <- !is_missing_val(r$body_site) & !r$blood
+    }
+    known <- aggregate(cbind(described, human, other_species, blood, other_site) ~ deposit_id,
+                       data = r, FUN = sum)
+    known <- known[!known$deposit_id %in% partly, ]
+    known$reason <- ifelse(known$other_species > 0 & known$human == 0, "not_human",
+                    ifelse(known$blood == 0 & known$other_site == known$described,
+                           "no_blood", NA_character_))
+  }
+  unreadable <- deposits[!grepl("^(MSV|MTBLS|ST)", deposits)]
+  if (!is.null(by_hand)) by_hand <- by_hand[by_hand$dataset_id %in% deposits, ]
+  removed <- dplyr::bind_rows(
+    tibble::tibble(dataset_id = unreadable, reason = "not_reachable",
+                   notes      = "a repository the MsBackend packages do not read"),
+    tibble::tibble(dataset_id = known$deposit_id[!is.na(known$reason)],
+                   reason     = known$reason[!is.na(known$reason)],
+                   notes      = "ReDU describes every file with a hit"),
+    by_hand)
+  removed <- removed[!duplicated(removed$dataset_id), ]
+  left    <- setdiff(deposits, removed$dataset_id)
+  list(removed = removed, deposits = left, n_described = n_described,
+       hits = all_hits[all_hits$ATTRIBUTE_DatasetAccession %in% left, ])
+}
+
+# ===== Pan-ReDU =====
 
 # GNPS2's harmonised metadata layer over MassIVE/MetaboLights/Workbench; often the only
 # standardised source for MassIVE deposits. Used as fallback/gap-fill alongside local TSVs.
@@ -372,17 +524,24 @@ PANREDU_URL_TMPL <- paste0(
   "attributeterm/%s/files?filters=%%5B%%5D"
 )
 
-# Fetch Pan-ReDU per-file metadata for one accession (MSV/MTBLS/ST). Returns a data.frame
-# (one row per file) or NULL on failure/empty; caches to <cache_dir>/<ds>_panredu.tsv.
+# Accessions Pan-ReDU failed for in this R session (an HTTP error, not a network failure),
+# so each is asked once per render.
+PANREDU_FAILED <- new.env()
+panredu_failed <- function(ds) exists(ds, envir = PANREDU_FAILED, inherits = FALSE)
+
+# Pan-ReDU per-file metadata for one accession, or NULL on failure/no rows; cached as
+# <cache_dir>/<ds>_panredu.tsv, or an empty <ds>_panredu.none when Pan-ReDU has no rows.
 fetch_panredu_metadata <- function(ds,
                                    cache_dir = "dataset_metadata",
                                    force = FALSE,
                                    timeout = 180L) {
   cache_path <- file.path(cache_dir, paste0(ds, "_panredu.tsv"))
+  none_path  <- file.path(cache_dir, paste0(ds, "_panredu.none"))
   if (!force && file.exists(cache_path)) {
     return(read.delim(cache_path, check.names = FALSE,
                       stringsAsFactors = FALSE, na.strings = ""))
   }
+  if (!force && (file.exists(none_path) || panredu_failed(ds))) return(NULL)
 
   url <- sprintf(PANREDU_URL_TMPL, ds)
   tmp <- tempfile(fileext = ".json")
@@ -392,11 +551,13 @@ fetch_panredu_metadata <- function(ds,
     curl::curl_download(url, tmp, handle = h, quiet = TRUE)
     TRUE
   }, error = function(e) {
+    if (is_network_error(e)) stop(e)
     message("Pan-ReDU fetch failed for ", ds, ": ", conditionMessage(e))
     FALSE
   })
   if (!ok) {
     if (file.exists(tmp)) unlink(tmp)
+    assign(ds, TRUE, envir = PANREDU_FAILED)
     return(NULL)
   }
 
@@ -405,6 +566,8 @@ fetch_panredu_metadata <- function(ds,
   if ((is.list(parsed) && !length(parsed)) ||
       (is.data.frame(parsed) && !nrow(parsed))) {
     message("Pan-ReDU returned no rows for ", ds)
+    dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+    file.create(none_path)
     return(NULL)
   }
 
@@ -417,20 +580,219 @@ fetch_panredu_metadata <- function(ds,
   df
 }
 
+# MS data files of a MassIVE deposit, by extension; vendor folders (x.d/, x.raw/)
+# count as one file each.
+MSV_MS_EXT <- "[.](mzml|mzxml|mgf|raw|wiff|cdf|mzdata)$"
+MSV_VENDOR_DIR <- "^(.*/)?([^/]+)[.](d|raw)/.*$"
+
+# Candidate tables downloaded per deposit, at most: a few deposits carry hundreds of
+# tables, and the ranking puts a sample table near the top.
+MSV_MAX_TABLES <- 20L
+
+# Tables that are not sample tables, by folder and by file name. Generic words like "method"
+# match the file name only, since a methods/ folder can hold the sample table.
+MSV_NOT_SAMPLE_DIR <- paste(
+  "^search", "sirius", "csi", "canopus", "zodiac", "trinity", "proteosafe", "ili_files",
+  "pdata", "quant", "feature", "mzmine", "msdial", "xcms", "standard",
+  sep = "|")
+MSV_NOT_SAMPLE_NAME <- paste(
+  "quant", "feature", "edges", "cluster", "network", "sirius", "csi", "canopus",
+  "zodiac", "formula", "structure", "identification", "trinity", "mzmine", "msdial",
+  "xcms", "peaklist", "peaktable", "_ili", "lcparms", "nugenesis", "acqmethod",
+  "method", "standard", "std_?mix", "compound", "smiles", "mwtab", "_maf", "read ?me",
+  "msgs", "result", "audit",
+  sep = "|")
+
+# A file's key: its base name without extension, in lower case ("C:\\run\\A1.mzML"
+# and "a1" are the same file).
+msv_file_key <- function(x) {
+  tolower(tools::file_path_sans_ext(sub(".*[/\\\\]", "", trimws(x))))
+}
+
+# Keys of the deposit's MS files, from its file listing.
+msv_ms_file_keys <- function(fl) {
+  in_vendor <- grepl(MSV_VENDOR_DIR, fl, ignore.case = TRUE)
+  unique(c(msv_file_key(fl[!in_vendor & grepl(MSV_MS_EXT, fl, ignore.case = TRUE)]),
+           tolower(sub(MSV_VENDOR_DIR, "\\2", fl[in_vendor], ignore.case = TRUE))))
+}
+
+# Table files that may be the sample table, most likely first: "meta" names, then sample-like
+# names, then the rest, later updates first; a name with "metadata" is never dropped.
+msv_table_candidates <- function(fl) {
+  cand <- grep("[.](tsv|txt|csv|xlsx|xls)$", fl, value = TRUE, ignore.case = TRUE)
+  cand <- cand[!grepl("[.](d|raw)/|(^|/)ccms_", cand, ignore.case = TRUE)]
+  rel  <- sub("^updates/[^/]+/", "", tolower(cand))
+  nm   <- basename(rel)
+  drop <- grepl(MSV_NOT_SAMPLE_DIR, dirname(rel)) |
+          (grepl(MSV_NOT_SAMPLE_NAME, nm) & !grepl("metadata", nm))
+  cand <- cand[!drop]
+  nm   <- nm[!drop]
+  tier <- ifelse(grepl("meta(?!bol)", nm, perl = TRUE), 1,
+          ifelse(grepl("sample|design|mapping|attribute|annot|group|info|key|manifest",
+                       nm), 2, 3))
+  upd  <- ifelse(startsWith(cand, "updates/"), sub("^updates/([^/]+)/.*$", "\\1", cand), "")
+  head(cand[order(tier, -rank(upd))], MSV_MAX_TABLES)
+}
+
+# A downloaded table (first Excel sheet, or tab/comma/semicolon text) as text columns, or NULL.
+# The header is the first of the top ten rows with >= 2 cells and > half the median row's.
+read_submitter_table <- function(p) {
+  x <- tryCatch(suppressWarnings(
+    if (grepl("[.]xlsx?$", p, ignore.case = TRUE)) {
+      as.data.frame(readxl::read_excel(p, col_names = FALSE, col_types = "text",
+                                       .name_repair = "minimal"))
+    } else {
+      b <- readBin(p, "raw", file.size(p))
+      # Windows tools often write UTF-16; a sample table is plain ASCII, so dropping the
+      # zero bytes decodes it.
+      if (length(b) > 1 && all(b[1:2] %in% as.raw(c(0xff, 0xfe)))) {
+        b <- b[-(1:2)]
+        b <- b[b != as.raw(0)]
+      }
+      txt <- rawToChar(b)
+      # Latin-1 text read as UTF-8 would break tolower() and the join later on.
+      if (!validUTF8(txt)) txt <- iconv(txt, "latin1", "UTF-8")
+      txt   <- gsub("\r\n?", "\n", sub("^\ufeff", "", txt))
+      lines <- strsplit(txt, "\n", fixed = TRUE)[[1]]
+      n     <- function(s, l) nchar(l) - nchar(gsub(s, "", l, fixed = TRUE))
+      sep   <- if (any(grepl("\t", head(lines, 10)))) "\t" else
+               if (n(";", lines[1]) > n(",", lines[1])) ";" else ","
+      # As many columns as the longest line, so that no line wraps onto the next.
+      read.delim(text = txt, sep = sep, header = FALSE, colClasses = "character",
+                 col.names = paste0("V", seq_len(1 + max(n(sep, lines)))))
+    }), error = function(e) NULL)
+  if (is.null(x) || nrow(x) < 2) return(NULL)
+  full <- !is.na(x) & trimws(as.matrix(x)) != ""
+  n    <- rowSums(head(full, 10))
+  h    <- which(n >= 2 & n > median(n) / 2)[1]
+  if (is.na(h)) return(NULL)
+  named <- full[h, ]
+  # Columns with neither a name nor a value (trailing separators) are dropped.
+  keep <- named | colSums(full[-seq_len(h), , drop = FALSE]) > 0
+  nm   <- ifelse(named, trimws(unlist(x[h, ])), paste0("V", seq_along(x)))[keep]
+  x    <- x[-seq_len(h), keep, drop = FALSE]
+  names(x)    <- make.unique(nm)
+  rownames(x) <- NULL
+  if (nrow(x)) x else NULL
+}
+
+# Columns of x naming the deposit's MS files: the first where >= a fifth (and >= 3) of values
+# are MS-file keys, then others naming other files. None for file lists or feature tables.
+msv_file_columns <- function(x, ms_keys) {
+  if (ncol(x) < 2 || any(grepl(MSV_MS_EXT, names(x), ignore.case = TRUE)) ||
+      any(c("#Scan#", "SpectrumID") %in% names(x)) ||
+      mean(grepl("^[0-9]", names(x))) > 0.5) return(integer())
+  js   <- integer()
+  seen <- character()
+  for (j in seq_along(x)) {
+    v   <- msv_file_key(x[[j]][!is.na(x[[j]]) & nzchar(trimws(x[[j]]))])
+    hit <- v %in% ms_keys
+    if (!length(v) || sum(hit) < min(3, nrow(x)) || mean(hit) < 0.2) next
+    if (length(js) && (anyDuplicated(v[hit]) || any(v[hit] %in% seen))) next
+    js   <- c(js, j)
+    seen <- c(seen, v[hit])
+  }
+  js
+}
+
+# Cache a MassIVE deposit's submitter sample table as <id>_metadata.tsv (path returned, or NULL);
+# none found leaves <id>_metadata_all.none, a failure caches nothing. A non-empty marker holds
+# the listing's warning about hidden files: delete it to search again once the package lists them.
+fetch_massive_submitter_table <- function(deposit_id, cache_dir = META_DIR) {
+  cached <- list.files(cache_dir, full.names = TRUE,
+                       pattern = paste0("^", deposit_id, "_metadata\\.(csv|tsv)$"))
+  if (length(cached)) return(cached[1])
+  none <- file.path(cache_dir, paste0(deposit_id, "_metadata_all.none"))
+  if (file.exists(none)) return(NULL)
+  hidden <- character()
+  fl <- tryCatch(withCallingHandlers(
+    massive_files(deposit_id),
+    warning = function(w) {
+      hidden <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    }), error = function(e) {
+      if (is_network_error(e)) stop(e)
+      NULL
+    })
+  if (is.null(fl)) return(NULL)                    # not listed now: try next time
+  ms_keys <- msv_ms_file_keys(fl)
+  cand    <- if (length(ms_keys)) msv_table_candidates(fl) else character()
+  # Without readxl every Excel table would read as unreadable, and the deposit
+  # would be marked as searched.
+  if (any(grepl("[.]xlsx?$", cand, ignore.case = TRUE)) &&
+      !requireNamespace("readxl", quietly = TRUE))
+    stop("Excel sample tables need the readxl package: install.packages(\"readxl\")")
+  tmp <- tempfile()
+  dir.create(tmp)
+  on.exit(unlink(tmp, recursive = TRUE))
+  failed <- FALSE
+  tabs <- lapply(cand, function(f) {
+    download <- function() {
+      unlink(list.files(tmp, full.names = TRUE))   # a partial download
+      tryCatch({
+        suppressWarnings(suppressMessages(MsBackendMassIVE::massive_download_file(
+          deposit_id, pattern = paste0("^", gsub("([^A-Za-z0-9/_-])", "[\\1]", f), "$"),
+          fileName = basename(f), path = tmp, overwrite = TRUE)))
+        length(list.files(tmp)) > 0
+      }, error = function(e) {
+        if (is_network_error(e)) stop(e)
+        FALSE
+      })
+    }
+    # A second try, as the MassIVE FTP drops a connection now and then.
+    if (!download() && !download()) {
+      message("  ", deposit_id, ": could not download ", f)
+      failed <<- TRUE
+      return(NULL)
+    }
+    # The file arrives under its URL-encoded name ("new%202.txt"): take what came.
+    p <- list.files(tmp, full.names = TRUE)
+    x <- read_submitter_table(p[1])
+    unlink(p)
+    if (is.null(x)) return(NULL)
+    # A table shared by several deposits (a MassiveID column): this deposit's rows.
+    own <- Find(function(v) deposit_id %in% v, x)
+    if (!is.null(own)) x <- x[own %in% deposit_id, , drop = FALSE]
+    js <- msv_file_columns(x, ms_keys)
+    if (!length(js)) return(NULL)
+    message("  ", deposit_id, ": sample table ", f, " (files in '",
+            paste(names(x)[js], collapse = "', '"), "')")
+    # One copy of the table per file column, that column named "filename".
+    dplyr::bind_rows(lapply(js, function(j) {
+      names(x)[names(x) == "filename"] <- "filename_submitted"
+      names(x)[j] <- "filename"
+      x
+    }))
+  })
+  # A failed download could hide the better table: keep nothing, try next time.
+  if (failed) return(NULL)
+  tabs <- Filter(Negate(is.null), tabs)
+  dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+  if (!length(tabs)) {
+    writeLines(hidden, none)
+    return(NULL)
+  }
+  # One row per deposited file, the first table in the order above winning; rows naming files
+  # never deposited would count as samples when Pan-ReDU has none.
+  out <- dplyr::bind_rows(tabs)
+  key <- msv_file_key(out$filename)
+  out <- out[key %in% ms_keys & !duplicated(key), ]
+  path <- file.path(cache_dir, paste0(deposit_id, "_metadata.tsv"))
+  # Quoted, so that a stray quote or line break in a cell survives read.delim().
+  write.table(out, path, sep = "\t", row.names = FALSE, quote = TRUE,
+              qmethod = "double", na = "")
+  path
+}
+
 # ---- extraction-set selection from the deposit inventory -----------------
 
-# Map prefixed cache filenames back to the bare names the pipeline keys on. MsBackend prefixes
-# cached files to dodge cross-dataset collisions: MetaboLights "<id>_<assayIndex>_<name>"
-# (e.g. MTBLS1866_1_1_p.mzML), MassIVE "<id>_<name>", Workbench "<zipbase>_<name>". Detect the
-# shared prefix from a file whose suffix is in `bare_ref`, then strip it; bare names pass through.
-# Lives here (not ms1.R) because norm_file_key() calls it and scripts source metadata.R alone.
+# Cached names (MsBackend prefixes them) back to the bare name: the longest name of `bare_ref`
+# each ends with. Here, not in ms1.R, because norm_file_key() needs it.
 to_bare_name <- function(x, bare_ref) {
   if (!length(x)) return(x)
   bare_ref <- unique(bare_ref)
-  # Resolve each name individually. Deriving one prefix from the first example assumes a
-  # deposit has only one form, and MTBLS1866 carries both MTBLS1866_129_p.mzML and the
-  # doubled MTBLS1866_1_MTBLS1866_DA44_p.mzML. Longest match wins, and the leading "_"
-  # keeps 21_p from resolving against 1_p.
+  # One by one, as a deposit can mix prefix forms; longest match wins, and the leading
+  # "_" keeps 21_p from resolving against 1_p.
   vapply(x, function(f) {
     if (f %in% bare_ref) return(f)
     cand <- bare_ref[endsWith(f, paste0("_", bare_ref))]
@@ -439,13 +801,8 @@ to_bare_name <- function(x, bare_ref) {
   }, character(1), USE.NAMES = FALSE)
 }
 
-# Normalise a file name for cross-source matching: drop accession prefix + extension, lower-case,
-# so MSV000082433_957.mzML, 957.mzXML and 957.mzML all reduce to "957".
-# Pass `bare_ref` (the dataset's real bio_files) whenever `x` comes from the cache: MsBackend
-# prefixes with accession and assay, and no regex can tell the assay token from the name, so
-# to_bare_name() resolves it against the real file list. Omit it for repo-derived names.
-#   cache-derived (dataOrigin, metrics_*$file) -> norm_file_key(x, bio_files)
-#   repo-derived  (hits_curated$file_path, submitter TSVs) -> norm_file_key(x)
+# Name key across sources: accession prefix and extension dropped, lower case (957.mzML -> "957").
+# Pass `bare_ref` (the real bio_files) for cache-derived names: only it resolves the assay prefix.
 norm_file_key <- function(x, bare_ref = NULL) {
   b <- basename(as.character(x))
   if (!is.null(bare_ref) && length(bare_ref))
@@ -454,17 +811,16 @@ norm_file_key <- function(x, bare_ref = NULL) {
   tolower(sub("[.][^.]*$", "", b))
 }
 
-# Build the MS1 extraction set for a MassIVE deposit from the deposit's OWN inventory, not a
-# metadata catalog: Pan-ReDU lists only harmonised-metadata files, a strict subset of what the
-# deposit holds and what MASST searched (082433: 223 catalog vs 457 spectra).
-# Returns data.frame(file, has_metadata); no-metadata files are kept only when they carry a
-# confirmed hit and must be excluded from stratified analysis.
-#   meta_keys = norm_file_key() of files with usable metadata (QC/blanks excluded by SampleType/EXCL_ST, not by name).
-#   hit_files = basenames of confirmed-hit files; always kept, whatever tree they live in.
+# MS1 extraction set of a MassIVE deposit from its own file listing: files with metadata
+# (meta_keys) plus hit files not declared non-biological. Returns data.frame(file, has_metadata).
 select_bio_files_massive <- function(deposit_id, meta_keys = character(),
-                                     hit_files = character()) {
-  inv <- tryCatch(MsBackendMassIVE::massive_list_files(deposit_id),
-                  error = function(e) NULL)
+                                     hit_files = character(),
+                                     nonbio_keys = character()) {
+  inv <- tryCatch(massive_files(deposit_id),
+                  error = function(e) {
+                    if (is_network_error(e)) stop(e)
+                    NULL
+                  })
   if (is.null(inv)) stop("massive_list_files failed for ", deposit_id)
   paths <- if (is.data.frame(inv)) {
     fc <- intersect(c("file_name", "fileName", "name", "path", "file",
@@ -472,22 +828,23 @@ select_bio_files_massive <- function(deposit_id, meta_keys = character(),
     as.character(inv[[fc]])
   } else as.character(inv)
 
-  # One copy per sample, deduplicated by normalised name not by picking a single tree:
-  # deposits hold the same sample under ccms_peak/, peak/, ...; restricting to one tree drops
-  # collections added by later updates (082493's 341 blood_plasma files live only under
-  # updates/.../peak/blood/, the CYP2C19 matrix). Prefer the ccms_peak copy on duplicates.
+  # One copy per sample by normalised name across all folders (later updates add collections
+  # elsewhere); the ccms_peak copy wins.
   ms  <- grep("[.](mzML|mzXML)$", paths, value = TRUE, ignore.case = TRUE)
   ms  <- ms[order(!grepl("^ccms_peak/", ms, ignore.case = TRUE))]
   bio <- ms[!duplicated(norm_file_key(basename(ms)))]
   with_meta <- basename(bio)[norm_file_key(basename(bio)) %in% meta_keys]
-  # Plus every confirmed-hit file, whatever tree it sits in.
-  all_files <- unique(c(with_meta, basename(as.character(hit_files))))
+  # Plus every confirmed-hit file, whatever tree it sits in, unless the metadata declares
+  # it non-biological.
+  hits <- basename(as.character(hit_files))
+  hits <- hits[!norm_file_key(hits) %in% nonbio_keys]
+  all_files <- unique(c(with_meta, hits))
 
-  # Pooled QC dropped outright (EXCL_POOL): not an independent sample, so out of num and denom.
-  n_pool <- sum(grepl(EXCL_POOL, all_files, perl = TRUE))
-  if (n_pool) {
-    message("  ", deposit_id, ": dropped ", n_pool, " pooled-QC files")
-    all_files <- all_files[!grepl(EXCL_POOL, all_files, perl = TRUE)]
+  # Pooled QCs, QC injections, blanks and standards dropped outright (EXCL_NONBIO).
+  n_nonbio <- sum(is_nonbio_file(all_files))
+  if (n_nonbio) {
+    message("  ", deposit_id, ": dropped ", n_nonbio, " QC, blank or standard files")
+    all_files <- all_files[!is_nonbio_file(all_files)]
   }
 
   data.frame(file         = all_files,
@@ -495,7 +852,7 @@ select_bio_files_massive <- function(deposit_id, meta_keys = character(),
              stringsAsFactors = FALSE)
 }
 
-# ===== assay/technical metadata (was assay_metadata.R) =====
+# ===== assay/technical metadata =====
 
 # fetch_assay_metadata(dataset_ids): one row per (dataset_id, assay). Sources: MTBLS from
 # mtbls_assay_data, ST from mwb_metadata()$MS_run, MSV from local TSV then Pan-ReDU fallback.
@@ -505,13 +862,8 @@ REDU_MISSING <- c("missing value", "not applicable", "not collected",
                   "not provided", "restricted access", "na", "n/a", "",
                   "-", "unknown", "no data")
 
-# Numeric where the text is a number, NA where it is not.
-#
-# as.numeric() answers "is this numeric?" by raising a warning, which then has to
-# be hidden -- and hiding it is how a corrupt cell stays invisible. Deposited
-# metadata is full of non-numeric entries in numeric columns (MSV000082493 carries
-# a literal "FALSE" in ATTRIBUTE_Time_Point_Mins), so decide with a predicate and
-# convert only what passes.
+# Numeric where the text is a number, NA where it is not, decided by a pattern rather
+# than by hiding as.numeric()'s warning.
 as_num <- function(x) {
   x <- as.character(x)
   ok <- !is.na(x) & grepl("^ *[-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)? *$", x)
@@ -521,7 +873,11 @@ as_num <- function(x) {
 }
 
 is_missing_val <- function(x) {
-  is.na(x) | tolower(trimws(as.character(x))) %in% REDU_MISSING
+  v <- tolower(trimws(as.character(x)))
+  # Pan-ReDU's UniqueSubjectID puts the accession before the recorded id, so a
+  # missing one reads "MSV000094097_nan".
+  v <- sub("^(msv|mtbls|st)[0-9]+_", "", v)
+  is.na(x) | v %in% c(REDU_MISSING, "nan")
 }
 
 chrom_type_of <- function(...) {
@@ -539,13 +895,12 @@ first_nonempty <- function(x) {
 }
 
 fetch_assay_metadata_mtbls <- function(ds) {
-  files <- MsBackendMetaboLights::mtbls_list_files(ds)
-  assay_files <- grep("^a_.*\\.txt$", basename(as.character(files)),
-                      value = TRUE)
+  # The assays the cached investigation file names, each read from its cached copy.
+  assay_files <- grep("^a_.*\\.txt$", mtbls_inv_assay_names(ds), value = TRUE)
   if (!length(assay_files)) return(NULL)
 
   do.call(rbind, lapply(assay_files, function(an) {
-    ad <- MsBackendMetaboLights::mtbls_assay_data(ds, assayName = an)
+    ad <- fetch_assay_table(ds, an)
     if (is.null(ad)) return(NULL)
     col_type  <- first_nonempty(ad[["Parameter Value[Column type]"]])
     col_model <- first_nonempty(ad[["Parameter Value[Column model]"]])
@@ -569,7 +924,7 @@ fetch_assay_metadata_mtbls <- function(ds) {
 }
 
 fetch_assay_metadata_mwb <- function(ds) {
-  md <- MsBackendMetabolomicsWorkbench::mwb_metadata(ds)
+  md <- mwb_metadata_cached(ds)
   if (is.null(md) || is.null(md$MS_run) || !nrow(md$MS_run)) return(NULL)
   m <- md$MS_run
   data.frame(
@@ -592,8 +947,13 @@ fetch_assay_metadata_massive <- function(ds) {
     if (is.null(x)) return(NULL)
     ifelse(is_missing_val(x), NA_character_, as.character(x))
   }
+  # Submitter tables sometimes prefix the ReDU names (MSV000086158: Analysis_...,
+  # ATTRIBUTE_Analysis_...); each prefixed form is matched too.
   get_col <- function(df, col) {
-    if (is.null(df) || !col %in% names(df)) NULL else clean(df[[col]])
+    if (is.null(df)) return(NULL)
+    hit <- intersect(c(col, paste0("Analysis_", col), paste0("ATTRIBUTE_Analysis_", col),
+                       paste0("ATTRIBUTE_", col)), names(df))
+    if (!length(hit)) NULL else clean(df[[hit[1]]])
   }
   all_missing <- function(x) is.null(x) || all(is.na(x))
 
@@ -653,24 +1013,30 @@ fetch_assay_metadata_massive <- function(ds) {
 }
 
 fetch_assay_metadata <- function(dataset_ids) {
-  rows <- lapply(unique(dataset_ids), function(ds) {
+  rows <- lapply(unique(dataset_ids), function(ds) tryCatch({
     if      (startsWith(ds, "MSV"))   fetch_assay_metadata_massive(ds)
     else if (startsWith(ds, "MTBLS")) fetch_assay_metadata_mtbls(ds)
     else if (startsWith(ds, "ST"))    fetch_assay_metadata_mwb(ds)
     else NULL
-  })
+  }, error = function(e) {
+    if (is_network_error(e)) stop(e)
+    message("  technical metadata not reachable for ", ds, ": ", conditionMessage(e))
+    NULL
+  }))
   do.call(rbind, rows)
 }
 
-# ===== biological file selection (was bio_files.R) =====
+# ===== biological file selection =====
 
 META_DIR <- "dataset_metadata"
 EXCL_ST  <- "(?i)^(blank|qc|pool|reference|standard|control|empty)"
 
-# Pooled QC excluded by file name: 094097's "Pool_*" files are SampleType "animal" so EXCL_ST
-# never fires, yet a re-injected pool inflates counts and denominator. The one name-based
-# override; deliberately narrow (leading "pool" only).
-EXCL_POOL <- "(?i)^pool"
+# Non-biological files by name (pooled QCs, QC injections, blanks, standards), often labelled
+# biological: a leading "pool" or "std<digit>", or a whole "qc" or "blank" token.
+EXCL_NONBIO <- "(?i)(^pool)|((^|[_-])(start_)?qc([_-]?[0-9]+)?([_.-]|$))|((^|[_-])blank([_-]|[0-9]|$))|(^std[0-9])"
+is_nonbio_file <- function(f)
+  grepl(EXCL_NONBIO, sub("^(MSV[0-9]+|MTBLS[0-9]+|ST[0-9]+)[_-]", "",
+                         basename(as.character(f))), perl = TRUE)
 
 # Assay file names for a MetaboLights study from its ISA investigation file (cached locally).
 mtbls_inv_assay_names <- function(ds) {
@@ -678,7 +1044,7 @@ mtbls_inv_assay_names <- function(ds) {
   if (!file.exists(inv_path)) {
     inv_url   <- paste0("https://ftp.ebi.ac.uk/pub/databases/metabolights/",
                         "studies/public/", ds, "/i_Investigation.txt")
-    inv_lines <- readLines(url(inv_url), warn = FALSE)
+    inv_lines <- offline_as_error(readLines(url(inv_url), warn = FALSE))
     writeLines(inv_lines, inv_path)
   } else {
     inv_lines <- readLines(inv_path, warn = FALSE)
@@ -689,13 +1055,15 @@ mtbls_inv_assay_names <- function(ds) {
   an[nchar(an) > 0]
 }
 
-# Fetch (or load from cache) one MetaboLights assay table; tries mtbls_assay_data() then FTP.
+# Fetch (or load from cache) one MetaboLights assay table; tries mtbls_assay_data() then FTP
+# (FTP only when mtbls_assay_data() failed for another reason than the network).
 fetch_assay_table <- function(ds, assay_name) {
   cache_path <- file.path(META_DIR, assay_name)
   if (file.exists(cache_path))
     return(read.delim(cache_path, check.names = FALSE))
-  adf <- tryCatch(mtbls_assay_data(ds, assay_name),
+  adf <- tryCatch(offline_as_error(mtbls_assay_data(ds, assay_name)),
                   error = function(e) {
+                    if (is_network_error(e)) stop(e)
                     message("  mtbls_assay_data failed for ", ds, "/",
                             assay_name, " (", e$message,
                             "); falling back to FTP")
@@ -708,7 +1076,7 @@ fetch_assay_table <- function(ds, assay_name) {
   }
   assay_url <- paste0("https://ftp.ebi.ac.uk/pub/databases/metabolights/",
                       "studies/public/", ds, "/", assay_name)
-  adf <- read.delim(url(assay_url), check.names = FALSE)
+  adf <- offline_as_error(read.delim(url(assay_url), check.names = FALSE))
   write.table(adf, cache_path, sep = "\t", row.names = FALSE, quote = FALSE)
   message("  Assay cached (FTP) → ", cache_path)
   adf
@@ -741,24 +1109,79 @@ assay_lookup_for <- function(ds) {
     }
     if (length(out)) out else NULL
   } else if (startsWith(ds, "ST")) {
-    md <- MsBackendMetabolomicsWorkbench::mwb_metadata(ds)
+    md <- mwb_metadata_cached(ds)
     if (is.null(md) || is.null(md$MS_run) || !nrow(md$MS_run)) return(NULL)
-    an_ids    <- md$MS_run$ANALYSIS_ID
-    an_labels <- paste0(ds, "_", an_ids, ".txt")
+    an_labels <- paste0(ds, "_", mwb_analysis_order(ds), ".txt")
+    # A study with one analysis: every file of the deposit belongs to it.
+    if (length(an_labels) == 1)
+      return(stats::setNames(list(mwb_listed_files(ds)), an_labels))
     rfn_col   <- grep("RAW_FILE_NAME", names(md$sample_annotation),
                       value = TRUE)[1]
     if (is.na(rfn_col)) return(NULL)
     per_sample <- strsplit(trimws(md$sample_annotation[[rfn_col]]), "\\s+")
+    # Positions only mean something when each sample lists one name per analysis.
+    if (length(an_labels) > 1 && all(lengths(per_sample) <= 1)) {
+      warning(ds, ": one file name per sample for ", length(an_labels),
+              " analyses; its hits are left unassigned")
+      return(NULL)
+    }
+    listed <- mwb_listed_files(ds)
     out <- list()
     for (i in seq_along(an_labels)) {
       files <- vapply(per_sample,
                       function(x) if (length(x) >= i) x[i] else NA_character_,
                       character(1))
       files <- basename(files[!is.na(files) & nzchar(files)])
+      # The metadata may name a file without its extension: match on the name alone.
+      stem  <- function(f) tolower(tools::file_path_sans_ext(f))
+      files <- listed[match(stem(files), stem(listed))]
+      files <- files[!is.na(files)]
       if (length(files)) out[[an_labels[i]]] <- unique(files)
     }
     if (length(out)) out else NULL
   } else NULL
+}
+
+# Analyses in the order a deposit lists its RAW_FILE_NAME entries, where that differs from
+# MS_run (by default the i-th name is the i-th analysis).
+MWB_FILE_ORDER <- list(
+  ST002044 = c("AN003327", "AN003328", "AN003325", "AN003326")
+)
+
+mwb_analysis_order <- function(deposit_id) {
+  ord <- MWB_FILE_ORDER[[deposit_id]]
+  if (is.null(ord))
+    ord <- as.character(mwb_metadata_cached(deposit_id)$MS_run$ANALYSIS_ID)
+  ord
+}
+
+# File names in the deposit listing, each once; a name found in two folders cannot be told
+# apart, so it is left out.
+mwb_listed_files <- function(deposit_id) {
+  fl <- mwb_list_files_cached(deposit_id)
+  b  <- basename(vapply(fl$sample_file, utils::URLdecode, character(1),
+                        USE.NAMES = FALSE))
+  b[!b %in% b[duplicated(b)]]
+}
+
+# A Workbench deposit's metadata and file listing, read from the saveRDS() copy in
+# dataset_metadata/ (written on first fetch); delete <id>_mwb_*.rds to fetch again.
+mwb_metadata_cached <- function(deposit_id)
+  mwb_cached(deposit_id, "metadata", MsBackendMetabolomicsWorkbench::mwb_metadata)
+
+mwb_list_files_cached <- function(deposit_id)
+  mwb_cached(deposit_id, "files", MsBackendMetabolomicsWorkbench::mwb_list_files)
+
+mwb_cached <- function(deposit_id, what, fetch, tag = "mwb") {
+  cache <- file.path(META_DIR, paste0(deposit_id, "_", tag, "_", what, ".rds"))
+  if (file.exists(cache)) return(readRDS(cache))
+  x <- fetch(deposit_id)
+  dir.create(META_DIR, showWarnings = FALSE, recursive = TRUE)
+  # Written whole before it takes its name, so that a render stopped mid-write
+  # leaves no broken copy for the next renders to read.
+  saveRDS(x, paste0(cache, ".part"))
+  file.rename(paste0(cache, ".part"), cache)
+  x
 }
 
 # Which assay a file belongs to in a lookup; NA if no assay's list has this basename.
@@ -771,11 +1194,15 @@ file_to_assay <- function(file_basename, lookup) {
   NA_character_
 }
 
-# MassIVE phantom-file guard: Pan-ReDU can advertise .mzXML names never deposited as spectra;
-# such phantoms made massive_sync_data_files() abort the dataset (084008: 21 phantoms). Keep only
-# files truly present as .mzML/.mzXML in the deposit listing. MsBackendMassIVE only (never curl/FTP).
+# MassIVE's file listing of a deposit, cached in dataset_metadata/ like the Workbench's;
+# delete <deposit>_msv_files.rds to read it anew.
+massive_files <- function(deposit_id)
+  mwb_cached(deposit_id, "files", MsBackendMassIVE::massive_list_files, tag = "msv")
+
+# The deposit's .mzML/.mzXML files as listed by MassIVE: Pan-ReDU can name files never
+# deposited, which make massive_sync_data_files() abort.
 massive_real_ms_files <- function(deposit_id) {
-  fl <- MsBackendMassIVE::massive_list_files(deposit_id)
+  fl <- massive_files(deposit_id)
   nm <- if (is.data.frame(fl)) {
     unlist(fl[[grep("file|name|path", names(fl), ignore.case = TRUE)[1]]])
   } else fl

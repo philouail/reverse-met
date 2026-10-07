@@ -1,35 +1,36 @@
 #!/usr/bin/env bash
-# Re-render pipeline stages in order, retrying the ones that depend on a remote repository.
-#   usage: bash bench/rerun.sh [stage ...]
-#   stages: massive metabolights workbench 02 03 04 05   (default: 02 03 04 05)
-#
-# Sequential by design: BiocFileCache is single-writer, so two renders at once deadlock.
-# GNPS2 and the EBI FTP drop requests under load, which looks like a hard failure but is
-# not, so a stage that fails on a known-transient message is retried rather than abandoned.
-# Anything else stops the run with the error printed, because a silent retry loop around a
-# real bug wastes hours.
-cd "$(dirname "$0")/.." || exit 1
+# bash bench/rerun.sh <application> [stage ...]: re-renders stages in order, retrying network
+# failures. Sequential: BiocFileCache is single-writer, so two renders at once deadlock.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
+APP="${1:?usage: bash bench/rerun.sh <application> [stage ...]}"; shift
+cd "$ROOT/application/$APP" 2>/dev/null || { echo "no such application: $APP"; exit 2; }
 
 export CONFIRM_CAP="${CONFIRM_CAP:-Inf}"   # confirmation is uncapped unless told otherwise
-TRANSIENT='Failed to connect to GNPS2|Gateway Timeout|Failed to perform HTTP|bfcrpath|database is locked|Connection reset|Timeout was reached|Failed to connect to MetaboLights'
+# Notebooks stop on an unreachable repository so this script retries them.
+# NETWORK must match NETWORK_ERROR in R/metadata.R word for word.
+NETWORK='Failed to perform HTTP request|resolve host|connect to server|Timeout (of [0-9]+ seconds )?was reached|timed out|Connection (was )?reset|Connection refused|Recv failure|Send failure|receiving data|sending data|Server returned nothing|Transferred a partial file|SSL connect error|(HTTP|error:?) ?(429|50[234])|Too Many Requests|Bad Gateway|Service Unavailable|Gateway Time-?out|not all .rnames. found'
+TRANSIENT="Failed to connect to GNPS2|Failed to connect to MetaboLights|bfcrpath|database is locked|$NETWORK"
 
 declare -A QMD=(
   [massive]=confirmation/massIVE-hit-confirmation
   [metabolights]=confirmation/metaboLights-confirmation
   [workbench]=confirmation/metabolomics-workbench-confirmation
-  [02]=02-confirmation-and-bio-files
-  [03]=03-all-datasets
-  [04]=04-cyp-validation
-  [05]=05-meta-analysis
+  [01]=01-search
+  [02]=02-metadata
+  [03]=03-curation
+  [04]=04-confirmation
+  [05]=05-extraction
+  [06]=06-analysis
 )
-declare -A TRIES=( [massive]=40 [metabolights]=20 [workbench]=20 [02]=5 [03]=3 [04]=3 [05]=3 )
+declare -A TRIES=( [massive]=40 [metabolights]=20 [workbench]=20 [01]=3 [02]=5 [03]=3 [04]=5 [05]=3 [06]=3 )
 
-stages=("${@:-02 03 04 05}"); stages=(${stages[@]})
+stages=("${@:-04 05 06}"); stages=(${stages[@]})
 
 for st in "${stages[@]}"; do
   q="${QMD[$st]}"
   [ -n "$q" ] || { echo "unknown stage: $st"; exit 2; }
-  log="bench/rerun-$(basename "$q").log"
+  [ -f "$q.qmd" ] || { echo "STAGE $st skipped: $APP has no $q.qmd"; continue; }
+  log="$ROOT/bench/rerun-$APP-$(basename "$q").log"
   max="${TRIES[$st]:-3}"
 
   for attempt in $(seq 1 "$max"); do

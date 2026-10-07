@@ -1,0 +1,7 @@
+"dataset","role","file","reason"
+"ST002044_AN003327","parent","ST002044_rawdata_D_88.mzML","the shifted compound of 05 'Checking the tolerance' (peak at -2.4 to -4.1 ppm, 502.6 s, about 3 s before omeprazole; no MS2), not omeprazole"
+"ST002044_AN003327","metabolite","ST002044_rawdata_D_88.mzML","the shifted compound's hydroxylated form (-3.9 ppm, 477.0 s, about 3 s before 5-hydroxyomeprazole; no MS2), not 5-hydroxyomeprazole"
+"ST002044_AN003327","parent","ST002044_rawdata_D_94.mzML","the shifted compound of 05 'Checking the tolerance' (peak at -3.7 to -5.6 ppm, 503.7 s; no MS2), not omeprazole"
+"ST002044_AN003327","parent","ST002044_rawdata_D_118.mzML","the shifted compound of 05 'Checking the tolerance' (peak at -3.9 to -5.1 ppm from 501 s; the 5 ppm pick is its tail; no MS2), not omeprazole"
+"ST002044_AN003327","parent","ST002044_rawdata_D_120.mzML","the shifted compound of 05 'Checking the tolerance' (peak at -4.3 to -4.8 ppm, 503.4 s; no MS2), not omeprazole"
+"ST002044_AN003327","parent","ST002044_rawdata_NHF_52.mzML","the shifted compound of 05 'Checking the tolerance' (241k at -5.6 ppm, 502.7 s; the 5 ppm pick at 511 s is its tail; no MS2), not omeprazole"

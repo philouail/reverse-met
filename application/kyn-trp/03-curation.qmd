@@ -1,0 +1,335 @@
+---
+title: "03 - Curation"
+subtitle: "Step 3: deposits dropped only for a stated reason"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+Deposits that cannot answer the question are removed, each with a recorded
+reason, and only the assays that measure every target are kept.
+
+**Input:** `artifacts/hits_assigned.csv`, `artifacts/metadata_entities.csv`,
+`artifacts/metadata_inventory.csv`, `artifacts/removed_step2.csv` and
+`artifacts/assay_metadata.csv` (all from step 2), plus the list of excluded deposits written in this notebook (manual work).
+
+**Output:** `artifacts/hits_curated.csv` and `artifacts/dataset_metadata_table.csv`,
+read by step 4 and every later step, and
+`artifacts/exclusions.csv`, the reason for every deposit removed. The figure
+`figures/metadata_inventory_kept.png` (and `.pdf`) shows what the kept assays
+describe.
+
+```{r setup}
+source("../../R/setup.R")
+source("../../R/masst.R")
+source("../../R/metadata.R")
+```
+
+```{r load}
+all_hits <- read.csv("artifacts/hits_assigned.csv", check.names = FALSE,
+                     stringsAsFactors = FALSE)
+metadata <- read.csv("artifacts/metadata_entities.csv", check.names = FALSE,
+                     stringsAsFactors = FALSE)
+inventory     <- read.csv("artifacts/metadata_inventory.csv", stringsAsFactors = FALSE)
+# As text: a file with no row (step 2 removed nothing) would read as logical columns.
+removed_step2 <- read.csv("artifacts/removed_step2.csv", colClasses = "character")
+assay_meta    <- read.csv("artifacts/assay_metadata.csv", stringsAsFactors = FALSE)
+D_both <- unique(all_hits$deposit_id)
+D_entering <- D_both
+```
+
+# Manual: excluded deposits
+
+::: {.callout-warning title="Manual work"}
+Each deposit below was read and excluded by hand, with the reason recorded.
+
+| reason | what it means |
+|---|---|
+| `duplicate_deposit` | the same files deposited again under another accession |
+:::
+
+```{r other-exclusions}
+other_exclusions <- dplyr::bind_rows(removed_step2, tibble::tribble(
+  ~dataset_id,    ~reason,             ~notes,
+  "MSV000085724", "duplicate_deposit", "re-deposits MSV000085607 file for file (.mzML instead of .mzXML)"
+))
+by_hand <- intersect(D_both, other_exclusions$dataset_id)
+D_both  <- setdiff(D_both, other_exclusions$dataset_id)
+```
+
+# What the metadata shows
+
+A deposit is kept when its metadata (step 2) shows blood samples from adults with
+an age (step 2 sets the adult age), and no species other than human. Otherwise it
+is removed with the reason: another species, no blood found, no adult with an age,
+no metadata found, or metadata that could not be read when step 2 ran (render
+step 2 again). A deposit that records no subject is kept; the analysis then
+counts its files.
+
+```{r fit-rule}
+inv <- merge(inventory, metadata[, c("dataset_id", "deposit_id")])
+dep <- aggregate(cbind(samples, human, other_species, blood, with_age, adult_blood,
+                       reachable) ~ deposit_id, data = inv, FUN = max)
+dep <- dep[dep$deposit_id %in% D_both, ]
+dep$reason <- with(dep, ifelse(!reachable, "metadata_unreachable",
+                ifelse(samples == 0, "no_metadata",
+                ifelse(other_species > 0 & human == 0, "not_human",
+                ifelse(blood == 0, "no_blood_found",
+                ifelse(adult_blood == 0, "no_adult_with_age", NA))))))
+other_exclusions <- dplyr::bind_rows(other_exclusions, tibble::tibble(
+  dataset_id = dep$deposit_id[!is.na(dep$reason)],
+  # As text: when no deposit is removed here, ifelse() gives logical NA.
+  reason     = as.character(dep$reason[!is.na(dep$reason)]),
+  notes      = "step 2 inventory"))
+D_both <- setdiff(D_both, dep$deposit_id[!is.na(dep$reason)])
+cat("Kept:", length(D_both), "deposits\n")
+table(other_exclusions$reason)
+```
+
+# Every target in one assay
+
+A deposit can carry every target and still never measure them in the same assay.
+Only assays with a hit for every target are kept, and hits marked `_unmatched`
+in step 2 are dropped. A deposit left without any assay is added to the
+exclusions with the reason `no_assay_with_both_roles` (`no_assay_with_every_target`
+with any other number of targets), or `no_hit_matched_to_assay` when step 2 could
+match none of its hits to an assay.
+
+```{r entity-coverage}
+# One has_<role> column per target, in the order of compound.csv: does the assay
+# carry a hit for it? The metabolite's keeps its short name, has_metab.
+roles    <- compound_spec$role
+has_cols <- sub("^has_metabolite$", "has_metab", paste0("has_", roles))
+cover    <- all_hits[all_hits$deposit_id %in% D_both,
+                     c("dataset_id", "deposit_id", "assay", "role")]
+for (i in seq_along(roles)) cover[[has_cols[i]]] <- cover$role == roles[i]
+entity_coverage <- cover |>
+  dplyr::group_by(dataset_id, deposit_id, assay) |>
+  dplyr::summarise(dplyr::across(dplyr::all_of(has_cols), any),
+                   n_hits  = dplyr::n(),
+                   .groups = "drop")
+entity_coverage$keep <- Reduce(`&`, entity_coverage[has_cols]) &
+  !grepl("_unmatched$", entity_coverage$dataset_id)
+
+datasets_with_kept_entity <- unique(
+  entity_coverage$deposit_id[entity_coverage$keep])
+deposits_lost <- setdiff(D_both, datasets_with_kept_entity)
+# A deposit whose hits are all `_unmatched` never had an assay to check.
+unmatched_only <- deposits_lost[vapply(deposits_lost, function(d)
+  all(grepl("_unmatched$", entity_coverage$dataset_id[entity_coverage$deposit_id == d])),
+  logical(1))]
+
+# The reason keeps its two-target name when there are two targets.
+no_assay <- if (length(roles) == 2) "no_assay_with_both_roles" else
+  "no_assay_with_every_target"
+if (length(deposits_lost)) {
+  unmatched <- deposits_lost %in% unmatched_only
+  new_excl <- tibble::tibble(
+    dataset_id = deposits_lost,
+    reason     = ifelse(unmatched, "no_hit_matched_to_assay", no_assay),
+    notes      = ifelse(unmatched, "no hit file matched to an assay in step 2",
+                        paste(paste(roles, collapse = " + "),
+                              "MASST hits land in different assays of the same deposit")))
+  other_exclusions <- dplyr::bind_rows(other_exclusions, new_excl)
+  D_both <- setdiff(D_both, deposits_lost)
+}
+
+entities_kept    <- entity_coverage$dataset_id[entity_coverage$keep]
+all_hits         <- all_hits[all_hits$dataset_id %in% entities_kept, ]
+dataset_metadata <- metadata[metadata$dataset_id %in% entities_kept, ]
+```
+
+```{r entity-coverage-summary}
+#| echo: false
+lost_assay <- setdiff(deposits_lost, unmatched_only)
+if (length(lost_assay))
+  cat("Deposits dropped (no assay carries ", if (length(roles) == 2) "both " else "all of ",
+      paste(roles, collapse = " + "), "):\n  ",
+      paste(lost_assay, collapse = "\n  "), "\n", sep = "")
+if (length(unmatched_only))
+  cat("Deposits dropped (no hit matched to an assay):\n  ",
+      paste(unmatched_only, collapse = "\n  "), "\n", sep = "")
+cat("Surviving entities:", length(entities_kept),
+    " | surviving deposits:", length(datasets_with_kept_entity), "\n")
+entity_coverage
+```
+
+# What the kept assays describe
+
+The kept assays are described by what the question on the blood of adults needs.
+
+For each assay kept, what its metadata (step 2) describes: how many samples,
+how many of them are blood, how many have an age, and how many are blood samples
+from adults.
+
+```{r fig-kept-inventory, fig.width = 6.3, fig.height = 5}
+FIG_DIR <- "figures"; dir.create(FIG_DIR, showWarnings = FALSE)
+figp    <- function(f) file.path(FIG_DIR, f)
+
+kept_inv <- merge(dataset_metadata[, c("dataset_id", "deposit_id", "assay", "chromatography")],
+                  inventory)
+# Assays of one deposit share its sample table: their labels add the column and the
+# polarity, or keep the dataset id where that still does not tell them apart.
+pol <- c(positive = "+", negative = "-")[
+  assay_meta$polarity[match(paste(kept_inv$deposit_id, kept_inv$assay),
+                            paste(assay_meta$dataset_id, assay_meta$assay))]]
+kept_inv$label <- ifelse(is.na(kept_inv$assay), kept_inv$deposit_id,
+                         paste0(kept_inv$deposit_id, " ", kept_inv$chromatography,
+                                ifelse(is.na(pol), "", pol)))
+same <- duplicated(kept_inv$label) | duplicated(kept_inv$label, fromLast = TRUE)
+kept_inv$label[same] <- kept_inv$dataset_id[same]
+
+bars <- c(samples = "samples described", blood = "blood", with_age = "with an age",
+          adult_blood = "adult blood")
+kept_long <- tidyr::pivot_longer(kept_inv[, c("label", names(bars))], -label,
+                                 names_to = "measure", values_to = "n")
+kept_long$measure <- factor(bars[kept_long$measure], levels = bars)
+kept_long$label   <- factor(kept_long$label, levels = rev(unique(kept_inv$label)))
+
+p_kept <- ggplot(kept_long, aes(n, label, fill = measure)) +
+  geom_col(position = position_dodge(width = 0.8, reverse = TRUE), width = 0.75) +
+  scale_fill_manual(values = c("grey82", "grey62", "grey42", "grey15"), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "samples", y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "top", panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank())
+ggsave(figp("metadata_inventory_kept.png"), p_kept, width = 6.3, height = 5, dpi = 200)
+ggsave(figp("metadata_inventory_kept.pdf"), p_kept, width = 6.3, height = 5)
+p_kept
+```
+
+# One set-up per MassIVE deposit
+
+MetaboLights and the Metabolomics Workbench record the set-ups of a deposit as
+separate assays; MassIVE does not, so a MassIVE deposit counts as one assay. Each
+kept MassIVE deposit is checked here for a mix of set-ups, from what can be known
+without the raw files: the chromatography and polarity its metadata records, and the
+polarity of its hits (the charge of the adduct each hit matched). A deposit that
+mixes set-ups is removed: it cannot be measured as one assay, and its files cannot
+be told apart reliably. A file without a hit, in a deposit whose metadata records no
+set-up, is not covered by this check.
+
+```{r stray-hits}
+# Hits dropped by hand (see the callout below), one row per deposit and adduct.
+stray_hits <- tibble::tribble(
+  ~deposit_id,    ~adduct_inferred, ~why,
+  "MSV000086158", "[M-H]-",         "negative-ion matches in positive-mode stool files with no metadata row"
+)
+stray <- paste(all_hits$deposit_id, all_hits$adduct_inferred) %in%
+  paste(stray_hits$deposit_id, stray_hits$adduct_inferred)
+```
+
+::: {.callout-warning title="Manual work"}
+One deposit is corrected by hand before the check. MSV000086158 records its set-up
+(reverse phase, positive mode) for its plasma files only. `r sum(stray)` of its hits match
+kynurenine as a negative ion ([M-H]-, m/z
+`r paste(unique(sprintf("%.3f", all_hits$Precursor_MZ[stray])), collapse = " and ")`)
+in `r length(unique(all_hits$file_path[stray]))` stool files that have no
+metadata row and whose other hits are all positive ions. A file acquired in positive
+mode cannot hold a negative ion, so these are stray library matches rather than a
+second set-up, and they are dropped. No rule is written for this: it is a reading of
+one deposit.
+:::
+
+```{r one-setup}
+message(sum(stray), " hit(s) dropped by hand as stray matches")
+all_hits <- all_hits[!stray, ]
+
+tech  <- read.csv("artifacts/assay_metadata.csv", stringsAsFactors = FALSE)
+known <- function(x) sort(unique(x[!is.na(x) & !x %in% c("", "Unknown")]))
+msv   <- sort(unique(all_hits$deposit_id[startsWith(all_hits$deposit_id, "MSV")]))
+setups <- do.call(rbind, lapply(msv, function(d) {
+  t   <- tech[tech$dataset_id == d, ]
+  add <- all_hits$adduct_inferred[all_hits$deposit_id == d]
+  pol <- ifelse(grepl("[+]$", add), "positive", ifelse(grepl("-$", add), "negative", NA))
+  data.frame(deposit           = d,
+             chromatography    = paste(known(t$chrom_type), collapse = " and "),
+             polarity_recorded = paste(known(t$polarity), collapse = " and "),
+             polarity_of_hits  = paste(known(pol), collapse = " and "))
+}))
+if (is.null(setups))
+  setups <- data.frame(deposit = character(), chromatography = character(),
+                       polarity_recorded = character(), polarity_of_hits = character())
+setups$mixed <- grepl(" and ", paste(setups$chromatography, setups$polarity_recorded,
+                                     setups$polarity_of_hits))
+mixed <- setups$deposit[setups$mixed]
+if (length(mixed)) {
+  other_exclusions <- dplyr::bind_rows(other_exclusions, tibble::tibble(
+    dataset_id = mixed, reason = "mixed_setups",
+    notes      = "MassIVE deposit whose files mix set-ups; MassIVE records no assays"))
+  D_both           <- setdiff(D_both, mixed)
+  all_hits         <- all_hits[!all_hits$deposit_id %in% mixed, ]
+  dataset_metadata <- dataset_metadata[!dataset_metadata$deposit_id %in% mixed, ]
+}
+setups
+```
+
+# Write curated hits
+
+```{r write-artifacts}
+write.csv(dataset_metadata, "artifacts/dataset_metadata_table.csv",
+          row.names = FALSE)
+write.csv(all_hits,         "artifacts/hits_curated.csv",
+          row.names = FALSE)
+write.csv(other_exclusions, "artifacts/exclusions.csv", row.names = FALSE)
+```
+
+```{r write-artifacts-summary}
+#| echo: false
+cat("artifacts/dataset_metadata_table.csv :",
+    nrow(dataset_metadata), "rows\n")
+cat("artifacts/hits_curated.csv           :",
+    nrow(all_hits), "rows /",
+    length(unique(all_hits$dataset_id)), "entities\n")
+```
+
+# Step summary
+
+The results of this step, as the chapter's table shows them.
+
+```{r step-summary}
+# The removals of this step, by reason (step 2's are in its own table). A reason
+# this application does not use reads "--".
+step2_ids <- if (exists("removed_step2")) removed_step2$dataset_id else character()
+step3 <- other_exclusions[!other_exclusions$dataset_id %in% step2_ids, ]
+step3 <- step3[!duplicated(step3$dataset_id), ]
+# One unit per table: deposits (the assays kept go to the recap). The rows starting with "..."
+# break down the deposits removed.
+REASONS <- list(
+  "... no or too little metadata" = c("no_metadata", "no_or_limited_metadata"),
+  "... not human study samples (another species, in vitro, reference material)" =
+    c("not_human", "non_human", "in_vitro", "reference_material"),
+  "... do not fit the research question (blood, age)" = c("no_blood_found", "no_adult_with_age"),
+  "... files not placed in an assay" = c("no_hit_matched_to_assay", no_assay))
+NOT_USED <- c()
+n_by <- vapply(REASONS, function(r) sum(step3$reason %in% r), numeric(1))
+n_other <- sum(!step3$reason %in% unlist(REASONS))
+summary_step <- data.frame(
+  item  = c("deposits entering", "deposits removed", names(REASONS), "... other reasons",
+            "deposits kept", "recap: assays kept"),
+  value = as.character(c(length(D_entering), nrow(step3),
+                         ifelse(names(REASONS) %in% NOT_USED, "--", n_by), n_other,
+                         length(D_both), nrow(dataset_metadata))))
+# For the discussion's recap only: the files with a hit that are kept.
+summary_step <- rbind(summary_step, data.frame(
+  item  = "recap: files",
+  value = as.character(length(unique(paste(all_hits$deposit_id,
+                                           basename(all_hits$file_path)))))))
+write.csv(summary_step, "artifacts/summary_step3.csv", row.names = FALSE)
+summary_step
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

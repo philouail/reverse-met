@@ -1,0 +1,742 @@
+---
+title: "06 - Analysis"
+subtitle: "Step 6: omeprazole against CYP2C19 genotype"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+A study in the corpus gave omeprazole to genotyped volunteers (Jarmusch et
+al., *Clin Transl Sci* 2020, PMC7485946). Omeprazole is the standard probe for
+the liver enzyme CYP2C19, which turns it into 5-OH-omeprazole, and each
+volunteer's CYP2C19 metaboliser class is known from their genotype. The study
+was deposited twice: MSV000084008 holds the timed plasma draws, MSV000082493 the
+skin, urine and faeces samples (and a second copy of most plasma files).
+
+It is the one place in the corpus where the answer is known before looking, and
+it is known twice. Before the dose there is no drug, so the extraction should
+find nothing. After the dose, the ratio of omeprazole to 5-OH-omeprazole should
+fall as CYP2C19 activity rises. This notebook tests both, then scans the rest
+of the corpus: every metadata field that varies inside an assay, tested against
+the ratio in blood.
+
+**Input:** `artifacts/sample_table_perfile.csv`, `artifacts/bio_files_per_ds.rds`
+and `artifacts/bio_meta_per_ds.rds` (step 5), `artifacts/datasets-confirmed.csv`
+and `artifacts/hits-confirmed-all.csv` (step 4), `artifacts/related_deposits.csv`
+(step 2), and the dosed study's submitter tables,
+`dataset_metadata/MSV000084008_metadata.tsv` and
+`dataset_metadata/MSV000082493_metadata.tsv`, which give each sample's
+volunteer, study day and time since the dose, and for the plasma the
+metaboliser class.
+
+**Output:** `artifacts/assay_choice.csv` (which assay is kept where several
+measured the same samples), `artifacts/ratio_scan.csv` (the scan of the rest of
+the corpus), `artifacts/summary_step6.csv` and `figures/ratio_volunteer.png`.
+
+```{r setup}
+suppressPackageStartupMessages({ library(dplyr); library(ggplot2) })
+source("../../R/metadata.R")   # norm_file_key(), as_num(), short_ds()
+source("../../R/analysis.R")   # the helpers shared with the kyn-trp notebook
+source("../../R/masst.R")      # PHENO: the CYP2C19 classes, low to high activity
+
+# Figures go to this application's own folder.
+FIG_DIR <- "figures"; dir.create(FIG_DIR, showWarnings = FALSE)
+figp    <- function(f) file.path(FIG_DIR, f)
+
+# The dosed study: its plasma and its skin accession.
+PLASMA_DS <- "MSV000084008"
+SKIN_DS   <- "MSV000082493"
+# Draws taken before the drug can reach the blood: at the dose and 5 min later.
+EARLY_MIN <- c(0, 5)
+
+# The rest of the corpus: matrices where the ratio is read, per-file metadata fields
+# scanned against it (column = label), and the scan's false discovery rate.
+MATRICES    <- c("plasma", "serum")
+SCAN_FIELDS <- c(sex = "sex", age = "age", group = "group",
+                 health_status = "health status", body_site = "matrix",
+                 country = "country", treatment = "treatment",
+                 timepoint = "time point")
+FDR <- 0.05
+
+# Class labels and colours of the figure.
+PH_SHORT <- c("Poor", "Inter.", "Normal", "Rapid", "Ultra")
+pal <- c("Poor Metabolizer" = "#B2182B", "Intermediate Metabolizer" = "#EF8A62",
+         "Normal Metabolizer" = "#D9D9D9", "Rapid Metabolizer" = "#67A9CF",
+         "Ultrarapid Metabolizer" = "#2166AC")
+
+# Numbers and lists for the text.
+fmt_p    <- function(p) formatC(p, digits = 2, format = "fg", flag = "#")
+pct      <- function(x) sprintf("%.1f%%", 100 * x)
+and_list <- function(x) if (length(x) < 3) paste(x, collapse = " and ") else
+  paste(paste(head(x, -1), collapse = ", "), "and", tail(x, 1))
+```
+
+# Inputs
+
+```{r load}
+pf        <- read.csv("artifacts/sample_table_perfile.csv", stringsAsFactors = FALSE)
+datasets  <- read.csv("artifacts/datasets-confirmed.csv", stringsAsFactors = FALSE)
+related   <- read.csv("artifacts/related_deposits.csv", stringsAsFactors = FALSE)
+conf      <- read.csv("artifacts/hits-confirmed-all.csv", stringsAsFactors = FALSE)
+bio_files <- readRDS("artifacts/bio_files_per_ds.rds")
+bio_meta  <- readRDS("artifacts/bio_meta_per_ds.rds")
+
+# Does a metadata source cover the file? Stops if step 5 has no file list for an
+# assay of the table.
+pf$has_metadata <- has_metadata(pf, bio_meta)
+```
+
+# One assay per set of samples
+
+Some samples were measured more than once, by assays on different columns or in
+different ionisation modes, and keeping them all would count the same people more
+than once.
+So one assay is kept per set of samples: the one where MS1 detects both targets
+in the most files; on a tie, the one with more files where MS2 confirms both;
+still tied, the first assay id in sort order. A study deposited twice, as the
+dosed study is, holds one set of files rather than two measurements and is left
+as it is.
+
+```{r keep-one}
+# Counted on every extracted file, before any restriction to metadata.
+choice <- keep_one_assay(pf, datasets, related, conf, bio_files)
+write.csv(choice, "artifacts/assay_choice.csv", row.names = FALSE)
+
+# The sets with more than one assay.
+groups <- choice[choice$group %in% choice$group[duplicated(choice$group)], ]
+groups$assay <- short_ds(groups$dataset_id, datasets$dataset_id)
+groups$chromatography <- datasets$chromatography[match(groups$dataset_id, datasets$dataset_id)]
+
+# One sentence per set for the text below, the kept assay first.
+said <- vapply(split(groups, factor(groups$group, levels = unique(groups$group))),
+               function(g) {
+  g <- g[order(!g$kept), ]
+  sprintf("%s (%s) is kept and %s set aside: MS1 detects both targets in %s of their files, MS2 confirms both in %s.",
+          g$assay[1], g$chromatography[1],
+          and_list(paste0(g$assay[-1], " (", g$chromatography[-1], ")")),
+          and_list(g$ms1_both), and_list(g$ms2_both))
+}, "")
+groups[, c("assay", "chromatography", "files", "ms1_both", "ms2_both", "kept")]
+n_out <- sum(!choice$kept)
+n_in  <- sum(choice$kept)
+
+pf <- pf[pf$dataset_id %in% choice$dataset_id[choice$kept], ]
+```
+
+`r if (length(said)) paste(said, collapse = " ") else "No two assays here measured the same samples."`
+`r n_out` `r if (n_out == 1) "assay is" else "assays are"` set aside, and
+`r n_in` `r if (n_in == 1) "goes" else "go"` on to the analysis.
+
+# The dosed study
+
+## Plasma draws
+
+`r PLASMA_DS` holds the plasma. The volunteers were drawn at set times after the
+dose, on study days before and after a course of antibiotics, and a draw could
+be injected more than once. The submitter table gives each file's
+volunteer, day, minutes since the dose and metaboliser class, and each file is
+matched to its extracted copy by `norm_file_key()`. A target that step 5 did
+not detect in a file has an area of zero there: it is below detection, not its
+integrated noise.
+
+```{r draws}
+p84   <- pf[pf$dataset_id == PLASMA_DS, ]
+p84$k <- norm_file_key(p84$file)
+# A detection must have an area. A truncated peak (detected, no area) would
+# otherwise count as zero, as if it were below detection.
+if (any(p84$par_detected %in% TRUE & is.na(p84$par_auc) |
+        p84$met_detected %in% TRUE & is.na(p84$met_auc)))
+  stop("a detection in ", PLASMA_DS, " has no peak area")
+
+ta   <- read.delim("dataset_metadata/MSV000084008_metadata.tsv",
+                   check.names = FALSE, stringsAsFactors = FALSE)
+ta$k <- norm_file_key(ta$filename)
+i    <- match(ta$k, p84$k)
+ta$extracted <- !is.na(i)
+ta$par_det   <- p84$par_detected[i] %in% TRUE
+ta$met_det   <- p84$met_detected[i] %in% TRUE
+ta$par_auc   <- ifelse(ta$par_det, p84$par_auc[i], 0)
+ta$met_auc   <- ifelse(ta$met_det, p84$met_auc[i], 0)
+ta$tmin      <- as_num(ta$ATTRIBUTE_Time_Point_Mins)
+# Volunteer draws only: blanks and QC injections have no draw time.
+ta <- ta[ta$MS_SampleType == "sample" & !is.na(ta$tmin), ]
+# A draw is one volunteer, study day and time; its files are its injections.
+ta$draw <- paste(ta$ATTRIBUTE_Subject, ta$ATTRIBUTE_Study_Day, ta$tmin)
+# Study days per volunteer, for the text below.
+n_days <- tapply(ta$ATTRIBUTE_Study_Day, ta$ATTRIBUTE_Subject, n_distinct)
+```
+
+The table lists `r nrow(ta)` files from `r n_distinct(ta$draw)` draws of
+`r n_distinct(ta$ATTRIBUTE_Subject)` volunteers:
+`r sum(table(ta$draw) > 1)` draws were injected more than once. Of these files,
+`r sum(ta$extracted)` were extracted, and they cover
+`r n_distinct(ta$draw[ta$extracted])` of the draws. Of the volunteers,
+`r sum(n_days > 1)` were drawn on more than one study day and
+`r sum(n_days == 1)` on a single day.
+
+## Before the dose
+
+The draws at the dose and `r EARLY_MIN[2]` minutes later come before the drug
+can reach the blood. They are real plasma, read at the true m/z and in the true
+retention window, so any detection there is a false one. The forehead skin of
+`r SKIN_DS`, swabbed before the first dose, is a second such set. Either target
+counts as a detection, and only files that were extracted are counted. The
+upper end of an exact binomial interval bounds the rate of false detections,
+since finding nothing in a few files says less than finding nothing in many.
+
+```{r negative-control}
+# Plasma drawn at the dose or just after, among the files extracted. A draw
+# injected more than once counts once, as detected if any of its files is.
+pre      <- ta[ta$tmin %in% EARLY_MIN & ta$extracted, ]
+pre_draw <- tapply(pre$par_det | pre$met_det, pre$draw, any)
+
+# Forehead skin swabbed before the first dose: day 0, or minute 0 of day 1.
+sk <- read.delim("dataset_metadata/MSV000082493_metadata.tsv",
+                 check.names = FALSE, stringsAsFactors = FALSE)
+sk <- sk[sk$MS_SampleType == "sample" & sk$ATTRIBUTE_Body_Site == "L.forehead" &
+           (sk$ATTRIBUTE_Study_Day %in% "0" |
+            (sk$ATTRIBUTE_Study_Day %in% "1" & sk$ATTRIBUTE_Time_Point_Mins %in% "0")), ]
+p82 <- pf[pf$dataset_id == SKIN_DS, ]
+j   <- match(norm_file_key(sk$filename), norm_file_key(p82$file))
+j   <- j[!is.na(j)]
+skin_det <- p82$par_detected[j] %in% TRUE | p82$met_detected[j] %in% TRUE
+
+neg <- data.frame(
+  set      = c(sprintf("plasma draws taken at %s min", and_list(EARLY_MIN)),
+               "skin samples swabbed before the first dose"),
+  n        = c(length(pre_draw), length(j)),
+  detected = c(sum(pre_draw), sum(skin_det)))
+# Upper end of the exact 95% interval on the rate of false detections.
+neg$upper95 <- mapply(function(x, n) binom.test(x, n)$conf.int[2],
+                      neg$detected, neg$n)
+neg
+```
+
+The extraction detects a target in `r neg$detected[1]` of the `r neg$n[1]` early
+plasma draws (`r nrow(pre)` files, since some draws were injected more than once)
+and in `r neg$detected[2]` of the `r neg$n[2]` skin samples. The upper ends of the
+exact 95% intervals on the rate of false detections are `r pct(neg$upper95[1])` in
+plasma and `r pct(neg$upper95[2])` on skin.
+
+## The ratio against genotype
+
+The usual read-out of CYP2C19 activity is this ratio in one draw, taken at a
+fixed time after the dose, because the ratio changes across the dosing interval.
+Here each volunteer's ratio is taken instead on the areas under the whole
+concentration-time curve, which uses every draw. A draw injected more than once
+gives the mean of its extracted files, so each draw weighs once and the order
+of the files does not matter. For each volunteer and study day, the area of
+each target is integrated over the draw times by the trapezoid rule, and the
+ratio of the two areas is taken. The study days are integrated separately, since
+they straddle the antibiotics, and then averaged per volunteer. A file where a
+target was not detected counts as zero, the usual below-detection rule; dropping
+it instead would raise the area for exactly the poor metabolisers whose
+metabolite is truly absent.
+
+```{r auc}
+# One area per draw and target: the mean over the draw's extracted files.
+draw_areas <- function(t)
+  aggregate(cbind(par_auc, met_auc) ~ ATTRIBUTE_Subject + ATTRIBUTE_Study_Day +
+              tmin + PharmGeno_Phenotype_2C19,
+            data = t[t$extracted, ], FUN = mean)
+dr <- draw_areas(ta)
+
+# Trapezoidal area over the draw times.
+trap <- function(x, y) {
+  o <- order(x); x <- x[o]; y <- y[o]
+  if (length(x) < 4) return(NA_real_)   # too few times for a curve
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+# One ratio of areas per volunteer and study day.
+day_ratios <- function(dr) {
+  a <- do.call(rbind, lapply(
+    split(dr, list(dr$ATTRIBUTE_Subject, dr$ATTRIBUTE_Study_Day), drop = TRUE),
+    function(d) data.frame(
+      subject = d$ATTRIBUTE_Subject[1], day = d$ATTRIBUTE_Study_Day[1],
+      auc_par = trap(d$tmin, d$par_auc), auc_met = trap(d$tmin, d$met_auc),
+      phenotype = d$PharmGeno_Phenotype_2C19[1], stringsAsFactors = FALSE)))
+  a$log2_ratio <- log2(a$auc_par / a$auc_met)
+  a <- a[is.finite(a$log2_ratio), ]
+  a$rank <- match(a$phenotype, PHENO)
+  a
+}
+auc <- day_ratios(dr)
+
+# One value per volunteer: the mean of the two days.
+subj_auc <- aggregate(log2_ratio ~ subject + phenotype + rank, data = auc, FUN = mean)
+```
+
+The direction is set before looking. CYP2C19 makes the metabolite, so a poor
+metaboliser keeps more omeprazole and less 5-OH-omeprazole, and the ratio should
+fall along the classes from poor to ultrarapid. The classes are ranked in that
+order, one step per class:
+`r and_list(sprintf("%s %d", tolower(sub(" Metabolizer", "", PHENO)), seq_along(PHENO)))`.
+
+The model, in words: a volunteer's log2 ratio of the two areas is a baseline,
+plus a change $b$ for each step up in activity class, plus what the model leaves
+unexplained. As a formula, one row per volunteer $v$, fitted by least squares:
+
+$$
+\log_2\left(\frac{\text{AUC}_{\text{omeprazole}}}{\text{AUC}_{\text{5-OH-omeprazole}}}\right)_v
+= a + b \cdot \text{class}_v + \varepsilon_v
+$$
+
+The slope $b$ is the change per class, and the prediction is $b < 0$. Reading
+the rank as a number assumes the classes are evenly spaced, which nothing
+guarantees; it is the price of an effect in units one can read.
+
+```{r genotype-model}
+m_auc <- lm(log2_ratio ~ rank, data = subj_auc)
+ci    <- confint(m_auc)["rank", ]   # 95% confidence interval
+p_auc <- summary(m_auc)$coefficients["rank", 4]
+summary(m_auc)
+# Classes with a single volunteer, for the text below.
+n_single <- sum(table(subj_auc$phenotype) == 1)
+```
+
+Over `r nrow(subj_auc)` volunteers, the log2 ratio changes by
+`r sprintf("%+.3f", coef(m_auc)[["rank"]])` per class (confidence interval
+`r sprintf("%.3f", ci[1])` to `r sprintf("%.3f", ci[2])`, p = `r fmt_p(p_auc)`,
+R² = `r sprintf("%.2f", summary(m_auc)$r.squared)`):
+`r if (ci[2] < 0) "the predicted fall, with an interval that excludes zero" else if (ci[1] > 0) "a rise, against the prediction" else "the interval includes zero, so no fall is shown"`.
+
+Of the classes, `r n_single` `r if (n_single == 1) "holds" else "hold"` a
+single volunteer, so one person could carry the slope. The model is refitted
+once without each volunteer.
+
+```{r leave-one-out}
+# The slope and its p, fitted once without each volunteer of `d`.
+leave_one_out <- function(d) do.call(rbind, lapply(seq_len(nrow(d)), function(i) {
+  co <- summary(lm(log2_ratio ~ rank, data = d[-i, ]))$coefficients
+  data.frame(dropped = d$subject[i], phenotype = d$phenotype[i],
+             beta = co[2, 1], p = co[2, 4])
+}))
+jk <- leave_one_out(subj_auc)
+jk[order(jk$beta), ]
+```
+
+Without any one volunteer the slope stays between
+`r sprintf("%+.3f", min(jk$beta))` and `r sprintf("%+.3f", max(jk$beta))`,
+`r if (all(jk$beta < 0)) "negative every time" else "and changes sign"`, and the
+largest p is `r fmt_p(max(jk$p))`. One point per volunteer:
+
+```{r fig-ratio-class, fig.width=6.4, fig.height=4.4}
+#| echo: false
+vol <- subj_auc
+vol$phenotype <- factor(vol$phenotype, levels = PHENO)
+fit_line <- data.frame(rank = seq(1, 5, length.out = 50))
+fit_line$log2_ratio <- predict(m_auc, fit_line)
+nv <- table(vol$phenotype)
+
+p_vol <- ggplot(vol, aes(rank, log2_ratio)) +
+  geom_line(data = fit_line, colour = "grey35", linewidth = 0.8) +
+  geom_point(aes(fill = phenotype), shape = 21, size = 3.4, stroke = 0.6,
+             colour = "grey20") +
+  scale_fill_manual(values = pal, guide = "none") +
+  scale_x_continuous(breaks = 1:5,
+                     labels = sprintf("%s\n(%d)", PH_SHORT, as.integer(nv))) +
+  # No title: the fit is given in the text and the chapter's caption.
+  labs(x = "CYP2C19 metaboliser class (volunteers)",
+       y = "log2(AUC omeprazole / AUC 5-hydroxyomeprazole)") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+ggsave(figp("ratio_volunteer.png"), p_vol, width = 6.4, height = 4.4, dpi = 200)
+p_vol
+```
+
+# The rest of the corpus
+
+Elsewhere in the corpus nobody's dose or genotype is on record, so there is no
+known answer to test. What is left is to ask whether the ratio in blood moves
+with anything the deposits record. A unit is one subject in one matrix, so a
+study that sampled each person many times does not outweigh one that sampled
+once. Where no subject is named, each file is its own unit, and repeat files of
+one person then count as separate units. A field of a subject sampled several
+times, such as a time point, belongs to the unit only where all its files agree.
+
+```{r rest-of-corpus}
+# Files a metadata source covers, outside both accessions of the dosed study.
+DOSED <- c(PLASMA_DS, SKIN_DS)
+rest  <- pf[pf$has_metadata & !pf$dataset_id %in% DOSED, ]
+rest$fk    <- norm_file_key(rest$file)
+rest$study <- rest$dataset_id
+rest$subj  <- nz(rest$subject_id)
+rest$site  <- canon_site(rest$body_site)
+# log2(omeprazole / 5-OH-omeprazole) where both were detected; a truncated peak
+# has no area, so no ratio.
+rest$l2 <- ifelse(rest$par_detected %in% TRUE & rest$met_detected %in% TRUE,
+                  log2(rest$par_auc / rest$met_auc), NA_real_)
+# The scanned fields: a placeholder is missing, and sex and matrix are written
+# one way across deposits.
+stopifnot(all(names(SCAN_FIELDS) %in% names(rest)))
+for (f in names(SCAN_FIELDS))
+  rest[[f]] <- ifelse(is_missing_val(rest[[f]]), NA_character_, trimws(as.character(rest[[f]])))
+rest$sex       <- harmonise_sex(rest$sex)
+rest$body_site <- rest$site
+
+u     <- unitise(rest, fields = names(SCAN_FIELDS))
+# Units whose files disagree on a scanned field, which they then lack.
+u_disagree <- disagree_text(u, SCAN_FIELDS)
+blood <- u[is.finite(u$l2) & u$site %in% MATRICES, ]
+
+u |>
+  group_by(assay = short_ds(study, datasets$dataset_id)) |>
+  summarise(units = n(), either_target = sum(either),
+            with_ratio = sum(is.finite(l2)),
+            blood_with_ratio = sum(is.finite(l2) & site %in% MATRICES),
+            blood_single_files = sum(is.finite(l2) & site %in% MATRICES & kind == "file"),
+            .groups = "drop")
+
+# Blood units that are single files with no subject named, per assay.
+fs <- blood$study[blood$kind == "file"]
+file_units <- table(factor(fs, sort(unique(fs), method = "radix")))
+```
+
+`r if (nzchar(u_disagree)) paste0("The files of some units disagree on a field, which these units then lack: ", u_disagree, ".") else "No unit's files disagree on any of the fields scanned below."`
+Outside the dosed study, `r n_distinct(u$study)` assays have files with
+metadata, `r nrow(u)` units in all. Omeprazole or 5-OH-omeprazole is detected in
+`r sum(u$either)` of these units, and both, which gives a ratio, in
+`r sum(is.finite(u$l2))`; `r nrow(blood)` of those are blood, from
+`r n_distinct(blood$study)` assays.
+`r if (length(file_units)) paste0("Of these blood units, ", sum(file_units), if (sum(file_units) == 1) " is a single file" else " are single files", " with no subject named (", and_list(sprintf("%s: %d", short_ds(names(file_units), datasets$dataset_id), file_units)), "), so several may come from one person.")`
+
+## Every field against the ratio
+
+The scan takes every metadata field of the per-file table
+(`r and_list(SCAN_FIELDS)`) and, inside each assay where the field takes more
+than one value among the blood units with a ratio, tests the ratio against it.
+The model, in words: inside one assay, a unit's log2 ratio is the assay's level,
+plus the effect of the field (a slope where the field is a number, such as age;
+a shift for each value otherwise), plus what the model leaves unexplained. As a
+formula, for unit $i$ of assay $s$ and field $f$, fitted by least squares:
+
+$$
+\log_2\left(\frac{\text{omeprazole}}{\text{5-OH-omeprazole}}\right)_i
+= a_s + f_i + \varepsilon_i
+$$
+
+Each fit gives one p value, from the F test of the field (for a number, the same
+as the test of its slope). Testing inside one assay keeps each assay's method
+from being read as an effect. All p values are then corrected together with
+Benjamini-Hochberg, and a contrast counts as significant where its corrected p
+is below `r FDR`. A field that repeats another inside an assay, as group and health status
+often do, is tested once there. A field constant inside every assay but
+different between assays is confounded with the assay: its effect cannot be told
+apart from the method's, so it cannot be tested.
+
+```{r scan}
+blood_ids <- sort(unique(blood$study), method = "radix")
+values_in <- function(f, s) { v <- blood[[f]][blood$study == s]; unique(v[!is.na(v)]) }
+
+# Per field: the assays where it varies, and whether it is confounded with the
+# assay (one value inside every assay, not the same value in all of them).
+fields <- do.call(rbind, lapply(names(SCAN_FIELDS), function(f) {
+  n_in <- vapply(blood_ids, function(s) length(values_in(f, s)), 0L)
+  data.frame(field = SCAN_FIELDS[[f]], column = f,
+             varies_in = sum(n_in >= 2),
+             confounded = all(n_in <= 1) && n_distinct(blood[[f]], na.rm = TRUE) >= 2)
+}))
+
+# One test per field and assay where the field varies. A field whose values
+# split the assay's units exactly as an earlier field's do is the same test.
+scan <- list(); repeats <- character(0)
+for (s in blood_ids) {
+  z0   <- blood[blood$study == s, ]
+  seen <- character(0)
+  for (f in fields$column[fields$varies_in > 0]) {
+    if (length(values_in(f, s)) < 2) next
+    split_key <- paste(match(z0[[f]], unique(z0[[f]])), collapse = " ")
+    if (split_key %in% seen) {
+      repeats <- c(repeats, sprintf("%s repeats %s in %s", SCAN_FIELDS[[f]],
+                                    SCAN_FIELDS[[names(seen)[seen == split_key]]],
+                                    short_ds(s, datasets$dataset_id)))
+      next
+    }
+    seen[f] <- split_key
+    z <- z0[!is.na(z0[[f]]), ]
+    x <- if (!anyNA(as_num(z[[f]]))) as_num(z[[f]]) else factor(z[[f]])
+    m <- lm(z$l2 ~ x)
+    scan[[length(scan) + 1]] <- data.frame(
+      field = SCAN_FIELDS[[f]], assay = short_ds(s, datasets$dataset_id),
+      units = nrow(z),
+      compared = if (is.numeric(x)) sprintf("slope over %g to %g", min(x), max(x)) else
+        paste(sprintf("%s (%d)", levels(x), tabulate(x)), collapse = ", "),
+      p = if (df.residual(m) > 0) anova(m)[["Pr(>F)"]][1] else NA_real_)
+  }
+}
+scan <- bind_rows(scan)
+# A contrast with no unit left over for the error has no test.
+untestable <- scan[is.na(scan$p), ]
+scan       <- scan[!is.na(scan$p), ]
+scan$q     <- p.adjust(scan$p, "BH")
+write.csv(scan, "artifacts/ratio_scan.csv", row.names = FALSE)
+knitr::kable(scan[order(scan$q, scan$p), ], row.names = FALSE, digits = 3,
+             col.names = c("field", "assay", "units", "compared", "p",
+                           "p after Benjamini-Hochberg"),
+             caption = "The log2 ratio against each field, inside each assay where the field varies")
+
+tested     <- fields$field[fields$varies_in > 0]
+confounded <- fields$field[fields$confounded]
+left       <- fields$field[fields$varies_in == 0 & !fields$confounded]
+n_sig      <- sum(scan$q < FDR)
+```
+
+Of the `r nrow(fields)` fields, `r length(tested)` vary inside at least one
+assay (`r and_list(tested)`), which gives `r nrow(scan)` contrasts inside assays.
+`r if (length(repeats)) paste0("In the scan, ", and_list(repeats), if (length(repeats) == 1) ", so the pair is tested once." else ", so each pair is tested once.")`
+`r if (nrow(untestable)) paste0("Too few units leave no test for ", and_list(sprintf("%s in %s (%d units)", untestable$field, untestable$assay, untestable$units)), ".")`
+After the correction over all `r nrow(scan)`, `r n_sig`
+`r if (n_sig == 1) "survives" else "survive"` at a false discovery rate of
+`r 100 * FDR`% (smallest corrected p = `r fmt_p(min(scan$q))`).
+`r length(confounded)` `r if (length(confounded) == 1) "field is" else "fields are"`
+confounded with the assay`r if (length(confounded)) paste0(" (", and_list(confounded), ")")`.
+`r if (length(left)) paste0("The other ", length(left), " (", and_list(left), ") ", if (length(left) == 1) "has" else "have", " no value, or a single value, across the blood units with a ratio.")`
+With no dose time on record, the ratio also carries when each person last took
+the drug, so these numbers describe the corpus; they do not test a known answer.
+
+# Step summary
+
+The results of this step, as the chapter's table shows them.
+
+```{r step-summary}
+summary_step <- data.frame(
+  item  = c("assays set aside (same samples, another set-up)",
+            "volunteers",
+            sprintf("plasma draws at %s min with a detection", and_list(EARLY_MIN)),
+            "skin samples before the first dose with a detection",
+            "change in log2 omeprazole/5-OH-omeprazole per activity class (95% CI)",
+            "p (R2)",
+            "slope with each volunteer left out",
+            "other assays with a ratio in blood",
+            "blood units with a ratio",
+            "contrasts tested",
+            sprintf("significant at %g%% FDR", 100 * FDR),
+            "fields confounded with the assay"),
+  value = c(sum(!choice$kept), nrow(subj_auc),
+            sprintf("%d of %d", neg$detected[1], neg$n[1]),
+            sprintf("%d of %d", neg$detected[2], neg$n[2]),
+            sprintf("%+.3f (%.3f to %.3f)", coef(m_auc)[["rank"]], ci[1], ci[2]),
+            sprintf("%s (%.2f)", fmt_p(p_auc), summary(m_auc)$r.squared),
+            sprintf("%+.3f to %+.3f", min(jk$beta), max(jk$beta)),
+            n_distinct(blood$study), nrow(blood), nrow(scan),
+            sprintf("%d of %d", n_sig, nrow(scan)),
+            if (length(confounded)) sprintf("%d (%s)", length(confounded), and_list(confounded))
+            else "0"))
+write.csv(summary_step, "artifacts/summary_step6.csv", row.names = FALSE)
+summary_step
+```
+
+# Checks on repeated sampling
+
+These checks are not part of the chapter's results, and the step summary above
+does not use them. Each volunteer in the model of the dosed study gives one
+value: the ratio of the areas over all draws, averaged over the two study days.
+The checks fit the same model on other values from the same draws: the first
+study day alone, and the ratio in a single draw.
+
+```{r checks-setup}
+# The model of the dosed study on one value per volunteer (a log2 ratio, with the
+# class rank): the volunteers, the slope per class with its 95% CI, p and R2.
+class_fit <- function(d, ratio, days) {
+  m  <- lm(log2_ratio ~ rank, data = d)
+  ci <- confint(m)["rank", ]
+  data.frame(ratio = ratio, days = days, volunteers = nrow(d),
+             slope = coef(m)[["rank"]], lo = ci[[1]], hi = ci[[2]],
+             p = summary(m)$coefficients["rank", 4], r2 = summary(m)$r.squared)
+}
+# One value per volunteer: the mean over the study days that give one.
+per_volunteer <- function(d) aggregate(log2_ratio ~ subject + phenotype + rank, data = d, FUN = mean)
+check_cols <- c("ratio", "study days", "volunteers", "slope per class",
+                "95% CI low", "95% CI high", "p", "R2")
+say_fit <- function(r) sprintf("%+.3f per class (95%% CI %.3f to %.3f, p = %s, R² = %.2f)",
+                               r$slope, r$lo, r$hi, fmt_p(r$p), r$r2)
+main_fit <- class_fit(subj_auc, "areas over all draws", "mean of days")
+```
+
+## First study day only
+
+```{r check-day1}
+# The study day before the antibiotics, as the submitter table names it.
+day1 <- unique(ta$ATTRIBUTE_Study_Day[ta$ATTRIBUTE_Study_Day_Text == "pre-antibiotic PK"])
+stopifnot(length(day1) == 1)
+auc_day1  <- auc[auc$day == day1, ]
+check_day <- rbind(main_fit, class_fit(auc_day1, "areas over all draws", paste("day", day1)))
+knitr::kable(transform(check_day, p = fmt_p(p)), row.names = FALSE, digits = 3,
+             col.names = check_cols,
+             caption = "The ratio against class: both study days and the first alone")
+no_day1 <- setdiff(subj_auc$subject, auc_day1$subject)
+```
+
+The submitter table names study day `r day1` as the one before the antibiotics
+("pre-antibiotic PK"). On that day alone, over `r nrow(auc_day1)` volunteers,
+the log2 ratio of the two areas changes by `r say_fit(check_day[2, ])`, against
+`r say_fit(main_fit)` over the mean of both days.
+`r if (check_day$hi[2] < 0) paste0("The interval on day ", day1, " alone also lies below zero, the predicted fall.") else paste0("On day ", day1, " alone, the interval includes zero.")`
+`r if (length(no_day1)) paste0(and_list(no_day1), if (length(no_day1) == 1) " has" else " have", " no area ratio on day ", day1, " and is left out.")`
+
+## A single draw
+
+```{r check-single-draw}
+# The usual index reads the ratio in one draw, about 3 hours after the dose.
+SINGLE_MIN <- 180
+draw_times <- sort(unique(dr$tmin))
+nearest    <- draw_times[abs(draw_times - SINGLE_MIN) == min(abs(draw_times - SINGLE_MIN))]
+
+# The ratio of the two targets in one draw at time t, per volunteer and day. A
+# draw where a target is not detected gives no ratio.
+at_draw <- function(t) {
+  d <- dr[dr$tmin == t, ]
+  data.frame(subject = d$ATTRIBUTE_Subject, day = d$ATTRIBUTE_Study_Day,
+             phenotype = d$PharmGeno_Phenotype_2C19,
+             rank = match(d$PharmGeno_Phenotype_2C19, PHENO),
+             log2_ratio = log2(d$par_auc / d$met_auc))
+}
+draws <- lapply(setNames(nearest, nearest), at_draw)
+check_draw <- rbind(main_fit, do.call(rbind, lapply(names(draws), function(t) {
+  d <- draws[[t]]
+  d <- d[is.finite(d$log2_ratio), ]
+  label <- sprintf("single draw at %s min", t)
+  rbind(class_fit(d[d$day == day1, ], label, paste("day", day1)),
+        class_fit(per_volunteer(d), label, "mean of days"))
+})))
+knitr::kable(transform(check_draw, p = fmt_p(p)), row.names = FALSE, digits = 3,
+             col.names = check_cols,
+             caption = "The ratio against class: the areas over all draws and a single draw")
+# Draws (volunteer and day) with no ratio at each of the nearest times.
+no_ratio <- vapply(draws, function(d) sum(!is.finite(d$log2_ratio)), 0L)
+# The rows of one draw time in the table.
+draw_rows <- function(t) check_draw[check_draw$ratio == sprintf("single draw at %s min", t), ]
+say_draw  <- function(t) {
+  r <- draw_rows(t)
+  paste0("At ", t, " min, the log2 ratio changes by ", say_fit(r[1, ]), " on day ", day1,
+         " (", r$volunteers[1], " volunteers), and by ", say_fit(r[2, ]),
+         " over the mean of the days (", r$volunteers[2], " volunteers).")
+}
+```
+
+The usual index of CYP2C19 activity is the ratio in one draw about
+`r SINGLE_MIN` min after the dose. This study drew at `r and_list(draw_times)`
+min. `r if (SINGLE_MIN %in% draw_times) paste0("The index is read at ", SINGLE_MIN, " min.") else if (length(nearest) > 1) paste0("No draw falls at ", SINGLE_MIN, " min; the nearest are ", and_list(nearest), " min, equally far from it, so the index is read at each.") else paste0("No draw falls at ", SINGLE_MIN, " min; the index is read at the nearest, ", nearest, " min.")`
+The index is the log2 ratio of the two targets' areas in that draw, per volunteer
+and day; a draw injected more than once gives the mean of its files, as above. A
+draw where a target is not detected gives no ratio and is left out:
+`r and_list(sprintf("%d at %s min", no_ratio, names(no_ratio)))`.
+
+`r paste(vapply(names(draws), say_draw, ""), collapse = " ")` Over the areas of
+all draws and both days, the slope is `r say_fit(main_fit)`. Of the
+`r nrow(check_draw) - 1` single-draw fits, `r sum(check_draw$hi[-1] < 0)` have an
+interval below zero, the predicted fall.
+
+# Check across assays
+
+This check is not part of the chapter's results either. The scan above tests
+each field inside each assay. Sex, age and matrix are recorded the same way in
+every deposit, so they can also be tested across assays: one model over the
+assays where the field varies, with each assay's own level ($a_s$ above) and one
+effect of the field shared by all of them. The same model without the assay's
+level is shown too; it reads each method's offset as part of the field's effect.
+
+```{r check-across}
+# The fields recorded the same way in every deposit. Group, health status and the
+# others name each deposit's own categories, so they have no shared effect.
+SHARED_FIELDS <- c("sex", "age", "body_site")
+varies_in <- function(f) blood_ids[vapply(blood_ids, function(s) length(values_in(f, s)) >= 2, TRUE)]
+across <- do.call(rbind, lapply(SHARED_FIELDS, function(f) {
+  vs <- varies_in(f)
+  if (length(vs) < 2) return(NULL)
+  z <- blood[blood$study %in% vs & !is.na(blood[[f]]), ]
+  x <- if (!anyNA(as_num(z[[f]]))) as_num(z[[f]]) else factor(z[[f]])
+  data.frame(field = SCAN_FIELDS[[f]], n_assays = length(vs),
+             assays = and_list(short_ds(vs, datasets$dataset_id)),
+             units = nrow(z),
+             p_with = anova(lm(z$l2 ~ factor(z$study) + x))["x", "Pr(>F)"],
+             p_without = anova(lm(z$l2 ~ x))["x", "Pr(>F)"])
+}))
+knitr::kable(transform(across[, names(across) != "n_assays"],
+                       p_with = fmt_p(p_with), p_without = fmt_p(p_without)),
+             row.names = FALSE,
+             col.names = c("field", "assays", "units", "p, with each assay's level",
+                           "p, without"),
+             caption = "The log2 ratio against each shared field, across the assays where it varies")
+# Shared fields that vary inside a single assay: their test is the one in the scan.
+one_assay <- SCAN_FIELDS[SHARED_FIELDS[vapply(SHARED_FIELDS, function(f) length(varies_in(f)) == 1, TRUE)]]
+n_below   <- sum(c(across$p_with, across$p_without) < 0.05)
+cap       <- function(x) paste0(toupper(substring(x, 1, 1)), substring(x, 2))
+```
+
+`r paste(sprintf("Across the %d assays where %s varies (%d units), p = %s with each assay's level and %s without.", across$n_assays, across$field, across$units, fmt_p(across$p_with), fmt_p(across$p_without)), collapse = " ")`
+`r if (n_below == 0) "None is below 0.05: the added assays make no field significant across assays either." else paste(n_below, "of these p values are below 0.05.")`
+`r if (length(one_assay)) paste0(cap(and_list(unname(one_assay))), if (length(one_assay) == 1) " varies" else " vary", " inside a single assay only, so ", if (length(one_assay) == 1) "its test is" else "their tests are", " the one in the scan above.")`
+
+# Check: the area baseline
+
+This check is not part of the chapter's results, and the step summary above
+does not use it. Step 5 measures a peak's area above a straight line between its
+two boundary scans. Where the scan just outside a boundary is empty, the signal
+rises from nothing there, and that line leaves out the part of the peak below
+the boundary scan. Step 5 therefore also records the area with the line started
+from zero on such a side (`auc0`). Here the model of the dosed study is fitted
+again with each file's areas taken from `auc0`. The draws, the areas over the
+draw times and the volunteers are built as above.
+
+```{r check-baseline}
+# The two baselines, as the table names them.
+BASELINES <- c("between the boundary scans", "from zero beside an empty scan")
+# A per-file table written before step 5 recorded auc0 has no such columns.
+has_auc0 <- all(c("par_auc0", "met_auc0") %in% names(p84))
+if (has_auc0) {
+  # Each file's areas on auc0, zero where the target was not detected, as above.
+  ta0 <- ta
+  j0  <- match(ta0$k, p84$k)
+  ta0$par_auc <- ifelse(ta0$par_det, p84$par_auc0[j0], 0)
+  ta0$met_auc <- ifelse(ta0$met_det, p84$met_auc0[j0], 0)
+  # Extracted draw files with a detection, and those whose areas the line from zero changes.
+  n_det   <- sum(ta0$extracted & (ta0$par_det | ta0$met_det))
+  n_moved <- sum(ta0$extracted & (ta0$par_auc != ta$par_auc | ta0$met_auc != ta$met_auc))
+  subj0 <- per_volunteer(day_ratios(draw_areas(ta0)))
+  # auc0 is missing exactly where the area is, so the volunteers are those of the model.
+  stopifnot(setequal(subj0$subject, subj_auc$subject))
+  # The model's fit and its slope without each volunteer in turn.
+  with_loo <- function(d, label) {
+    f   <- class_fit(d, label, "mean of days")
+    loo <- leave_one_out(d)
+    cbind(f[, names(f) != "days"], loo_lo = min(loo$beta), loo_hi = max(loo$beta))
+  }
+  by_base <- rbind(with_loo(subj_auc, BASELINES[1]), with_loo(subj0, BASELINES[2]))
+  say_loo <- function(r) sprintf("%+.3f and %+.3f", r$loo_lo, r$loo_hi)
+  baseline_txt <- paste0(
+    "The line from zero changes the areas of ", n_moved, " of the ", n_det,
+    " extracted draw files with a detection. With it, over ", by_base$volunteers[2],
+    " volunteers, the log2 ratio changes by ", say_fit(by_base[2, ]),
+    ", against ", say_fit(by_base[1, ]), " with the line between the boundary scans",
+    "; without any one volunteer the slope stays between ", say_loo(by_base[2, ]),
+    " (", say_loo(by_base[1, ]), " with the line between the boundary scans).")
+} else {
+  baseline_txt <- paste("The per-file table has no area on the second baseline (no par_auc0 or",
+                        "met_auc0 column): it was written before step 5 recorded one, so the",
+                        "check waits for step 5 to be rendered again.")
+}
+if (has_auc0)
+  knitr::kable(transform(by_base, p = fmt_p(p)), row.names = FALSE, digits = 3,
+               col.names = c("area baseline", "volunteers", "slope per class",
+                             "95% CI low", "95% CI high", "p", "R2",
+                             "slope without one volunteer, lowest", "highest"),
+               caption = "The ratio against class on the two area baselines")
+```
+
+`r baseline_txt`
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

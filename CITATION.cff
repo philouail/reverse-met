@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+title: >-
+  Reverse metabolomics across public LC-MS/MS repositories: a reproducible
+  workflow, applied to tryptophan and kynurenine and to omeprazole and
+  5-hydroxyomeprazole
+message: >-
+  If you use this software or its results, please cite it using the
+  metadata below.
+type: software
+authors:
+  - given-names: Philippine
+    family-names: Louail
+    email: philoulouail@gmail.com
+repository-code: "https://github.com/philouail/reverse-met"
+abstract: >-
+  A reproducible six-step workflow (search, metadata, curation,
+  confirmation, extraction, analysis) for reusing public LC-MS/MS data at
+  scale, built on the RforMassSpectrometry ecosystem. Target compounds are
+  searched in FASSTrecords, a database of precomputed MASST matches; the
+  deposits that hold them are described from the metadata of MassIVE,
+  MetaboLights and the Metabolomics Workbench; their hits are confirmed with
+  SIRIUS and CSI:FingerID; and each target's MS1 peak is measured in every
+  file of the confirmed assays. Two applications use it: the ratio of
+  kynurenine to tryptophan against age in adult blood, and the ratio of
+  omeprazole to 5-hydroxyomeprazole, checked against CYP2C19 genotype in a
+  dosed cohort.
+keywords:
+  - metabolomics
+  - mass spectrometry
+  - reverse metabolomics
+  - public data reuse
+  - FASSTrecords
+  - SIRIUS
+  - tryptophan
+  - kynurenine
+  - pharmacogenomics
+  - CYP2C19
+  - omeprazole
+license: Apache-2.0

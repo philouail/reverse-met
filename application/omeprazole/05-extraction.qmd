@@ -1,0 +1,1685 @@
+---
+title: "05 - Extraction"
+subtitle: "Step 5: each target measured in every file"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+---
+
+# Overview
+
+Step 4 established, per assay, which ion of each target to extract, at what
+m/z, and the range of retention times over which its confirmed spectra were
+recorded. This notebook takes those back to every biological file of the assay:
+for each file and target it reads the ion trace (EIC) at the m/z of the
+confirmed spectra over that range and a margin beyond it, places a
+retention-time window on the MS1 peak the confirmed spectra point to, looks for
+a peak in that window, and integrates it if it passes the criteria below. Files
+that were never fragmented are measured as well as the confirmed ones.
+
+**Input:** `artifacts/hits-confirmed-all.csv`, `artifacts/datasets-confirmed.csv`,
+`artifacts/extraction_windows.csv` (step 4: per assay and target, the ion,
+its m/z and the range of confirmed retention times) and
+`artifacts/assay_instruments.csv` (step 4: per assay, the instrument its raw files
+record and the m/z tolerance it sets), `artifacts/dataset_metadata_table.csv`
+(step 3), and the hand corrections in `curation/` (manual work, optional).
+
+**Output:** `artifacts/sample_table_perfile.csv`, one row per file with, for each
+target, whether it was detected, its peak area and the measurements behind both
+(among them `auc0`, the area on a second baseline, for a check in step 6);
+`artifacts/sample_table_all.csv`, the same collapsed to one row per sample;
+`artifacts/positive_control.csv`; `artifacts/ms1_windows.csv`, the window in
+which each target's peak was looked for, per assay; the figure
+`figures/step5_windows.png` (and `.pdf`); each assay's extraction, cached in
+`artifacts/per_dataset/<dataset_id>.rds`; and the lists of extracted files
+(`artifacts/bio_*.rds`).
+
+All compute goes through `run_ms1_for_dataset()` (`R/ms1.R`); this notebook
+holds the loop, the extraction settings and the cross-dataset summary.
+Datasets are
+keyed by the combined `dataset_id` from `02`, and the loop pulls the bare
+`deposit_id` and `assay` per row so repository downloads see plain accessions.
+
+## Why not just use the MS2 matches?
+
+A missing MS2 spectrum does not mean a missing compound. These deposits were
+acquired by data-dependent acquisition, in which the instrument decides in real
+time which ions to fragment, mostly by intensity and within a limited duty
+cycle. A compound can therefore be present at a perfectly measurable level and
+receive no MS2 scan at all, simply because the instrument was busy with
+something else; run the same sample twice and the set of fragmented precursors
+differs. A search resting on MS2 alone cannot separate absence from
+non-selection, and the failure is not random. Selection is intensity-driven, so
+the compounds most often missed are the low-abundance ones, often exactly the
+observations a reanalysis is after. MS2-only prevalence is a lower bound, and a
+biased one.
+
+The two levels are complementary. MS2 gives identity, because fragments
+constrain the structure and SIRIUS can tell isomers apart; MS1 gives coverage,
+because it is recorded continuously with no selection step. Propagation uses
+each for what it is good at: confirm the compound by MS2 in the files where it
+happened to be fragmented, which pins both its mass and its retention time, then
+measure that mass at that retention time in every file, including the many where
+the instrument never fragmented it.
+
+Proteomics met the same problem and solved it the same way. Match-between-runs
+identifies a peptide by MS2 in the run where it was fragmented, then transfers
+that identification to other runs by accurate mass and aligned retention time,
+quantifying at MS1 where the precursor was never selected. It became standard
+practice because DDA under-samples exactly as described above. Metabolomics
+repository reanalysis has largely not adopted the equivalent step, and this
+notebook is that step.
+
+The trade is sensitivity for specificity, and it is real. MS2 can distinguish
+compounds that share a mass and MS1 cannot, so propagation extends coverage only
+as far as the chromatography preserves identity. Where a target has an isobar,
+a retention-time window set too wide silently measures the wrong molecule, so
+the method is only as good as that window, which is why so much of this
+notebook is about it.
+
+There is a second benefit, less obvious. Comparing deposits by their MS2
+detection rates would substantially be comparing instruments: a deposit run on a
+faster instrument with a deeper precursor list fragments more, so it looks more
+prevalent. MS1 is acquired whatever the instrument chose to fragment, so
+propagating to MS1 removes that confound. It does not make deposits fully
+comparable, since sensitivity, matrix and chromatography still differ, but it
+removes the one that most distorts a raw detection-rate comparison.
+
+```{r setup}
+source("../../R/setup.R")
+source("../../R/metadata.R")
+source("../../R/masst.R")   # compound_spec + PHENO, the domain constants
+source("../../R/ms1.R")
+library(Chromatograms)
+library(MsQuality)
+# The targets, in the order of compound.csv, and the prefix of their columns and
+# fields (par, met; target_prefix() in R/setup.R).
+roles     <- compound_spec$role
+prefixes  <- target_prefix(roles)
+n_targets <- length(roles)
+```
+
+```{r load-artifacts}
+conf_final        <- read.csv("artifacts/hits-confirmed-all.csv",
+                              check.names = FALSE)
+conf_final$confidence <- factor(conf_final$confidence,
+                                 levels = c("strict", "standard",
+                                            "liberal", "not_confirmed"))
+ds_summary        <- read.csv("artifacts/datasets-confirmed.csv", check.names = FALSE)
+ds_meta_tbl       <- read.csv("artifacts/dataset_metadata_table.csv",
+                              check.names = FALSE)
+# Each assay's ion, m/z and range of confirmed retention times per target, set in
+# step 4. The window itself is set here, on the MS1 trace.
+if (!file.exists("artifacts/extraction_windows.csv"))
+  stop("artifacts/extraction_windows.csv not found: render 04-confirmation.qmd first")
+ext_windows       <- read.csv("artifacts/extraction_windows.csv", check.names = FALSE)
+# Each assay's instrument and the m/z tolerance it sets, read from the raw files'
+# headers in step 4.
+if (!file.exists("artifacts/assay_instruments.csv"))
+  stop("artifacts/assay_instruments.csv not found: render 04-confirmation.qmd first")
+assay_inst        <- read.csv("artifacts/assay_instruments.csv", stringsAsFactors = FALSE)
+```
+
+# Files to extract
+
+For each surviving `dataset_id` we build the list of biological MS files,
+excluding QC injections, blanks, pooled QCs and reference standards. The three
+repositories record that differently, so there is one loop per repository below.
+`EXCL_ST` in `R/metadata.R` defines the regex of sample-type strings treated as
+non-biological in all three.
+
+```{r init-lists}
+bio_files_per_ds  <- list()
+bio_assays_per_ds <- list()
+# Per file, does a metadata source cover it? Files without metadata are extracted
+# for the record (only if they carry a confirmed hit) but excluded downstream.
+bio_meta_per_ds   <- list()
+```
+
+The MassIVE extraction set comes from the **deposit's own file inventory**
+(`massive_list_files` via `select_bio_files_massive()`), de-duplicated by
+normalised name across all of the deposit's file trees. This matters because a
+metadata catalogue alone under-covers a deposit: MSV000082493's blood
+collection was added in a later deposit update that Pan-ReDU never indexed, and
+MSV000082433's confirmed exposure sits on a plate Pan-ReDU never received.
+Sourcing from the inventory keeps the extraction space equal to the MASST search
+space.
+
+A file enters the set if it is **either**:
+
+- covered by a metadata source (Pan-ReDU ∪ submitter table, reconciled in `02`),
+  with QC injections, blanks and reference standards removed by the *declared*
+  sample-type column (`EXCL_ST` on `SampleType` / `MS_SampleType`); **or**
+- carrying a confirmed MASST hit, whatever tree it sits in, so no confirmed
+  exposure is ever lost, unless the metadata declares that file a blank, QC or
+  standard: carryover gives a blank a confirmed hit, and that is not an exposure.
+  For this the sample type is read on every row, also on a submitter row with
+  too few fields to count as metadata: the sample type alone says what the file
+  is.
+
+Deposits also mislabel such files as samples, or leave them out of the metadata
+altogether, so one narrow file-name rule (`EXCL_NONBIO`) removes pooled QCs, QC
+injections, blanks and calibration standards from every repository's list, and
+their confirmed hits from the anchors, whatever the metadata says.
+
+Files that are neither are not downloaded. `bio_meta_per_ds` flags each kept
+file: `has_metadata = TRUE` is analysable downstream; a confirmed-hit-only file
+(`FALSE`) is extracted for the presence record but excluded from stratified
+analysis. The metadata side is a per-deposit TSV from Pan-ReDU, auto-cached from
+`redu.gnps2.org`, or a submitter-provided CSV; both carry `SampleType` and
+`filename`, and where the CSV holds bare stems they are reconstructed against
+the MASST `file_path` directory and extension.
+
+```{r bio-files-massive}
+# Loadable basename of a confirmed-hit file (strip the MsBackend cache prefix).
+bare_hit_name <- function(x) sub("^MSV[0-9]+[_-]", "", basename(as.character(x)))
+# The rows of a sample table whose declared sample type is a blank, QC or standard.
+nonbio_rows <- function(nat) {
+  nb <- rep(FALSE, nrow(nat))
+  for (st in intersect(c("SampleType", "MS_SampleType"), names(nat)))
+    nb <- nb | (grepl(EXCL_ST, nat[[st]], perl = TRUE) & !is.na(nat[[st]]))
+  nb
+}
+msv_rows <- ds_summary[startsWith(ds_summary$deposit_id, "MSV"), ]
+
+for (i in seq_len(nrow(msv_rows))) {
+  ds  <- msv_rows$dataset_id[i]
+  dep <- msv_rows$deposit_id[i]
+
+  # A repository that does not answer stops the render here, rather than leave the
+  # deposit without its metadata or its files (is_network_error() in R/metadata.R).
+  meta_keys <- tryCatch({
+    nat  <- msv_native_sample_table(dep)
+    fcol <- intersect(MSV_FILENAME_COLS, names(nat))[1]
+    if (is.na(fcol)) character() else norm_file_key(nat[[fcol]][!nonbio_rows(nat)])
+  }, error = function(e) {
+    if (is_network_error(e)) stop(e)
+    character()
+  })
+  # The sample type is read on every submitter row, also on one too thin to count
+  # as metadata above (MSV000082493's plate*_stdmixA files, declared blank_QC).
+  nonbio_keys <- tryCatch({
+    nat  <- suppressMessages(msv_native_sample_table(dep, min_fields = 0L))
+    fcol <- intersect(MSV_FILENAME_COLS, names(nat))[1]
+    if (is.na(fcol)) character() else norm_file_key(nat[[fcol]][nonbio_rows(nat)])
+  }, error = function(e) {
+    if (is_network_error(e)) stop(e)
+    character()
+  })
+  hit_files <- unique(bare_hit_name(
+    conf_final$source_file[conf_final$dataset_id == ds &
+                           !is.na(conf_final$source_file)]))
+
+  sel <- tryCatch(select_bio_files_massive(dep, meta_keys, hit_files, nonbio_keys),
+                  error = function(e) {
+                    if (is_network_error(e)) stop(e)
+                    warning("[", ds, "] ", conditionMessage(e)); NULL })
+  if (is.null(sel) || !nrow(sel)) {
+    warning("[", ds, "] no biological files resolved - skipped"); next
+  }
+
+  bio_files_per_ds [[ds]] <- sel$file
+  bio_meta_per_ds  [[ds]] <- stats::setNames(sel$has_metadata, sel$file)
+  bio_assays_per_ds[[ds]] <- NA_character_   # MassIVE backend needs no assay name
+  message(sprintf("[%s] %d files to extract (%d with metadata, %d record-only)",
+                  ds, nrow(sel), sum(sel$has_metadata), sum(!sel$has_metadata)))
+}
+```
+
+MetaboLights keeps the two halves apart: the study file `s_{id}.txt` lists
+sample names and factors, while the spectral file names live in the assay file
+`a_{id}_*.txt`. Each `dataset_id` is already scoped to one assay, so
+`mtbls_assay_data()` is called for one assay at a time and restricted to the
+sample rows `s_*.txt` marks as biological.
+
+```{r bio-files-mtbls}
+mtbls_rows <- ds_summary[startsWith(ds_summary$deposit_id, "MTBLS"), ]
+
+for (i in seq_len(nrow(mtbls_rows))) {
+  ds  <- mtbls_rows$dataset_id[i]
+  dep <- mtbls_rows$deposit_id[i]
+  an  <- mtbls_rows$assay[i]
+
+  s_path <- file.path(META_DIR, paste0("s_", dep, ".txt"))
+  if (!file.exists(s_path)) {
+    warning("[", ds, "] no s_*.txt - skipped"); next
+  }
+
+  samples <- read.delim(s_path, check.names = FALSE)
+  st_col  <- grep("sample type", names(samples), value = TRUE,
+                  ignore.case = TRUE)[1]
+  if (!is.na(st_col))
+    samples <- samples[!grepl(EXCL_ST, samples[[st_col]], perl = TRUE), ]
+  bio_names <- unique(samples[["Sample Name"]])
+
+  # The cached copy of the assay table (fetch_assay_table() in R/metadata.R).
+  adf <- fetch_assay_table(dep, an)
+  if (is.null(adf) || !nrow(adf)) {
+    warning("[", ds, "] empty assay table - skipped"); next
+  }
+  fc <- if ("Derived Spectral Data File" %in% names(adf) &&
+            any(nzchar(trimws(as.character(adf[["Derived Spectral Data File"]])))))
+          "Derived Spectral Data File"
+        else "Raw Spectral Data File"
+
+  rows  <- adf[adf[["Sample Name"]] %in% bio_names, , drop = FALSE]
+  files <- unique(trimws(as.character(rows[[fc]])))
+  files <- files[!is.na(files) & nchar(files) > 0]
+
+  bio_files_per_ds [[ds]] <- files
+  # MetaboLights files come from the deposit's own ISA-Tab manifest, so every
+  # one already carries metadata (QC excluded above): all TRUE.
+  bio_meta_per_ds  [[ds]] <- stats::setNames(rep(TRUE, length(files)), files)
+  bio_assays_per_ds[[ds]] <- an
+}
+```
+
+The Workbench packs it into one file. Each analysis file `<deposit>_AN*.txt`
+carries a `SUBJECT_SAMPLE_FACTORS` block in which a subject's `RAW_FILE_NAME` is
+a space-separated list, one name per analysis. The names follow the order of
+`MS_run` unless the deposit is declared otherwise (`MWB_FILE_ORDER` in
+`R/metadata.R`, see step 2). A name that is missing from the deposit, or that
+appears in two of its folders, is left out.
+
+```{r bio-files-mwb}
+mwb_rows <- ds_summary[startsWith(ds_summary$deposit_id, "ST"), ]
+
+for (i in seq_len(nrow(mwb_rows))) {
+  ds  <- mwb_rows$dataset_id[i]
+  dep <- mwb_rows$deposit_id[i]
+  an_id <- sub(paste0("^", dep, "_"), "",
+               sub("\\.txt$", "", mwb_rows$assay[i]))
+
+  mwf <- file.path(META_DIR, mwb_rows$assay[i])
+  if (!file.exists(mwf)) {
+    warning("[", ds, "] no ", basename(mwf), " - skipped"); next
+  }
+
+  ln  <- readLines(mwf, warn = FALSE)
+  ssf <- ln[startsWith(ln, "SUBJECT_SAMPLE_FACTORS") & !startsWith(ln, "#")]
+  if (!length(ssf)) {
+    warning("[", ds, "] no SUBJECT_SAMPLE_FACTORS - skipped"); next
+  }
+
+  ssf_parsed <- lapply(strsplit(ssf, "\t"), function(p) {
+    raw_str   <- if (length(p) >= 5)
+                   regmatches(p[5], regexpr("RAW_FILE_NAME=[^\t]+", p[5]))
+                 else character(0)
+    raw_str   <- sub("RAW_FILE_NAME=", "",
+                     if (length(raw_str)) raw_str else "")
+    raw_files <- trimws(unlist(strsplit(raw_str, "\\s+")))
+    list(factors   = if (length(p) >= 4) p[4] else NA_character_,
+         raw_files = raw_files[nchar(raw_files) > 0])
+  })
+  keep_qc    <- !vapply(ssf_parsed,
+                        function(r) grepl(EXCL_ST, r$factors, perl = TRUE),
+                        logical(1))
+  ssf_parsed <- ssf_parsed[keep_qc]
+
+  # RAW_FILE_NAME is a positional list, one entry per analysis.
+  an_idx <- match(an_id, mwb_analysis_order(dep))
+  if (is.na(an_idx))
+    stop("[", ds, "] ", an_id, " not in the deposit's analysis list")
+
+  files <- unique(vapply(ssf_parsed, function(r) {
+    # A row with a single name lists this analysis's own file.
+    if (length(r$raw_files) == 1) r$raw_files[1]
+    else if (length(r$raw_files) >= an_idx) r$raw_files[an_idx] else NA_character_
+  }, character(1)))
+  files <- files[!is.na(files) & nchar(files) > 0]
+  files <- files[files %in% mwb_listed_files(dep)]
+
+  bio_files_per_ds [[ds]] <- files
+  # Workbench files come from the deposit's own mwTab manifest (QC excluded), so
+  # every one carries metadata: all TRUE.
+  bio_meta_per_ds  [[ds]] <- stats::setNames(rep(TRUE, length(files)), files)
+  bio_assays_per_ds[[ds]] <- an_id
+}
+```
+
+The name rule, applied once more to every repository's list, since only the
+MassIVE selection applies it itself:
+
+```{r bio-files-nonbio}
+for (ds in names(bio_files_per_ds)) {
+  nb <- is_nonbio_file(bio_files_per_ds[[ds]])
+  if (!any(nb)) next
+  message(sprintf("[%s] dropped %d QC, blank or standard files", ds, sum(nb)))
+  keep <- bio_files_per_ds[[ds]][!nb]
+  bio_files_per_ds[[ds]] <- keep
+  if (!is.null(bio_meta_per_ds[[ds]]))
+    bio_meta_per_ds[[ds]] <- bio_meta_per_ds[[ds]][names(bio_meta_per_ds[[ds]]) %in% keep]
+}
+```
+
+A study deposited twice holds some files in both deposits; each is extracted
+once, under the deposit step 3 kept its hits in (`is_copy()`):
+
+```{r bio-files-copies}
+for (ds in names(bio_files_per_ds)) {
+  cp <- is_copy(bio_files_per_ds[[ds]], rep(ds, length(bio_files_per_ds[[ds]])),
+                function(d) bio_files_per_ds[[d]])
+  if (!any(cp)) next
+  message(sprintf("[%s] dropped %d files held again by a related deposit", ds, sum(cp)))
+  keep <- bio_files_per_ds[[ds]][!cp]
+  bio_files_per_ds[[ds]] <- keep
+  if (!is.null(bio_meta_per_ds[[ds]]))
+    bio_meta_per_ds[[ds]] <- bio_meta_per_ds[[ds]][names(bio_meta_per_ds[[ds]]) %in% keep]
+}
+```
+
+What the three loops leave, per dataset:
+
+```{r bio-summary}
+#| echo: false
+bio_counts <- data.frame(
+  dataset_id  = names(bio_files_per_ds),
+  n_bio_files = vapply(bio_files_per_ds, length, integer(1)),
+  assay       = vapply(names(bio_files_per_ds),
+                       function(d) as.character(bio_assays_per_ds[[d]]),
+                       character(1)),
+  row.names   = NULL
+) |>
+  dplyr::left_join(ds_summary[, c("dataset_id", "deposit_id", "repository",
+                                  "chromatography")],
+                   by = "dataset_id")
+bio_counts
+```
+
+```{r write-file-lists}
+saveRDS(bio_files_per_ds,  "artifacts/bio_files_per_ds.rds")
+saveRDS(bio_meta_per_ds,   "artifacts/bio_meta_per_ds.rds")
+# Does a metadata source cover each file? Keyed dataset_id|basename so identical
+# basenames in two deposits cannot collide.
+has_metadata_lookup <- unlist(lapply(names(bio_meta_per_ds), function(ds) {
+  v <- bio_meta_per_ds[[ds]]
+  stats::setNames(as.logical(v), paste0(ds, "|", basename(names(v))))
+}))
+```
+
+
+# Extraction settings
+
+```{r extraction-settings}
+DATASETS_TO_RUN <- names(bio_files_per_ds)
+
+RT_PAD_S <- ext_windows$rt_pad_s[1]   # s padded each side of the confirmed-RT range
+
+# The m/z tolerance of each assay, set in step 4 by the instrument its raw files
+# record. An assay step 4 gives no tolerance for is extracted at PPM_DEFAULT.
+ids_run <- as.character(DATASETS_TO_RUN)
+tol <- data.frame(dataset_id = ids_run,
+                  class = assay_inst$class[match(ids_run, assay_inst$dataset_id)],
+                  ppm   = assay_inst$ppm[match(ids_run, assay_inst$dataset_id)])
+no_inst <- is.na(tol$ppm)
+if (any(no_inst))
+  message("not in artifacts/assay_instruments.csv, extracted at ", PPM_DEFAULT, " ppm: ",
+          paste(tol$dataset_id[no_inst], collapse = ", "))
+tol$class[no_inst] <- "unknown"
+tol$ppm[no_inst]   <- PPM_DEFAULT
+# The target the text below gives the tolerance in Da for: the one of highest m/z.
+heaviest <- if (n_targets == 1) "the target's" else
+  if (n_targets == 2) "the heavier target's" else "the heaviest target's"
+```
+
+Two settings bound the part of the raw data that is read for a target. Both are
+set in step 4 and read back here:
+
+- **m/z tolerance**, per assay. When we go looking for a compound at its known
+  mass, real instruments are slightly off, so we accept anything within a
+  tolerance of it, and how far off they are depends on the mass analyser. Step 4
+  reads each assay's instrument from its raw files and sets the tolerance from
+  it (`artifacts/assay_instruments.csv`): `r PPM_BY_CLASS[["orbitrap"]]` ppm on
+  an Orbitrap (±`r sprintf("%.4f", PPM_BY_CLASS[["orbitrap"]] * 1e-6 * max(compound_spec$mz_pos))` Da
+  at `r heaviest` m/z), where the scans across a true peak sit within a
+  few ppm of its mass, and `r PPM_BY_CLASS[["tof"]]` ppm on a time-of-flight
+  instrument (±`r sprintf("%.4f", PPM_BY_CLASS[["tof"]] * 1e-6 * max(compound_spec$mz_pos))` Da),
+  where the scans on a peak's edges scatter much further. An assay whose
+  instrument cannot be told gets `r PPM_DEFAULT` ppm. Too narrow a tolerance cuts
+  real signal off a peak's edges; too wide a one lets a neighbouring ion of
+  nearly the same mass into the trace. Of the `r nrow(tol)` assays extracted
+  here, `r sum(tol$class == "orbitrap")` are extracted at
+  `r PPM_BY_CLASS[["orbitrap"]]` ppm, `r sum(tol$class == "tof")` at
+  `r PPM_BY_CLASS[["tof"]]` ppm and `r sum(tol$class == "unknown")`, whose
+  instrument is not known, at `r PPM_DEFAULT` ppm (table below).
+- **`RT_PAD_S` = `r RT_PAD_S`**: seconds added on each side of
+  step 4's range of confirmed retention times. Step 4 sets it, since it builds
+  the range, and it is read back here. It bounds the stretch of trace that is
+  read, not the window: the window is set on the MS1 trace and padded by
+  `APEX_PAD` (see *The retention-time window* below).
+
+```{r extraction-tolerance}
+#| echo: false
+knitr::kable(data.frame(assay = short_ds(tol$dataset_id), instrument = tol$class,
+                        `m/z tolerance (ppm)` = tol$ppm, check.names = FALSE),
+             caption = "The m/z tolerance of each assay extracted here, set by its instrument in step 4.")
+```
+
+There is no peak-edge padding: the picker integrates valley to valley, so how
+far it reaches is set by the peak's own shape rather than by a fixed margin.
+
+
+## How the peaks are picked and filtered
+
+The picker lives in `R/ms1.R` and runs in five stages, in this order.
+
+- **Set the window** (`acceptance_window`). Rather than a fixed span, each
+  confirmed MS2 hit is anchored to the apex of the MS1 peak it sits on, and the
+  window brackets the best-supported cluster of those apexes, padded by
+  `APEX_PAD` = `r APEX_PAD` s (see *The retention-time window* below). The picker starts
+  from the local maxima inside the window; the apex it settles on may lie up to
+  `APEX_PAD` s outside it, and how far the integration then reaches is set by
+  the peak.
+- **Integrate** (`pick`). Each local maximum is integrated valley to valley,
+  walking out from the apex until the trace returns to baseline or meets a deep
+  valley, merging shallow shoulders and sub-`r PROX_S` s doublets and stopping at dead
+  gaps where the EIC dropped out. Area is trapezoidal above a straight line
+  between the two boundary scans; prominence, SNR and the nearest-taller-neighbour
+  ratio are computed on the whole peak.
+- **Choose which peak.** Where several fall inside the window, the dominant one
+  is chosen by area weighted by a gaussian in its distance from the expected RT
+  (`RT_SIGMA` = `r RT_SIGMA` s). This is the isomer defence at the selection level: a
+  larger interferent elsewhere in the window loses to the on-RT peak. HILIC
+  keeps pure area-selection, its windows having been audited peak by peak.
+- **Accept or reject** (`accept_peak`), conditional on chromatography. Both
+  modes require an apex
+  of `r format(MIN_INT, big.mark = ",")` counts, an SNR of `r SNR_MIN_RP` on
+  reverse phase or `r SNR_MIN_HILIC` on HILIC, an FWHM inside
+  [`r FWHM_BAND_RP[1]`, `r FWHM_BAND_RP[2]`] s on reverse phase or of at least
+  `r FWHM_BAND_HILIC[1]` s on HILIC. HILIC also requires return-to-baseline
+  and no much-taller neighbour; reverse phase drops both, because they rejected
+  sharp peaks truncated on one flank and real peaks sitting beside a larger
+  neighbour, and instead requires a 3-point peak to clear its own baseline. The
+  reverse-phase floors were set on audited peaks: the SNR floor sits below every
+  real peak seen and the FWHM ceiling above the widest.
+- **Measure** (`add_msquality`). The picker chooses the peak and its boundaries;
+  **MsQuality** then measures it, so the reported width, FWHM and shape are mzQC
+  controlled-vocabulary quantities rather than local re-implementations. Handed
+  our boundaries, its `peakWidth()` and `xicFwhm()` reproduce the local values
+  exactly on reverse phase; on HILIC the two FWHMs differ, because ours takes
+  the outermost half-maximum crossings of a merged cluster while MsQuality takes
+  50% of the maximum inside the region. `gaussianSimilarity()` is recorded per
+  peak but never gated on, since it needs at least 5 points and is NA on the
+  sparsest. Apex intensity and SNR stay local: both describe *which* peak was
+  selected, and MsQuality has no way of being told that.
+
+A peak whose trace empties before it falls to half height is measured out to
+those empty scans and kept as `truncated`. An unresolved neighbouring ion does
+this: where the target weakens the instrument merges the two into one centroid
+that drifts out of the mass window, so the trace reads zero while the compound
+is still eluting. Only a trace shaped like a peak qualifies: no empty scan
+inside it, rising to the apex and falling after it. A dip of up to
+`r 100 * TRUNC_DIP`% of the apex on the way up or down is allowed, as noise from
+one scan to the next. The peak counts as a detection, but its area is a lower
+bound, so no area is reported.
+
+Each peak also records a second area, `auc0`, for a check in step 6. Where the
+scan just outside a boundary is empty, the signal rises from nothing there, and
+a line starting at the boundary scan leaves out the part of the peak below it;
+`auc0` starts the line from zero on such a side instead. Where neither side
+borders an empty scan, the two areas are the same. `auc0` plays no part in
+detection or in choosing the peak, and it is missing wherever the area is.
+
+One further rejection happens after the picker, once every channel exists, and
+only for a compound whose `compound.csv` row names an isobar: another compound
+of the same mass that elutes where a partner compound does, and that spectral
+confirmation may not reject either. The partner is the target the row's
+`isobar_at` names; with two targets it may be left blank, and is then the other
+one. `resolve_isobars()` drops such a channel's peak when it sits nearer the
+*partner's* retention time than its own, each compound's retention time being
+the median of the anchors its window rests on. A channel with no declared
+isobar is never tested, because a peak drifting toward another target's
+retention time is still its own compound. Where either of the two windows is
+uncertain (its confirmed spectra point to two equally supported MS1 peaks), the
+channel is not tested.
+
+The gates were tuned by auditing peaks in a reverse-phase assay and a HILIC
+assay, each peak plotted and labelled by eye as signal, noise or interferent.
+Detected peaks carrying no MS2 confirmation of their own were then reviewed
+against the panels `R/peak_review_panels.R` saves under `peaks_review_v2/`,
+which also name the gate rule behind every rejection. Peaks that survive every
+rule while still being wrong, where noise and signal overlap on every shape
+metric, are corrected by hand (below). For a genuinely ambiguous peak a
+transparent per-peak correction is more honest than a gate no one can fully reason
+about. This is inspection-backed calibration rather than a formal benchmark, but
+every decision is auditable from the saved panels.
+
+::: {.callout-warning title="Manual work"}
+Three optional files in `curation/` hold corrections made by hand after looking at
+the peak panels: `rt_apex_overrides.csv`, the retention time to use where the
+picker took the wrong apex, `ms1_drop_list.csv`, peaks to drop, and
+`ms1_accept_list.csv`, peaks to pick around a given apex instead of in the
+window (the peak criteria still apply). Every entry carries its reason. An application without them is extracted without corrections.
+:::
+
+```{r peak-criteria}
+#| echo: false
+tol_text <- sprintf("%g ppm on an Orbitrap, %g ppm on a time-of-flight, %g ppm where the instrument is not known",
+                    PPM_BY_CLASS[["orbitrap"]], PPM_BY_CLASS[["tof"]], PPM_DEFAULT)
+gate <- data.frame(
+  criterion = c("ion extracted",
+                "m/z tolerance",
+                "retention-time window",
+                "peak chosen among several in the window",
+                "apex intensity",
+                "signal-to-noise ratio",
+                "width at half maximum",
+                "return to baseline (prominence, fraction of the apex)",
+                "taller neighbour",
+                "peak that leaves the m/z window before half height"),
+  `reverse phase` = c(
+    "molecular ion if confirmed, else the most frequent confirmed adduct",
+    tol_text,
+    sprintf("MS1 apexes of the confirmed spectra (best-supported cluster), %g s either side", APEX_PAD),
+    sprintf("largest area, weighted by distance from the window centre (Gaussian, sd %g s)", RT_SIGMA),
+    sprintf("at least %g counts", MIN_INT),
+    sprintf("at least %g", SNR_MIN_RP),
+    sprintf("%g to %g s", FWHM_BAND_RP[1], FWHM_BAND_RP[2]),
+    sprintf("at least %g, for 3-point peaks only", PROM_MIN),
+    "not tested",
+    "detected, no area"),
+  HILIC = c(
+    "same",
+    tol_text,
+    sprintf("MS1 apexes of the confirmed spectra (best-supported cluster), %g s either side", APEX_PAD),
+    "largest area",
+    sprintf("at least %g counts", MIN_INT),
+    sprintf("at least %g", SNR_MIN_HILIC),
+    sprintf("at least %g s", FWHM_BAND_HILIC[1]),
+    sprintf("at least %g", PROM_MIN),
+    sprintf("none more than %g times the apex within %g s", NBR_MAX, NEAR_S),
+    "detected, no area"),
+  check.names = FALSE)
+knitr::kable(gate, caption = "Peak criteria, read from `R/ms1.R` and the settings above.")
+```
+
+## The retention-time window
+
+Retention time (RT) is *when* a compound comes off the chromatography column. We
+only look for a peak inside an RT window, so the window has to sit over the
+peak. It is set in two stages.
+
+Step 4 gives, per assay and target, the range of retention times at which the
+target's confirmed spectra were recorded: earliest to latest, at the best tier
+the target reached, padded each side by `RT_PAD_S`, in
+`artifacts/extraction_windows.csv`. That range is not the window. An MS2 scan is
+triggered whenever the precursor is intense enough, so the confirmed spectra
+scatter along the peak and down its tail, and can include a second peak of the
+same m/z; the range can be several times wider than the peak. It says where to
+read the trace: each file's trace is read over the range, and `WIDE_EXTRA` =
+`r WIDE_EXTRA` s beyond it on each side so the peak walk has data.
+
+```{r most-fragmented}
+#| echo: false
+# The most times one file was fragmented on one target (distinct confirmed MS2
+# retention times), over the assays extracted here, for the example below.
+frag <- conf_final[conf_final$dataset_id %in% names(bio_files_per_ds) &
+                   !is.na(conf_final$rt), ]
+frag <- unique(data.frame(
+  key = paste(frag$dataset_id, frag$role, basename(as.character(frag$source_file))),
+  rt  = frag$rt))
+n_frag_max <- if (nrow(frag)) max(table(frag$key)) else 0L
+```
+
+The window is then set on the MS1 trace (`acceptance_window()`). Each confirmed
+MS2 retention time is anchored to the apex of the MS1 peak it sits on, in the
+trace of the file it was recorded in (`snap_one()`). From the MS1 scan nearest
+the MS2 scan, the trace is followed along both flanks with the walk the picker
+uses to integrate a peak (*Integrate* above): a shallow shoulder, or a maximum
+within `PROX_S` = `r PROX_S` s of the start, is taken in, and a real valley, the
+baseline or a gap in the trace ends the walk. The anchor is the highest scan of
+that stretch. A spectrum fired on a peak's tail therefore anchors at the top of
+its own peak, not at a taller peak beside it. An anchor more than `SNAP_W` =
+`r SNAP_W` s from its MS2 retention time is dropped, and a hand override in
+`curation/` gives the apex where one exists. Each file then gives one anchor,
+its most intense anchored apex, so a file fragmented `r n_frag_max` times on one
+target (the most of any file here) weighs no more than a file fragmented once.
+The anchors with the most neighbours within
+`CLUST_TOL` = `r CLUST_TOL` s mark the centre of the best-supported cluster; the
+cluster is every anchor within `CLUST_TOL` of that centre, and the window spans
+it, padded by `APEX_PAD` = `r APEX_PAD` s each side. An anchor outside the cluster
+is left out, so a single file anchored on another peak cannot stretch the window
+over the whole run. It then extends, step by
+step, over accepted peak apexes within `COHERE_S` = `r COHERE_S` s beyond its
+edge, up to 2 × `APEX_PAD` = `r 2 * APEX_PAD` s from the cluster, so a peak just outside the edge is
+not cut off. Where two clusters are equally supported, the assay does not say
+which retention time is the compound: the window spans every anchor, both
+clusters included, and is flagged uncertain. Where no confirmed spectrum gives
+an anchor, the window falls back to the range itself. The window, the number
+of files with an anchor (in the kept cluster or not) and the uncertain
+flag are kept with each assay's extraction, and *Extraction windows* below
+writes and draws them.
+
+Before an assay is extracted, each target must have a confirmation on one of the
+files extracted here, or the assay is skipped with the reason
+(`extraction_window()`): a range resting only on other files would import
+another matrix's retention time. For the same reason, if a spectrum that set
+step 4's range lies on a file not extracted here, the range is set again from
+the extracted files' spectra alone, and the log says so.
+
+Where a target has an isobar (declared in `compound.csv`), two defences keep the
+measurement off it: the proximity-weighted selection above, under which the
+on-RT peak beats a larger interferent inside the window, and the window itself,
+kept to a modest pad so the isobar rarely enters it. An application with a
+declared isobar and an independent ground truth measures what each defence is
+worth in its own checks (`_05-probe-checks.qmd`).
+
+# Per-dataset extraction
+
+For each assay, `run_ms1_for_dataset()` loads the MS1 spectra, pulls each
+compound's extracted-ion chromatogram (EIC) at the confirmed mass, within the
+assay's m/z tolerance, over step 4's (widened) retention-time range, sets the
+window on it, then **picks and
+integrates the on-RT peak per file** (the picker described above), applies the
+manual drop-list, flags files whose peak width is an outlier, joins the sample
+metadata, and emits a per-file table
+(`sample_tbl`) with, for each target, whether it was detected and its peak
+area.
+
+```{r run-all}
+#| echo: false
+# Cached per assay (delete an assay's RDS to force a re-run), keyed on step 4's ion,
+# m/z and range and the m/z tolerance: a change in any of them re-reads the raw files.
+CACHE_DIR <- "artifacts/per_dataset"
+dir.create(CACHE_DIR, showWarnings = FALSE, recursive = TRUE)
+
+cfg_is_current <- function(cached, want) {
+  if (is.null(cached$cfg)) return(FALSE)
+  # With two targets: assay, adduct_par, adduct_met, mz_par, mz_met, rt_par_win,
+  # rt_met_win, ppm.
+  k <- c("assay", paste0("adduct_", prefixes), paste0("mz_", prefixes),
+         paste0("rt_", prefixes, "_win"), "ppm")
+  isTRUE(all.equal(cached$cfg[k], want[k], tolerance = 1e-6))
+}
+
+results <- list()
+SKIPPED_DATASETS <- character(0)   # extraction failed
+NO_WINDOW        <- character(0)   # no confirmed range on the files extracted here
+for (ds in DATASETS_TO_RUN) {
+  # Step 4's ion, m/z and range for this assay; an assay with a target unconfirmed on
+  # the files extracted here is skipped.
+  cfg <- tryCatch(extraction_window(ds, ext_windows, conf_final, bio_files_per_ds[[ds]]),
+                  error = function(e) {
+                    message("  SKIPPED ", ds, ", no confirmed range on the files extracted here: ",
+                            conditionMessage(e))
+                    NULL
+                  })
+  if (is.null(cfg)) { NO_WINDOW <- c(NO_WINDOW, ds); next }
+  # The m/z tolerance step 4 set from the assay's instrument.
+  cfg$ppm <- tol$ppm[tol$dataset_id == ds]
+  cache_path <- file.path(CACHE_DIR, paste0(ds, ".rds"))
+  cached <- if (file.exists(cache_path)) readRDS(cache_path) else NULL
+  # A cache that records no tolerance was extracted at 20 ppm. Record that, so an
+  # assay whose tolerance is 20 ppm is not read again.
+  if (!is.null(cached$cfg) && is.null(cached$cfg$ppm)) {
+    cached$cfg$ppm <- 20
+    if (cfg_is_current(cached, cfg)) saveRDS(cached, cache_path)
+  }
+  if (!is.null(cached) && !cfg_is_current(cached, cfg)) {
+    message("  cache for ", ds, " was built on a different ion, m/z, range or m/z tolerance; re-extracting")
+    cached <- NULL
+  }
+  # Picker, gate, confirmed anchors or hand corrections changed: re-pick from the
+  # stored EICs, reading no raw file.
+  if (!is.null(cached) &&
+      (!identical(cached$picker, PICKER_VERSION) ||
+       !identical(cached$is_hilic, row_is_hilic(dataset_meta_row(ds_meta_tbl, ds))) ||
+       !identical(cached$anchors, anchor_key(conf_final, ds)) ||
+       !identical(cached$curation, curation_key(ds)))) {
+    message("  ", ds, ": re-picking from the stored EICs (picker, gate, anchors or hand corrections changed)")
+    cached <- repick_cached(cached, conf_final, bio_files_per_ds[[ds]], ds_meta_tbl)
+    saveRDS(cached, cache_path)
+  }
+  if (!is.null(cached)) {
+    message("========== ", ds, " (cached) ==========")
+    results[[ds]] <- cached
+  } else {
+    message("\n========== ", ds, " ==========")
+    # A repository that does not answer stops the render (the next one resumes from the
+    # cache); any other failure skips the dataset, recorded in SKIPPED_DATASETS.
+    res <- tryCatch(
+      run_ms1_for_dataset(
+        dataset_id       = ds,
+        conf_final       = conf_final,
+        bio_files_per_ds = bio_files_per_ds,
+        ds_meta_tbl      = ds_meta_tbl,
+        ppm              = cfg$ppm,
+        cfg              = cfg),
+      error = function(e) {
+        if (is_network_error(e)) stop(e)
+        message("  SKIPPED ", ds, ", extraction failed: ", conditionMessage(e))
+        NULL
+      })
+    if (is.null(res)) { SKIPPED_DATASETS <<- c(SKIPPED_DATASETS, ds); next }
+    results[[ds]] <- res
+    saveRDS(results[[ds]], cache_path)
+  }
+}
+if (length(NO_WINDOW))
+  message("\n", length(NO_WINDOW),
+          " assay(s) SKIPPED (no confirmed range on the files extracted here; ",
+          "re-confirm on them): ", paste(NO_WINDOW, collapse = ", "))
+if (length(SKIPPED_DATASETS))
+  message("\n", length(SKIPPED_DATASETS),
+          " dataset(s) SKIPPED (extraction failed, see above): ",
+          paste(SKIPPED_DATASETS, collapse = ", "))
+```
+
+## Extraction windows
+
+The window in which each target's peak was looked for, per extracted assay, is
+written to `artifacts/ms1_windows.csv`: its bounds (`rt_lo`, `rt_hi`), the number
+of files whose confirmed spectra snapped to an MS1 peak (`n_anchor_files`; the
+window is set from the best-supported cluster of these, so some can lie outside
+it), and whether it is uncertain. The range of confirmed retention times the
+trace was read over is kept beside it (`ms2_lo`, `ms2_hi`) for the record.
+
+```{r ms1-windows}
+# The window of each assay and target, set on the MS1 trace by acceptance_window();
+# n_anchor_files is NA where no confirmed spectrum snapped, and the window is the range.
+target_name <- setNames(compound_spec$name, compound_spec$role)
+ids <- sort(as.character(names(results)), method = "radix")
+ms1_window_rows <- function(ds) {
+  r     <- results[[ds]]
+  stopifnot(prefixes %in% names(r$rt_anchor))
+  a     <- r$rt_anchor[prefixes]
+  # One cfg field per target, in target order: field("mz_%s") is list(mz_par, mz_met).
+  field <- function(k) lapply(prefixes, function(p) r$cfg[[sprintf(k, p)]])
+  ms2   <- field("rt_%s_win")
+  data.frame(dataset_id     = ds, assay = as.character(r$cfg$assay), role = roles,
+             target         = target_name[roles],
+             ion            = unlist(field("adduct_%s")),
+             mz             = unlist(field("mz_%s")),
+             rt_lo          = unlist(lapply(a, function(x) x$win[1])),
+             rt_hi          = unlist(lapply(a, function(x) x$win[2])),
+             n_anchor_files = vapply(a, function(x)
+               if (is.null(x$n_anchor_files)) NA_integer_ else as.integer(x$n_anchor_files),
+               integer(1)),
+             uncertain      = vapply(a, function(x) isTRUE(x$uncertain), logical(1)),
+             ms2_lo         = unlist(lapply(ms2, function(w) w[1])),
+             ms2_hi         = unlist(lapply(ms2, function(w) w[2])),
+             row.names = NULL)
+}
+ms1_windows <- do.call(rbind, lapply(ids, ms1_window_rows))
+# No assay was extracted: the same table, empty.
+if (is.null(ms1_windows))
+  ms1_windows <- data.frame(dataset_id = character(), assay = character(), role = character(),
+                            target = character(), ion = character(), mz = numeric(),
+                            rt_lo = numeric(), rt_hi = numeric(), n_anchor_files = integer(),
+                            uncertain = logical(), ms2_lo = numeric(), ms2_hi = numeric())
+write.csv(ms1_windows, "artifacts/ms1_windows.csv", row.names = FALSE)
+# Height in inches of the figure below: one row per assay, 0.15 in per target,
+# and a line of key for each kind of marked window (uncertain, fallback) present.
+n_key <- any(ms1_windows$uncertain) + any(is.na(ms1_windows$n_anchor_files))
+fig_h <- 1.3 + 0.15 * n_targets * length(ids) + 0.2 * n_key
+ms1_windows
+```
+
+The figure shows, per assay, the window in which each target's peak was looked
+for (A, the shaded band) with the retention times of its confirmed spectra
+(points), and how far each confirmed precursor m/z sits from the target's exact
+mass (B). The column on the right counts the confirmed spectra of each target,
+`r knitr::combine_words(roles, and = " then ")`. The band is set on MS1, the
+points are MS2 trigger times. Those scatter along the peak's tail and can fall
+on a second peak of the
+same m/z, so points can lie outside the band. A detected peak can reach past the
+band too: its apex may sit up to `r APEX_PAD` s outside it, and its area runs
+valley to valley. An asterisk after an assay's name marks a window to read with
+care. A dashed outline is an uncertain window: the confirmed spectra point to two
+equally supported MS1 peaks, and the window spans both. A dotted outline is a
+fallback: no confirmed spectrum snapped to an MS1 peak, so the band is the range
+the trace was read over.
+
+```{r fig-step5-windows, fig.width = 6.3, fig.height = fig_h}
+FIG_DIR <- "figures"; dir.create(FIG_DIR, showWarnings = FALSE)
+figp    <- function(f) file.path(FIG_DIR, f)
+
+# A window to read with care is marked: uncertain (two equally supported MS1
+# peaks, both spanned) or fallback (nothing snapped, so it is the range read).
+win <- ms1_windows
+win$flag <- ifelse(win$uncertain, "uncertain",
+                   ifelse(is.na(win$n_anchor_files), "fallback", ""))
+
+# One row per extracted assay, the first at the top, with a band per target around
+# its line; an assay with a marked window is labelled with an asterisk.
+flagged <- unique(win$dataset_id[win$flag != ""])
+lab   <- function(ds) paste0(short_ds(ds, ids), ifelse(ds %in% flagged, " *", ""))
+lev   <- rev(lab(ids))
+off   <- ((n_targets + 1) / 2 - seq_len(n_targets)) * 0.72 / n_targets
+half  <- 0.28 / n_targets
+row_y <- function(ds, role)
+  match(lab(ds), lev) + off[match(role, roles)]
+# Blue and red for the first two targets, then a palette.
+tcol  <- c("#2166AC", "#D6604D", grDevices::hcl.colors(max(n_targets - 2, 0), "Dark 3"))
+tcol  <- setNames(tcol[seq_len(n_targets)], target_name[roles])
+
+pts <- conf_final[conf_final$dataset_id %in% ids & !is.na(conf_final$rt), ]
+pts$y      <- row_y(pts$dataset_id, pts$role)
+pts$target <- factor(target_name[pts$role], names(tcol))
+win$y      <- row_y(win$dataset_id, win$role)
+win$row    <- match(lab(win$dataset_id), lev)
+win$target <- factor(win$target, names(tcol))
+win$n_spectra <- vapply(seq_len(nrow(win)), function(i)
+  sum(conf_final$dataset_id == win$dataset_id[i] & conf_final$role == win$role[i]),
+  integer(1))
+
+rows <- scale_y_continuous(breaks = seq_along(lev), labels = lev,
+                           limits = c(0.5, length(lev) + 0.5), expand = c(0, 0))
+jit  <- position_jitter(width = 0, height = 0.1 / n_targets, seed = 1)
+look <- list(scale_colour_manual(values = tcol, name = NULL, drop = FALSE),
+             scale_fill_manual(values = tcol, guide = "none"),
+             guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1))),
+             theme_minimal(base_size = 9),
+             theme(panel.grid.minor = element_blank(),
+                   plot.title = element_text(size = 9, face = "bold")))
+
+p_rt <- ggplot() +
+  geom_rect(data = win, aes(xmin = rt_lo, xmax = rt_hi, ymin = y - half,
+                            ymax = y + half, fill = target), alpha = 0.25) +
+  geom_rect(data = win[win$flag != "", ], aes(xmin = rt_lo, xmax = rt_hi, ymin = y - half,
+                                              ymax = y + half, colour = target, linetype = flag),
+            fill = NA, linewidth = 0.3, show.legend = FALSE) +
+  geom_point(data = pts, aes(rt, y, colour = target),
+             size = 0.8, alpha = 0.5, stroke = 0.3, position = jit) +
+  scale_linetype_manual(values = c(uncertain = 2, fallback = 3), guide = "none") +
+  rows + look +
+  labs(x = "retention time (s)", y = NULL, title = "A   Retention time")
+
+# Each assay's own m/z tolerance, dotted: 5 ppm on an Orbitrap, 20 ppm otherwise.
+tolr <- unique(win[, c("dataset_id", "row")])
+tolr$ppm <- tol$ppm[match(tolr$dataset_id, tol$dataset_id)]
+tolr <- rbind(transform(tolr, x = -ppm), transform(tolr, x = ppm))
+p_mz <- ggplot(pts[!is.na(pts$mz_ppm_dev), ],
+               aes(mz_ppm_dev, y, colour = target)) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.3) +
+  geom_segment(data = tolr, aes(x = x, xend = x, y = row - 0.45, yend = row + 0.45),
+               inherit.aes = FALSE, colour = "grey60", linetype = 3, linewidth = 0.3) +
+  geom_point(size = 0.8, alpha = 0.5, stroke = 0.3, position = jit) +
+  rows + look + theme(axis.text.y = element_blank()) +
+  labs(x = "m/z deviation (ppm)", y = NULL, title = "B   Precursor m/z")
+
+# The counts get a panel of their own, so they never sit on a point: two targets
+# read "first / second" on the row's line, more sit at their target's band.
+if (n_targets == 2) {
+  p_n <- ggplot(win, aes(x = ifelse(role == roles[1], 0.45, 0.55), y = row,
+                         label = prettyNum(n_spectra, big.mark = ","), colour = target,
+                         hjust = ifelse(role == roles[1], 1, 0))) +
+    geom_text(size = 2.8, show.legend = FALSE) +
+    geom_text(data = win[win$role == roles[1], ], aes(x = 0.5, y = row, label = "/"),
+              inherit.aes = FALSE, colour = "grey40", size = 2.8)
+} else {
+  p_n <- ggplot(win, aes(x = 0.5, y = y, label = prettyNum(n_spectra, big.mark = ","),
+                         colour = target)) +
+    geom_text(size = 2.8, show.legend = FALSE)
+}
+p_n <- p_n +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  rows + look +
+  theme(axis.text = element_blank(), panel.grid = element_blank()) +
+  labs(x = NULL, y = NULL, title = "Spectra")
+
+# The key to the marks sits in the figure, so a copy of it carries its own; one
+# line per kind present.
+key <- c(uncertain = "* dashed: uncertain window, spanning two equally supported MS1 peaks",
+         fallback  = "* dotted: fallback window, the range read (no confirmed spectrum snapped to an MS1 peak)")
+key <- key[names(key) %in% win$flag]
+
+p_windows <- patchwork::wrap_plots(p_rt, p_mz, p_n, widths = c(1.5, 1, 0.45),
+                                   guides = "collect") +
+  patchwork::plot_annotation(
+    caption = if (length(key)) paste(key, collapse = "\n"),
+    theme   = theme(plot.caption = element_text(size = 7, colour = "grey30", hjust = 0))) &
+  theme(legend.position = "bottom", legend.box = "vertical",
+        legend.margin = margin(0, 0, 0, 0), legend.spacing.y = unit(2, "pt"),
+        legend.box.spacing = unit(4, "pt"))
+
+# The note under the figure names each marked window.
+say <- function(f, what) {
+  r <- win[win$flag == f, , drop = FALSE]
+  if (nrow(r)) paste0(what, " here: ", paste(sprintf("%s (%s)", short_ds(r$dataset_id, ids),
+                                                    as.character(r$target)), collapse = ", "), ".")
+}
+unc_note <- paste(c(say("uncertain", "Uncertain windows"), say("fallback", "Fallback windows")),
+                  collapse = " ")
+if (!nzchar(unc_note)) unc_note <- "No window here is uncertain or a fallback."
+
+if (length(lev)) {
+  ggsave(figp("step5_windows.png"), p_windows, width = 6.3, height = fig_h, dpi = 200)
+  ggsave(figp("step5_windows.pdf"), p_windows, width = 6.3, height = fig_h)
+  p_windows
+}
+```
+
+The precursor m/z deviations of panel B, by the assays' m/z tolerance:
+
+```{r mz-dev-by-tolerance}
+#| echo: false
+d <- pts[!is.na(pts$mz_ppm_dev), ]
+d$tolerance_ppm <- tol$ppm[match(d$dataset_id, tol$dataset_id)]
+do.call(rbind, lapply(split(d, d$tolerance_ppm), function(x) data.frame(
+  tolerance_ppm = x$tolerance_ppm[1], assays = length(unique(x$dataset_id)),
+  spectra = nrow(x), beyond_5_ppm = sum(abs(x$mz_ppm_dev) > 5),
+  max_abs_ppm = round(max(abs(x$mz_ppm_dev)), 1))))
+```
+
+`r unc_note`
+
+### Uncertain windows
+
+```{r uncertain-traces}
+# The raw traces behind each uncertain window, for the appendix: up to four files
+# per window, those with the most confirmed spectra of that target.
+unc <- ms1_windows[ms1_windows$uncertain, ]
+# The file anchors each uncertain window rests on, for the text.
+unc$anchors <- vapply(seq_len(nrow(unc)), function(i) {
+  a <- results[[unc$dataset_id[i]]]$rt_anchor[[target_prefix(unc$role[i])]]$anchors
+  if (is.null(a)) "not stored" else paste(round(sort(a)), collapse = ", ")
+}, character(1))
+unc_rows <- lapply(seq_len(nrow(unc)), function(i) {
+  ds   <- unc$dataset_id[i]
+  chr  <- results[[ds]][[paste0("chr_", target_prefix(unc$role[i]))]]
+  bare <- function(x) norm_file_key(to_bare_name(basename(as.character(x)),
+                                                 basename(bio_files_per_ds[[ds]])))
+  orig <- basename(dataOrigin(chr))
+  keyf <- bare(orig)
+  hh   <- conf_final[conf_final$dataset_id == ds & conf_final$role == unc$role[i], ]
+  n_by <- sort(table(bare(hh$source_file)), decreasing = TRUE)
+  pick_f <- head(names(n_by)[names(n_by) %in% keyf], 4)
+  lapply(pick_f, function(f) {
+    j   <- match(f, keyf)
+    pd  <- as.data.frame(Chromatograms::peaksData(chr)[[j]])
+    pd  <- pd[is.finite(pd$intensity) &
+              pd$rtime >= unc$rt_lo[i] - 30 & pd$rtime <= unc$rt_hi[i] + 30, ]
+    lab <- paste0(short_ds(ds), ", ", unc$target[i], "\n", orig[j])
+    list(trace = data.frame(panel = lab, rt = pd$rtime, intensity = pd$intensity),
+         ms2   = data.frame(panel = lab, rt = as.numeric(hh$rt[bare(hh$source_file) == f])),
+         win   = data.frame(panel = lab, lo = unc$rt_lo[i], hi = unc$rt_hi[i]))
+  })
+})
+unc_rows <- unlist(unc_rows, recursive = FALSE)
+unc_h    <- 1 + 2 * ceiling(length(unc_rows) / 2)   # inches: two panels per row
+```
+
+```{r fig-step5-uncertain, fig.width = 7, fig.height = unc_h}
+if (length(unc_rows)) {
+  part <- function(k) do.call(rbind, lapply(unc_rows, `[[`, k))
+  p_unc <- ggplot(part("trace"), aes(rt, intensity)) +
+    geom_rect(data = part("win"), aes(xmin = lo, xmax = hi, ymin = -Inf, ymax = Inf),
+              inherit.aes = FALSE, fill = "grey85") +
+    geom_line(linewidth = 0.4) +
+    geom_vline(data = part("ms2"), aes(xintercept = rt), colour = "firebrick",
+               linetype = 2, linewidth = 0.3) +
+    facet_wrap(~panel, ncol = 2, scales = "free") +
+    labs(x = "retention time (s)", y = "MS1 intensity") +
+    theme_bw(base_size = 8)
+  ggsave(figp("step5_uncertain_windows.png"), p_unc, width = 7, height = unc_h, dpi = 200)
+  ggsave(figp("step5_uncertain_windows.pdf"), p_unc, width = 7, height = unc_h)
+  p_unc
+}
+```
+
+Windows flagged uncertain:
+`r if (nrow(unc)) paste(sprintf("%s (%s; file anchors at %s s)", short_ds(unc$dataset_id), unc$target, unc$anchors), collapse = "; ") else "none"`.
+In each, the files with a confirmed spectrum do not agree on one MS1 peak: the
+window spans the peaks they point to, and the figure shows their traces. Step 5
+does not align retention times between files, so it cannot tell these cases
+apart from a real second compound.
+
+For each file detected in an uncertain window, the apex and the range step 5
+integrates, from the picker run again on the stored trace:
+
+```{r uncertain-bounds}
+#| echo: false
+# pick() on the stored trace and window, as process_eics() runs it; the bounds are
+# kept only where its apex is the stored one, so they belong to the peak measured.
+unc_bounds <- do.call(rbind, lapply(seq_len(nrow(unc)), function(i) {
+  ds    <- unc$dataset_id[i]
+  p     <- target_prefix(unc$role[i])
+  r     <- results[[ds]]
+  m     <- r[[paste0("metrics_", p)]]
+  chr   <- r[[paste0("chr_", p)]]
+  files <- basename(dataOrigin(chr))
+  win   <- r$rt_anchor[[p]]$win
+  det   <- m$file[m[[paste0(p, "_detected")]] %in% TRUE]
+  do.call(rbind, lapply(which(files %in% det), function(j) {
+    pd     <- Chromatograms::peaksData(chr)[[j]]
+    pk     <- pick(pd[, "rtime"], pd[, "intensity"], win[1], win[2], r$is_hilic)
+    apex   <- m[[paste0(p, "_apex_rt")]][match(files[j], m$file)]
+    same   <- !is.null(pk) && isTRUE(abs(pk$apex_rt - apex) < 0.01)
+    data.frame(assay = short_ds(ds), target = unc$target[i], file = files[j],
+               apex = round(apex, 1),
+               from = if (same) round(pk$lb, 1) else NA,
+               to   = if (same) round(pk$rb, 1) else NA)
+  }))
+}))
+if (is.null(unc_bounds) || !nrow(unc_bounds)) cat("No file is detected in an uncertain window.\n") else
+  knitr::kable(unc_bounds, row.names = FALSE,
+               col.names = c("assay", "target", "file", "apex (s)",
+                             "integrated from (s)", "to (s)"))
+```
+
+## Checking the tolerance
+
+Each assay is extracted at the tolerance its instrument sets, not at one tuned on
+the assay. The check below asks what a wider one would add, on the assays listed
+in `curation/tolerance_check.csv`. Each is extracted again at the
+time-of-flight tolerance, `r PPM_BY_CLASS[["tof"]]` ppm, with the same ion, m/z,
+range, picker and hand corrections (`run_ms1_for_dataset()`), and its raw scans
+are read for what a trace does not keep: the m/z of each centroid. The result is
+cached in `artifacts/tolerance_check_<dataset_id>.rds` and read again while the
+assay's extraction above is unchanged.
+
+```{r tolerance-check}
+# The assays to check, listed in curation/tolerance_check.csv; without it the
+# section is skipped.
+TOL_CHECK     <- if (file.exists("curation/tolerance_check.csv"))
+  read.csv("curation/tolerance_check.csv", stringsAsFactors = FALSE)$assay else character()
+TOL_CHECK_PPM <- PPM_BY_CLASS[["tof"]]  # the wider tolerance
+CAL_PAD_S     <- 15    # s each side of the first target's window (reference ions)
+CAL_MIN_INT   <- 1e5   # a reference ion's centroids are at least this intense
+CAL_MIN_FRAC  <- 0.9   # ... and it is found in at least this fraction of the files
+
+not_run <- setdiff(TOL_CHECK, names(results))
+if (length(not_run))
+  message("not extracted above, so not checked: ", paste(not_run, collapse = ", "))
+TOL_CHECK <- intersect(TOL_CHECK, names(results))
+if (!length(TOL_CHECK))
+  cat("No assay is checked: curation/tolerance_check.csv names no assay extracted above.\n")
+# The check compares the two targets of a pair, file by file; with any other
+# number of targets it is not run.
+if (length(TOL_CHECK) && n_targets != 2) {
+  cat("No assay is checked: the check is written for two targets, and compound.csv has ",
+      n_targets, ".\n", sep = "")
+  TOL_CHECK <- character(0)
+}
+
+# Cached like the extraction above: read again only when the assay's ion, m/z,
+# range, windows, picker, gate, confirmed anchors or hand corrections change.
+tol_check <- list()
+for (ds in TOL_CHECK) {
+  r   <- results[[ds]]
+  cfg <- r$cfg
+  cfg$ppm <- TOL_CHECK_PPM
+  win <- lapply(r$rt_anchor[prefixes], `[[`, "win")   # list(par = , met = )
+  key <- list(win = win, picker = PICKER_VERSION, hilic = r$is_hilic,
+              anchors = anchor_key(conf_final, ds), curation = curation_key(ds),
+              settings = c(CAL_PAD_S, CAL_MIN_INT, CAL_MIN_FRAC))
+  path   <- file.path("artifacts", paste0("tolerance_check_", ds, ".rds"))
+  cached <- if (file.exists(path)) readRDS(path) else NULL
+  if (!is.null(cached) && cfg_is_current(cached, cfg) && identical(cached$key, key)) {
+    message("========== ", ds, " at ", TOL_CHECK_PPM, " ppm (cached) ==========")
+    tol_check[[ds]] <- cached
+    next
+  }
+  message("\n========== ", ds, " at ", TOL_CHECK_PPM, " ppm ==========")
+  # The extraction of run_ms1_for_dataset(), at the wider tolerance.
+  row   <- dataset_meta_row(ds_meta_tbl, ds)
+  files <- bio_files_per_ds[[ds]]
+  cur   <- curation_inputs()
+  ms1   <- load_spectra_ms1(row$deposit_id, files, assay = row$assay)
+  eics  <- extract_eics(ms1, cfg, cfg$ppm)
+  proc  <- process_eics(per_target(eics, "chr"), eics$chr_all, ds, cfg, conf_final,
+                        cur$ov, cur$drop_all, row_is_hilic(row), basename(files))
+  # The raw scans: each target's centroids in its window above, and the reference ions
+  # over the first target's window and CAL_PAD_S either side.
+  cent <- dplyr::bind_rows(lapply(setNames(prefixes, roles), function(p)
+    scan_centroids(ms1, cfg[[paste0("mz_", p)]], win[[p]], TOL_CHECK_PPM)), .id = "role")
+  ions <- common_ions(ms1, win[[1]] + c(-1, 1) * CAL_PAD_S, CAL_MIN_INT, CAL_MIN_FRAC)
+  tol_check[[ds]] <- c(list(dataset_id = ds, cfg = cfg, key = key),
+                       proc[paste0("metrics_", prefixes)],
+                       list(rt_anchor = proc$rt_anchor, centroids = cent, ions = ions))
+  saveRDS(tol_check[[ds]], path)
+}
+```
+
+The files each target is detected in at the assay's own tolerance (the extraction
+above) and at `r PPM_BY_CLASS[["tof"]]` ppm, after the isobar rule as in the
+sample tables below:
+
+```{r tolerance-check-detections}
+# The keys of the files each target is detected in, after the isobar rule.
+detected_keys <- function(r, ds) {
+  m  <- resolve_isobars(per_target(r, "metrics"), conf_final, ds, r$rt_anchor)
+  fb <- basename(bio_files_per_ds[[ds]])
+  # One set of keys per target, named by role: list(parent = , metabolite = ).
+  setNames(lapply(prefixes, function(p)
+    norm_file_key(m[[p]]$file[m[[p]][[paste0(p, "_detected")]] %in% TRUE], fb)), roles)
+}
+tc_det    <- list()
+tc_counts <- list()
+for (ds in TOL_CHECK) {
+  own  <- detected_keys(results[[ds]], ds)
+  wide <- detected_keys(tol_check[[ds]], ds)
+  f <- data.frame(file = basename(bio_files_per_ds[[ds]]))
+  f$key <- norm_file_key(f$file)
+  for (role in roles) {
+    f[[paste0(role, "_own")]]  <- f$key %in% own[[role]]
+    f[[paste0(role, "_wide")]] <- f$key %in% wide[[role]]
+  }
+  f$both_own  <- f[[paste0(roles[1], "_own")]] & f[[paste0(roles[2], "_own")]]
+  f$both_wide <- f[[paste0(roles[1], "_wide")]] & f[[paste0(roles[2], "_wide")]]
+  tc_det[[ds]] <- f
+  windows <- function(r) lapply(r$rt_anchor[prefixes], `[[`, "win")
+  if (!isTRUE(all.equal(windows(results[[ds]]), windows(tol_check[[ds]]))))
+    message(ds, ": the windows at ", TOL_CHECK_PPM, " ppm differ from those above")
+  own_c  <- f[paste0(c(roles, "both"), "_own")]
+  wide_c <- f[paste0(c(roles, "both"), "_wide")]
+  tc_counts[[ds]] <- data.frame(
+    assay = short_ds(ds), target = c(target_name[roles], "both"),
+    files = nrow(f), `tolerance (ppm)` = tol$ppm[tol$dataset_id == ds],
+    `at its tolerance` = colSums(own_c), `at the wider tolerance` = colSums(wide_c),
+    `at the wider only` = colSums(wide_c & !own_c),
+    `at its tolerance only` = colSums(own_c & !wide_c),
+    check.names = FALSE, row.names = NULL)
+}
+if (length(TOL_CHECK)) do.call(rbind, unname(tc_counts))
+```
+
+A file the wider tolerance adds can hold the target, its m/z at the edge of the
+narrower tolerance, or another ion of nearly the same mass, and the raw centroids
+tell the two apart. In each file, every scan of a target's window gives its most intense
+centroid within `r PPM_BY_CLASS[["tof"]]` ppm of the target, and the scan where
+that centroid is most intense is the apex: its m/z deviation from the target and
+its retention time. A file is **shifted** when the wider tolerance adds it to the
+files with both targets and both its apexes lie further from the target than the
+assay's own tolerance. Two checks follow. An MS2 spectrum of either target in a
+shifted file (a match of step 3, `artifacts/hits_curated.csv`, or a confirmation
+of step 4) would point to the target itself. A drift of a file's mass calibration
+would move every ion, so the ions found in at least `r 100 * CAL_MIN_FRAC`% of the
+files over the `r roles[1]`'s window and `r CAL_PAD_S` s either side (centroids of at
+least `r format(CAL_MIN_INT, big.mark = ",", scientific = FALSE)` counts, in
+0.01 m/z bins) serve as references. Each file's offset is the median, over these
+ions, of its deviation from the ion's median m/z in the files that are not shifted.
+
+```{r tolerance-check-files}
+hits <- if (length(TOL_CHECK)) read.csv("artifacts/hits_curated.csv", check.names = FALSE)
+tc_files <- list()
+tc_ions  <- list()
+for (ds in TOL_CHECK) {
+  fb  <- basename(bio_files_per_ds[[ds]])
+  ppm <- tol$ppm[tol$dataset_id == ds]
+  f   <- tc_det[[ds]]
+  # The apex of each file and target: the scan with the most intense centroid.
+  apex <- tol_check[[ds]]$centroids |>
+    dplyr::group_by(role, file) |>
+    dplyr::slice_max(int, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup()
+  apex$key <- norm_file_key(apex$file, fb)
+  for (role in roles) {
+    a <- apex[apex$role == role, ]
+    f[[paste0(role, "_dev")]] <- a$dev[match(f$key, a$key)]
+    f[[paste0(role, "_rt")]]  <- a$rt[match(f$key, a$key)]
+  }
+  # Shifted: both targets added by the wider tolerance, both apexes beyond the assay's own.
+  f$shifted <- f$both_wide & !f$both_own &
+    abs(f[[paste0(roles[1], "_dev")]]) > ppm & abs(f[[paste0(roles[2], "_dev")]]) > ppm
+  f$shifted <- f$shifted %in% TRUE
+  # An MS2 spectrum of either target: a match of step 3 or a confirmation of step 4.
+  f$ms2 <- f$key %in% c(norm_file_key(hits$file_path[hits$dataset_id == ds]),
+                        norm_file_key(conf_final$source_file[conf_final$dataset_id == ds], fb))
+  # Each file's calibration offset: per reference ion, its deviation (ppm) from the
+  # ion's median m/z in the files that are not shifted; per file, the median over its ions.
+  ions <- tol_check[[ds]]$ions
+  ions$key     <- norm_file_key(ions$file, fb)
+  ions$shifted <- ions$key %in% f$key[f$shifted]
+  ions <- ions |>
+    dplyr::group_by(ion) |>
+    dplyr::mutate(ref = median(mz[!shifted]), dev = 1e6 * (mz - ref) / ref) |>
+    dplyr::ungroup()
+  offset <- tapply(ions$dev, ions$key, median)
+  f$cal_offset <- unname(offset[f$key])
+  tc_ions[[ds]]  <- ions
+  tc_files[[ds]] <- f
+}
+
+# Per assay and target: the shifted files against the other files the target is
+# detected in at the assay's own tolerance, by median apex deviation and retention time.
+tc_tab <- do.call(rbind, lapply(TOL_CHECK, function(ds) {
+  f <- tc_files[[ds]]
+  do.call(rbind, lapply(roles, function(role) {
+    dev <- f[[paste0(role, "_dev")]]
+    rt  <- f[[paste0(role, "_rt")]]
+    own <- f[[paste0(role, "_own")]] & !f$shifted
+    data.frame(dataset_id = ds, target = target_name[[role]], shifted = sum(f$shifted),
+               dev_shifted = median(dev[f$shifted]), dev_own = median(dev[own]),
+               rt_shifted = median(rt[f$shifted]), rt_own = median(rt[own]))
+  }))
+}))
+# Per assay, for the text: rounded, one row each.
+drops <- curation_inputs()$drop_all
+tc_sum <- do.call(rbind, lapply(TOL_CHECK, function(ds) {
+  f   <- tc_files[[ds]]
+  t   <- tc_tab[tc_tab$dataset_id == ds, ]
+  dt  <- t$rt_shifted - t$rt_own
+  # The files where a hand drop (curation/ms1_drop_list.csv) removes the detection of
+  # either target, its cached file names resolved against the extracted ones.
+  dropped <- norm_file_key(drops$file[drops$dataset == ds], f$file)
+  # The calibration offsets: the range of the shifted files', the 5th to 95th
+  # percentile of the other files'.
+  sh  <- f$cal_offset[f$shifted & !is.na(f$cal_offset)]
+  cal_sh <- if (length(sh)) round(range(sh), 2) else c(NA, NA)
+  cal_ot <- round(quantile(f$cal_offset[!f$shifted], c(0.05, 0.95), na.rm = TRUE, names = FALSE), 2)
+  data.frame(assay = short_ds(ds), ppm = tol$ppm[tol$dataset_id == ds],
+             n_shifted = sum(f$shifted),
+             dev_par = round(t$dev_shifted[1], 1), dev_met = round(t$dev_shifted[2], 1),
+             rt_par = sprintf("%.1f s %s", abs(dt[1]), ifelse(dt[1] < 0, "earlier", "later")),
+             rt_met = sprintf("%.1f s %s", abs(dt[2]), ifelse(dt[2] < 0, "earlier", "later")),
+             n_ions = length(unique(tc_ions[[ds]]$ion)),
+             cal_sh_lo = cal_sh[1], cal_sh_hi = cal_sh[2],
+             cal_ot_lo = cal_ot[1], cal_ot_hi = cal_ot[2],
+             n_ms2 = sum(f$shifted & f$ms2),
+             n_drop = sum(f$key %in% dropped))
+}))
+# The shifted files: apex deviation (ppm) and retention time (s) of each target, and
+# the file's calibration offset (ppm).
+if (length(TOL_CHECK)) do.call(rbind, lapply(TOL_CHECK, function(ds) {
+  f    <- tc_files[[ds]]
+  cols <- c(paste0(roles, "_dev"), paste0(roles, "_rt"))
+  f    <- f[f$shifted, c("file", cols, "cal_offset", "ms2")]
+  if (nrow(f)) cbind(assay = short_ds(ds), f, row.names = NULL) |>
+    dplyr::mutate(dplyr::across(dplyr::all_of(cols), ~ round(.x, 1)),
+                  cal_offset = round(cal_offset, 2))
+}))
+```
+
+```{r tolerance-check-table}
+#| echo: false
+if (length(TOL_CHECK))
+  knitr::kable(data.frame(assay = short_ds(tc_tab$dataset_id), target = tc_tab$target,
+                          `shifted files` = tc_tab$shifted,
+                          `median deviation, shifted (ppm)` = round(tc_tab$dev_shifted, 1),
+                          `median deviation, detected (ppm)` = round(tc_tab$dev_own, 1),
+                          `median apex RT, shifted (s)` = round(tc_tab$rt_shifted, 1),
+                          `median apex RT, detected (s)` = round(tc_tab$rt_own, 1),
+                          check.names = FALSE),
+               caption = paste("The shifted files of each checked assay against the other files",
+                               "where each target is detected at the assay's own tolerance: median",
+                               "apex m/z deviation from the target and median apex retention time."))
+```
+
+<!-- Shown only where an assay is checked. knitr runs the inline code even when the
+div is hidden, so it reads the two targets' names with [ ], which gives NA rather
+than an error where compound.csv has fewer. -->
+::: {.content-`r if (length(TOL_CHECK)) "visible" else "hidden"`}
+In `r tc_sum$n_shifted` files of `r tc_sum$assay`, both targets are detected at
+`r TOL_CHECK_PPM` ppm but not both at `r tc_sum$ppm` ppm, and both apexes lie further
+than `r tc_sum$ppm` ppm from the target's m/z: a median of `r tc_sum$dev_par` ppm
+for `r target_name[roles][1]` and `r tc_sum$dev_met` ppm for
+`r target_name[roles][2]`. Their apexes come `r tc_sum$rt_par`
+(`r target_name[roles][1]`) and `r tc_sum$rt_met`
+(`r target_name[roles][2]`) than in the other files where each target is
+detected at `r tc_sum$ppm` ppm. Around the `r roles[1]`'s window, `r tc_sum$n_ions` ions
+are found in at least `r 100 * CAL_MIN_FRAC`% of the files. Measured on them, the
+offsets of the shifted files lie between `r tc_sum$cal_sh_lo` and
+`r tc_sum$cal_sh_hi` ppm, and those of the other files between
+`r tc_sum$cal_ot_lo` and `r tc_sum$cal_ot_hi` ppm (5th to 95th percentile). The
+shifted files are not off in mass as a whole: only the ions of the two targets
+are. `r ifelse(tc_sum$n_ms2 == 0, "None", tc_sum$n_ms2)` of the shifted files
+carry an MS2 spectrum matched to either target. At `r TOL_CHECK_PPM` ppm, step 5 would
+count each of them as a detection of both. In `r tc_sum$n_drop` more files the
+same ion lies close enough to the target to be detected at `r tc_sum$ppm` ppm;
+their detections are dropped by hand (`curation/ms1_drop_list.csv`).
+:::
+
+## Extraction runtime
+
+```{r}
+#| echo: false
+# Timing log written by R/peak_review_panels.R; git-ignored, so tolerate its
+# absence.
+et_path <- "peaks_review_v2/_extract_times.csv"
+et <- if (file.exists(et_path)) {
+  x <- read.csv(et_path, stringsAsFactors = FALSE)
+  # The current assays only (keyed by assay or by deposit), each one's latest run.
+  x <- x[x$dataset %in% c(names(results), sub("_.*", "", names(results))), ]
+  x <- x[!duplicated(x$dataset, fromLast = TRUE), ]
+  x <- x[order(x$extract_seconds), ]
+  x$minutes    <- round(x$extract_seconds / 60, 1)
+  x$s_per_file <- round(x$extract_seconds / x$n_files, 2)
+  x
+} else NULL
+et_hours <- if (is.null(et)) NA else round(sum(et$extract_seconds) / 3600, 1)
+et_files <- if (is.null(et)) NA else format(sum(et$n_files), big.mark = ",")
+# The version the log recorded, where it did; else the installed one.
+chr_ver  <- if (!is.null(et) && any(nzchar(et$chromatograms))) {
+  paste(unique(et$chromatograms[nzchar(et$chromatograms)]), collapse = ", ")
+} else as.character(utils::packageVersion("Chromatograms"))
+```
+
+Loading each file's spectra and pulling its
+`r xfun::numbers_to_words(n_targets)` EIC`r if (n_targets > 1) "s"` is the
+pipeline's dominant compute cost, and it runs single-threaded. That is measured rather than assumed:
+parallel backends gave no gain once the files are read, because the cost is disk
+I/O rather than CPU. Cost tracks file count and file size, not the number of
+detections, and the timings are compute-only on cached files (raw-file FTP
+download is excluded). The corpus takes about **`r et_hours` hours** over
+`r if (is.null(et)) NA else nrow(et)` datasets (`r et_files` files).
+
+These numbers were measured with **Chromatograms `r chr_ver`**. Extraction
+performance is strongly version-dependent, so treat the table as valid only for
+that version and re-measure after any upgrade of the extraction stack.
+
+```{r}
+#| echo: false
+#| output: asis
+if (is.null(et)) {
+  cat("_Timing table skipped: `", et_path, "` is not present (git-ignored). Run ",
+      "`Rscript R/peak_review_panels.R <application>` to regenerate it._\n", sep = "")
+} else {
+  cat(knitr::kable(et[, c("dataset", "n_files", "minutes", "s_per_file")],
+                   col.names = c("dataset", "files", "min", "s / file"),
+                   align = "lrrr", row.names = FALSE), sep = "\n")
+}
+```
+
+<!-- Application-specific checks. An application with a positive control of its
+own, such as a dosed or genotyped cohort, keeps it in _05-probe-checks.qmd beside
+this notebook. Without that file the section is omitted and everything else here
+runs unchanged. -->
+
+```{r probe-checks-targets}
+#| echo: false
+# The probe checks are written for the targets parent and metabolite.
+probe_checks <- file.exists("_05-probe-checks.qmd") &&
+  identical(compound_spec$role, c("parent", "metabolite"))
+if (file.exists("_05-probe-checks.qmd") && !probe_checks)
+  message("_05-probe-checks.qmd is skipped: its checks need the targets parent ",
+          "and metabolite, in that order, in compound.csv")
+```
+
+```{r probe-checks, child = if (probe_checks) "_05-probe-checks.qmd"}
+```
+
+# Cross-dataset sample table
+
+```{r combine-tables}
+#| echo: false
+all_samples <- do.call(rbind, lapply(names(results), function(ds) {
+  # The sample table is rebuilt, not read from the cache, so it is never stale. A
+  # repository that does not answer stops here, before rbind() fails on the stub.
+  meta <- tryCatch(load_metadata(ds), error = function(e) {
+    if (is_network_error(e)) stop(e)
+    data.frame(file = basename(bio_files_per_ds[[ds]]))
+  })
+  .m <- resolve_isobars(per_target(results[[ds]], "metrics"),
+                        conf_final, ds, results[[ds]]$rt_anchor)
+  st <- build_sample_table(.m, basename(bio_files_per_ds[[ds]]), meta, dedup = TRUE)
+  # Keep only files still in the current bio_files: a cached extraction can hold files
+  # a later QC rule removed.
+  keep <- norm_file_key(st$file) %in% norm_file_key(bio_files_per_ds[[ds]])
+  cbind(dataset_id = ds, assay = results[[ds]]$assay, st[keep, , drop = FALSE],
+        stringsAsFactors = FALSE)
+}))
+
+# Files with no metadata are kept for the presence record but excluded from
+# every stratified analysis below.
+all_samples$has_metadata <- {
+  key <- paste0(all_samples$dataset_id, "|",
+                basename(as.character(all_samples$file)))
+  hit <- has_metadata_lookup[key]
+  ifelse(is.na(hit), FALSE, unname(hit))
+}
+
+write.csv(all_samples, "artifacts/sample_table_all.csv", row.names = FALSE)
+
+cat("Datasets processed :", length(results), "\n")
+cat("Total rows         :", nrow(all_samples),
+    "  (with metadata:", sum(all_samples$has_metadata),
+    "| record-only:", sum(!all_samples$has_metadata), ")\n")
+```
+
+`sample_table_all.csv` is one row per subject (the `build_sample_table()`
+dedup). Per-file and longitudinal analyses (`06`) need the rows *before* that
+dedup, so we also write a per-file table, keeping `subject_id` (+ a
+`subject_key` fallback) so those analyses aggregate to one-per-subject
+themselves; the rows are not independent.
+
+```{r combine-tables-perfile}
+#| echo: false
+getcol <- function(df, nm)
+  if (nm %in% names(df)) as.character(df[[nm]]) else rep(NA_character_, nrow(df))
+
+all_samples_perfile <- dplyr::bind_rows(lapply(names(results), function(ds) {
+  r    <- results[[ds]]
+  meta <- tryCatch(load_metadata(ds), error = function(e) {
+    if (is_network_error(e)) stop(e)   # as in combine-tables
+    data.frame(file = basename(bio_files_per_ds[[ds]]))
+  })
+  .m   <- resolve_isobars(per_target(r, "metrics"), conf_final, ds, r$rt_anchor)
+  st   <- build_sample_table(.m, basename(bio_files_per_ds[[ds]]), meta, dedup = FALSE)
+  st$subject_key <- dplyr::coalesce(getcol(st, "subject_id"),
+                                    getcol(st, "sample_name"), as.character(st$file))
+  cbind(dataset_id = ds, assay = r$assay, st, stringsAsFactors = FALSE)
+}))
+write.csv(all_samples_perfile, "artifacts/sample_table_perfile.csv", row.names = FALSE)
+cat("One row per raw file:", nrow(all_samples_perfile),
+    "| one row per subject-sample after collapsing repeat files:", nrow(all_samples), "\n")
+```
+
+## Positive control: files where MS2 already confirmed the compound
+
+Where SIRIUS confirmed a compound's MS2 spectrum in a file, the compound is in
+that file, so MS1 extraction must find it there too. A confirmed file it misses
+is propagation losing real signal rather than biology, and the table names the
+rule behind each miss. A `truncated` detection counts as found: its peak ran
+into empty scans before falling to half height, so it is detected but carries
+no area.
+
+```{r positive-control}
+#| echo: false
+#| output: asis
+pc <- dplyr::bind_rows(lapply(names(results), function(ds) {
+  fb   <- basename(as.character(bio_files_per_ds[[ds]]))
+  bare <- function(x) norm_file_key(to_bare_name(basename(as.character(x)), fb))
+  st   <- all_samples_perfile[all_samples_perfile$dataset_id == ds, ]
+  st$k <- norm_file_key(st$file)
+  dplyr::bind_rows(lapply(roles, function(role) {
+    pre <- target_prefix(role)
+    ck  <- unique(bare(conf_final$source_file[conf_final$dataset_id == ds &
+                                              conf_final$role == role]))
+    s   <- st[st$k %in% ck, , drop = FALSE]
+    if (!nrow(s)) return(NULL)
+    det <- s[[paste0(pre, "_detected")]] %in% TRUE
+    why <- as.character(s[[paste0(pre, "_gate")]]); why[is.na(why)] <- "no peak in window"
+    tab <- sort(table(why[!det]), decreasing = TRUE)
+    data.frame(dataset = short_ds(ds, names(results)), compound = role, confirmed = nrow(s),
+               detected = sum(det),
+               by_hand = sum(det & why == "manual accept"),
+               truncated = sum(det & s[[paste0(pre, "_truncated")]] %in% TRUE),
+               missed = sum(!det),
+               why_missed = if (length(tab)) paste0(names(tab), " (", tab, ")", collapse = "; ") else "",
+               stringsAsFactors = FALSE)
+  }))
+}))
+write.csv(pc, "artifacts/positive_control.csv", row.names = FALSE)
+cat(knitr::kable(pc, row.names = FALSE,
+                 col.names = c("dataset", "compound", "MS2-confirmed files", "MS1 detected",
+                               "of which accepted by hand", "of which truncated", "missed",
+                               "why missed"),
+                 caption = sprintf(paste(
+                   "Positive control: %d of %d MS2-confirmed files are detected at MS1,",
+                   "%d of them accepted by hand."),
+                   sum(pc$detected), sum(pc$confirmed), sum(pc$by_hand))), sep = "\n")
+```
+
+```{r fig-pc-misses, fig.width = 7, fig.height = 0.6 + 1.9 * max(1, ceiling(sum(pc$missed) / 4))}
+# Every miss of the table above, one panel each: trace, window, MS2 times and apex.
+# A file's key within its assay, as the table above matches files.
+key_in <- function(ds, x)
+  norm_file_key(to_bare_name(basename(as.character(x)),
+                             basename(as.character(bio_files_per_ds[[ds]]))))
+miss <- as.data.frame(dplyr::bind_rows(lapply(names(results), function(ds) {
+  st <- all_samples_perfile[all_samples_perfile$dataset_id == ds, ]
+  dplyr::bind_rows(lapply(roles, function(role) {
+    pre <- target_prefix(role)
+    ck  <- key_in(ds, conf_final$source_file[conf_final$dataset_id == ds &
+                                             conf_final$role == role])
+    s   <- st[norm_file_key(st$file) %in% ck &
+              !(st[[paste0(pre, "_detected")]] %in% TRUE), , drop = FALSE]
+    if (!nrow(s)) return(NULL)
+    why <- as.character(s[[paste0(pre, "_gate")]]); why[is.na(why)] <- "no peak in window"
+    data.frame(dataset_id = ds, role = role, pre = pre, file = s$file, reason = why,
+               apex_rt = s[[paste0(pre, "_apex_rt")]])
+  }))
+})))
+stopifnot(nrow(miss) == sum(pc$missed))
+
+# A file name without its accession and extension, cut in the middle if long.
+short_file <- function(f) {
+  f <- sub("[.][^.]*$", "", sub("^(MSV|MTBLS|ST)[0-9]+[_-]", "", basename(f)))
+  ifelse(nchar(f) > 28, paste0(substr(f, 1, 13), "...", substring(f, nchar(f) - 11)), f)
+}
+miss_rows <- lapply(seq_len(nrow(miss)), function(i) {
+  m   <- miss[i, ]
+  r   <- results[[m$dataset_id]]
+  k   <- norm_file_key(m$file)
+  win <- r$rt_anchor[[m$pre]]$win
+  ms2 <- unique(as.numeric(conf_final$rt[conf_final$dataset_id == m$dataset_id &
+                                         conf_final$role == m$role &
+                                         key_in(m$dataset_id, conf_final$source_file) == k]))
+  # The window and 25 s either side, wider where a confirmed spectrum or the apex lies outside.
+  xr  <- range(win + c(-25, 25), ms2 - 5, ms2 + 5, m$apex_rt, na.rm = TRUE)
+  chr <- r[[paste0("chr_", m$pre)]]
+  j   <- match(k, key_in(m$dataset_id, dataOrigin(chr)))
+  pd  <- if (is.na(j)) data.frame(rtime = numeric(), intensity = numeric()) else
+    as.data.frame(Chromatograms::peaksData(chr)[[j]])
+  pd  <- pd[pd$rtime >= xr[1] & pd$rtime <= xr[2], ]
+  id  <- sprintf("%03d", i)
+  pd$id  <- rep(id, nrow(pd))
+  # A run of scans with signal is one line; an empty scan breaks it.
+  pd$run <- paste(id, cumsum(!is.finite(pd$intensity)))
+  on  <- pd[is.finite(pd$intensity), ]
+  list(label = paste0(short_ds(m$dataset_id, names(results)), ", ",
+                      sub("^L-", "", target_name[[m$role]]),
+                      "\n", short_file(m$file), "\n", m$reason),
+       trace = on,
+       empty = pd[!is.finite(pd$intensity), ],
+       # The scan the picker took as apex; none where it found no peak.
+       apex  = on[which.min(abs(on$rtime - m$apex_rt)), ],
+       ms2   = data.frame(id = rep(id, length(ms2)), rtime = ms2),
+       win   = data.frame(id = id, lo = win[1], hi = win[2]),
+       lim   = data.frame(id = id, rtime = xr, intensity = 0))
+})
+
+by_reason <- sort(table(miss$reason), decreasing = TRUE)
+miss_note <- if (nrow(miss))
+  paste0("The figure draws each of the ", nrow(miss), " misses, one panel per file and target: ",
+         paste0(names(by_reason), " (", by_reason, ")", collapse = ", "), ".") else
+  "No MS2-confirmed file is missed, so there is nothing to draw."
+
+miss_h <- 0.6 + 1.9 * max(1, ceiling(nrow(miss) / 4))   # inches: four panels per row
+if (nrow(miss)) {
+  part <- function(k) do.call(rbind, lapply(miss_rows, `[[`, k))
+  p_miss <- ggplot(part("trace"), aes(rtime, intensity)) +
+    geom_rect(data = part("win"), aes(xmin = lo, xmax = hi, ymin = -Inf, ymax = Inf),
+              inherit.aes = FALSE, fill = "grey88") +
+    geom_blank(data = part("lim")) +
+    geom_vline(data = part("ms2"), aes(xintercept = rtime), colour = "firebrick",
+               linetype = 2, linewidth = 0.3) +
+    geom_rug(data = part("empty"), aes(x = rtime), inherit.aes = FALSE, sides = "b",
+             colour = "grey55", linewidth = 0.2, length = unit(0.04, "npc")) +
+    geom_line(aes(group = run), linewidth = 0.35) +
+    geom_point(size = 0.3) +
+    geom_point(data = part("apex"), shape = 21, size = 2, stroke = 0.5,
+               colour = "#2166AC", fill = NA) +
+    facet_wrap(~id, ncol = 4, scales = "free",
+               labeller = as_labeller(setNames(vapply(miss_rows, `[[`, "", "label"),
+                                               sprintf("%03d", seq_along(miss_rows))))) +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale()),
+                       expand = expansion(mult = c(0.05, 0.1))) +
+    labs(x = "retention time (s)", y = "MS1 intensity",
+         caption = paste("Shaded: the window. Dashed: the file's confirmed MS2 spectra.",
+                         "Circle: the apex the picker chose. Ticks: scans with no signal.")) +
+    theme_bw(base_size = 7) +
+    theme(strip.text = element_text(size = 6, hjust = 0),
+          panel.grid.minor = element_blank(),
+          plot.caption = element_text(size = 6, colour = "grey30", hjust = 0))
+  ggsave(figp("step5_pc_misses.png"), p_miss, width = 7, height = miss_h, dpi = 200)
+  ggsave(figp("step5_pc_misses.pdf"), p_miss, width = 7, height = miss_h)
+  p_miss
+} else {
+  # The chapter collects this figure from both applications, so it is written even empty.
+  p_none <- ggplot() + annotate("text", x = 0, y = 0, label = miss_note, size = 3) + theme_void()
+  ggsave(figp("step5_pc_misses.png"), p_none, width = 7, height = 1, dpi = 200)
+  ggsave(figp("step5_pc_misses.pdf"), p_none, width = 7, height = 1)
+}
+```
+
+`r miss_note`
+
+## Files per assay, by MS2 and by MS1
+
+For each assay and target, the files in which MS2 confirmed the target (the
+positive control's rule) and the files in which MS1 detects its peak. The
+chapter's examples of what extraction adds are read from this table.
+
+```{r files-per-assay}
+#| echo: false
+per_assay <- dplyr::bind_rows(lapply(names(results), function(ds) {
+  st <- all_samples_perfile[all_samples_perfile$dataset_id == ds, ]
+  a  <- short_ds(ds, names(results))
+  dplyr::bind_rows(lapply(roles, function(role) {
+    pre <- target_prefix(role)
+    data.frame(assay = a, compound = role, files = nrow(st),
+               ms2 = sum(pc$confirmed[pc$dataset == a & pc$compound == role]),
+               ms1 = sum(st[[paste0(pre, "_detected")]] %in% TRUE))
+  }))
+}))
+write.csv(per_assay, "artifacts/files_per_assay.csv", row.names = FALSE)
+knitr::kable(per_assay, col.names = c("assay", "compound", "files",
+                                      "MS2-confirmed files", "MS1-detected files"))
+```
+
+# Step summary
+
+The results of this step, as the chapter's table shows them.
+
+```{r step-summary}
+# A file has a target by MS2 where one of its confirmed spectra came from it, and by
+# MS1 where its peak was detected; a file counts when it has every target.
+ms2_every <- sum(vapply(names(results), function(ds) {
+  fb <- basename(as.character(bio_files_per_ds[[ds]]))
+  k  <- norm_file_key(all_samples_perfile$file[all_samples_perfile$dataset_id == ds])
+  confirmed <- function(role) k %in% norm_file_key(
+    conf_final$source_file[conf_final$dataset_id == ds & conf_final$role == role], fb)
+  sum(Reduce(`&`, lapply(roles, confirmed)))
+}, integer(1)))
+ms1_every <- sum(Reduce(`&`, lapply(prefixes, function(p)
+  all_samples_perfile[[paste0(p, "_detected")]] %in% TRUE)))
+# The hand corrections in curation/, counted for the datasets extracted here.
+cur <- curation_inputs()
+n_manual <- sum(cur$ov$dataset_id %in% names(results)) +
+            sum(cur$drop_all$dataset %in% names(results)) +
+            sum(cur$accept$dataset %in% names(results))
+
+# The step's table counts files only; the recap rows (assays, deposits, MS1 over MS2)
+# are for the discussion.
+summary_step <- data.frame(
+  item  = c("files extracted",
+            paste("... with", targets_phrase(n_targets), "confirmed by MS2"),
+            paste("... with", targets_phrase(n_targets), "detected in MS1"),
+            "recap: assays", "recap: deposits",
+            paste0("recap: ", targets_phrase(n_targets), ", MS1 over MS2")),
+  value = c(nrow(all_samples_perfile), ms2_every, ms1_every,
+            length(results),
+            length(unique(ds_summary$deposit_id[ds_summary$dataset_id %in% names(results)])),
+            sprintf("%.1f", ms1_every / ms2_every)))
+write.csv(summary_step, "artifacts/summary_step5.csv", row.names = FALSE)
+summary_step
+```
+
+Step 5 extracts `r length(results)` assays. Of the `r sum(pc$confirmed)` cases where
+MS2 confirmed a target in a file, the positive control finds its MS1 peak in
+`r sum(pc$detected)`. `r if (n_manual == 0) "No peak was corrected by hand." else paste(n_manual, if (n_manual == 1) "peak was" else "peaks were", "corrected by hand (curation/).")`
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

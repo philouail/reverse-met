@@ -1,0 +1,641 @@
+# Checks that can catch us being wrong
+
+A pipeline is only as trustworthy as the things that could contradict it, and
+plausible numbers are not evidence if nothing in the design would fail when they
+are wrong. The checks below are built in on purpose, in increasing order of how
+hard they are to argue with.
+
+**1. The confirmed-file positive control.** Where MS2 has already proved the
+compound is present, MS1 extraction must find it; if it does not, propagation is
+losing real signal and every prevalence number is an underestimate.
+`run_ms1_for_dataset()` reports this as `confirmed files loaded: N | with >=1
+peak: M`, where M should equal N and any shortfall is a bug rather than biology.
+It is the cheapest hard check here and needs no external data.
+
+**2. A known-negative control.** The complement: run the identical pipeline on
+files that *cannot* contain the compound and confirm it finds nothing. The
+pre-dose plasma draws of the probe study are exactly that (real matrix, true
+m/z, true retention window, drug absent by design), and `06-analysis` reports them. A
+synthetic decoy mass is deliberately not used: an untargeted file carries real
+compounds at arbitrary masses, so a hit at a decoy mass is usually the picker
+correctly finding something else, which bounds the false-positive rate from
+above without estimating it.
+
+**3. Report the surface, not the best cell.** Every parameter here is a choice,
+and a conclusion that survives only one setting is not a conclusion. The
+retention-time sweep below is the pattern to follow: a broad plateau where the
+answer is stable, and a cliff with a mechanism that explains exactly where and
+why it breaks. A single lucky optimum would not be evidence.
+
+**4. External ground truth, which beats every internal check.** Parameters can
+be tuned until an internal check passes; an outside number cannot be. `06-analysis` uses
+the one deposit where truth exists independently of us: a cohort in which every
+subject was deliberately dosed, with pre-dose samples that are known negatives
+and a CYP2C19 genotype per volunteer that the pipeline never sees.
+
+**5. The apex-snap shown rather than asserted.** The retention time a confirmed
+hit carries is when the instrument fired, not when the compound eluted, and the
+whole window design rests on the second being stable where the first is not.
+The dosed cohort shows it best, so it is plotted: in MSV000084008, the files with
+the most confirmed metabolite scans, each scan on the EIC of the file it fired in.
+
+```{r fig-dda-offset, fig.width = 9, fig.height = 5.6}
+#| echo: false
+# The dosed cohort's plasma, and the files with the most confirmed metabolite scans:
+# one panel each.
+.ds    <- "MSV000084008"
+.n_fig <- 15
+.r <- results[[.ds]]
+.h <- conf_final[conf_final$dataset_id == .ds & conf_final$role == "metabolite", ]
+.h$bn <- basename(.h$source_file)
+.top <- names(sort(table(norm_file_key(.h$bn)), decreasing = TRUE))[seq_len(min(.n_fig, length(unique(norm_file_key(.h$bn)))))]
+.h   <- .h[norm_file_key(.h$bn) %in% .top, ]
+.org <- basename(chartr(rawToChar(as.raw(92)), "/",
+                        chromData(.r$chr_met)$dataOrigin))
+.ix  <- which(norm_file_key(.org) %in% .top)
+.lab <- function(x) sub("^MSV[0-9]+_", "", sub("\\.mzX?ML$", "", x))
+.win <- .r$rt_anchor$met$win
+
+.tr <- dplyr::bind_rows(lapply(.ix, function(i) data.frame(
+  file = .lab(.org[i]),
+  rt = rtime(.r$chr_met[i])[[1]], int = intensity(.r$chr_met[i])[[1]])))
+.tr <- .tr[is.finite(.tr$int), ]
+# The apex inside step 5's window: elsewhere in the trace sits the sulfone.
+.ap <- .tr[.tr$rt >= .win[1] & .tr$rt <= .win[2], ] |> dplyr::group_by(file) |>
+  dplyr::slice_max(int, n = 1, with_ties = FALSE) |> dplyr::ungroup()
+.ms2 <- .h |> dplyr::transmute(file = .lab(bn), ms2 = rt)
+
+ggplot(.tr, aes(rt, int)) +
+  geom_line(colour = "grey35", linewidth = 0.4) +
+  geom_vline(data = .ms2, aes(xintercept = ms2), colour = "#D6604D",
+             linewidth = 0.4, alpha = 0.85) +
+  geom_point(data = .ap, aes(rt, int), colour = "#2166AC", size = 1.8) +
+  facet_wrap(~ file, scales = "free_y", ncol = 5) +
+  coord_cartesian(xlim = .win + c(-25, 25)) +   # zoom, not a filter: nothing is dropped
+  labs(x = "Retention time (s)", y = "Intensity",
+       title = paste(.ds, "metabolite: MS2 trigger times (red) against the MS1 apex (blue)"),
+       subtitle = paste("one panel per file, the", length(.top),
+                        "files with the most confirmed metabolite scans")) +
+  theme_bw(base_size = 10) +
+  theme(strip.background = element_rect(fill = "grey92"),
+        panel.grid.minor = element_blank())
+```
+
+```{r dda-offset-numbers}
+#| echo: false
+.j <- dplyr::left_join(.ms2, dplyr::select(.ap, file, apex = rt), by = "file")
+cat("files with a confirmed metabolite scan:", nrow(.ap),
+    "| confirmed scans:", nrow(.j), "\n")
+cat("apex span:", sprintf("%.1f-%.1f s (%.1f s)", min(.ap$rt), max(.ap$rt),
+                          diff(range(.ap$rt))), "\n")
+cat("trigger span:", sprintf("%.1f-%.1f s (%.1f s)", min(.j$ms2), max(.j$ms2),
+                             diff(range(.j$ms2))), "\n")
+cat("trigger minus apex:", sprintf("%+.1f to %+.1f s", min(.j$ms2 - .j$apex),
+                                   max(.j$ms2 - .j$apex)), "\n")
+```
+
+```{r dda-offset-example}
+#| echo: false
+# The file holding the largest trigger-to-apex offset, for the sentence below:
+# how many confirmed scans it contributes and how far apart they fired.
+.big   <- .j$file[which.max(.j$ms2 - .j$apex)]
+.big_n <- sum(.j$file == .big)
+.big_s <- round(diff(range(.j$ms2[.j$file == .big])))
+```
+
+The apexes sit in a band a fraction of the width of the triggers, and the
+largest offsets are not scattered files but single intense peaks re-fragmented
+on the way down: the file with the largest offset contributes `r .big_n`
+confirmed scans, spread over `r .big_s` seconds, all belonging to one apex.
+Centring a window on the trigger times would
+force it to span the union of those tails; centring on the apexes does not. This
+is what the window derivation is for, and the figure is the check that it is
+warranted.
+
+**6. Which of the two isobars is actually in the parent channel.** The window
+argument above says the compounds are chromatographically resolved; this asks
+the harder question of whether the peak we integrate is the right molecule.
+Omeprazole is a sulfoxide, so it cannot lose $\cdot$SH; hydroxyomeprazole
+sulfide, which shares its formula, gives m/z $313.1422$ on exactly that loss.
+The share of confirmed parent MS2 carrying that ion therefore reads directly on
+how much of the channel is the isobar, and the probe cohort supplies its own
+control: the cluster where omeprazole is confirmed should be near zero.
+
+```{r isobar-fragment}
+#| echo: false
+.ifc <- "artifacts/isobar_fragment_check.csv"
+# Reads raw MS2, not the cached EICs, so it is slow and its result is cached. Delete
+# the CSV to recompute; a change in the confirmed set is not noticed on its own.
+if (!file.exists(.ifc)) {
+  SULFIDE_MZ <- 313.1422   # [M+H-SH]+, impossible for a sulfoxide
+  SHARED_MZ  <- 198.0581   # substituted pyridine ring, given by both
+  TOL <- 0.02; PREC_TOL <- 0.05
+  .pc <- function(x) if (!length(x)) NA_real_ else round(100 * mean(x))
+  .rows <- list()
+  for (ds in names(results)) {
+    r <- results[[ds]]
+    # only files carrying a confirmed parent hit: reading the whole corpus
+    # costs hours and the question is what the confirmed spectra are
+    want <- unique(basename(as.character(conf_final$source_file[
+      conf_final$dataset_id == ds & conf_final$role == "parent"])))
+    if (!length(want)) next
+    fs <- unique(chartr(rawToChar(as.raw(92)), "/", chromData(r$chr_par)$dataOrigin))
+    fs <- fs[basename(fs) %in% want & file.exists(fs)]
+    if (!length(fs)) next
+    sp <- tryCatch(filterMsLevel(Spectra(fs), 2L), error = function(e) NULL)
+    if (is.null(sp) || !length(sp)) next
+    pmz <- precursorMz(sp)
+    k <- which(!is.na(pmz) & abs(pmz - compound_spec$mz_pos[compound_spec$role == "parent"]) < PREC_TOL)
+    if (!length(k)) next
+    sp <- sp[k]; pk <- peaksData(sp); rt <- rtime(sp)
+    hasfrag <- function(t) vapply(pk, function(m) any(abs(m[, 1] - t) < TOL), logical(1))
+    s313 <- hasfrag(SULFIDE_MZ)
+    # the same two centres, and the same stand-down condition, resolve_isobars() uses
+    ctr <- function(role) {
+      q <- as.numeric(conf_final$rt[conf_final$dataset_id == ds & conf_final$role == role])
+      q <- q[is.finite(q)]; if (length(q)) stats::median(q) else NA_real_
+    }
+    cp <- ctr("parent"); cm <- ctr("metabolite")
+    ok <- !isTRUE(r$rt_anchor$par$uncertain) && !isTRUE(r$rt_anchor$met$uncertain) &&
+      is.finite(cp) && is.finite(cm) && abs(cp - cm) >= CHAN_SEP
+    own <- if (ok) abs(rt - cp) < abs(rt - cm) else rep(NA, length(rt))
+    .rows[[length(.rows) + 1]] <- data.frame(
+      dataset_id = ds, spectra = length(pk),
+      pct_sulfide_313 = .pc(s313), pct_shared_198 = .pc(hasfrag(SHARED_MZ)),
+      resolved = ok,
+      n_integrated = if (ok) sum(own) else NA_integer_,
+      pct_sulfide_integrated = if (ok) .pc(s313[own]) else NA_real_,
+      n_rejected = if (ok) sum(!own) else NA_integer_,
+      pct_sulfide_rejected = if (ok) .pc(s313[!own]) else NA_real_,
+      stringsAsFactors = FALSE)
+  }
+  write.csv(do.call(rbind, .rows), .ifc, row.names = FALSE)
+}
+.z <- if (file.exists(.ifc)) read.csv(.ifc, stringsAsFactors = FALSE)
+# One cell out of the table, so no number in the prose below is typed twice.
+.iso <- function(ds, col) if (is.null(.z)) "--" else .z[[col]][.z$dataset_id == ds]
+{
+  .z$verdict <- ifelse(.z$pct_sulfide_313 >= 40, "largely the isobar",
+                ifelse(.z$pct_sulfide_313 >= 15, "mixed", "mostly omeprazole"))
+  .show <- .z[order(-.z$pct_sulfide_313),
+              c("dataset_id", "spectra", "pct_sulfide_313",
+                "pct_sulfide_integrated", "pct_sulfide_rejected", "verdict")]
+  knitr::kable(.show, row.names = FALSE,
+    col.names = c("assay", "MS2 at the parent mass", "% with 313.14 (-SH)",
+                  "integrated cluster", "rejected cluster", "verdict"),
+    caption = paste("Sulfide-diagnostic fragment among confirmed parent spectra.",
+                    "The last two columns split that rate by retention cluster,",
+                    "classified by the same comparison resolve_isobars() makes;",
+                    "they are empty where the anchors are too close for the",
+                    "rule to apply."))
+}
+```
+
+```{r isobar-separation}
+#| echo: false
+# How far apart a deposit's parent and metabolite anchors sit: the two medians of
+# the confirmed retention times that resolve_isobars() compares.
+.sep <- function(ds) {
+  m <- function(role) stats::median(as.numeric(
+    conf_final$rt[conf_final$dataset_id == ds & conf_final$role == role]), na.rm = TRUE)
+  abs(m("parent") - m("metabolite"))
+}
+```
+
+Read the rates as a mixture, not a verdict on a whole deposit. The probe cohort
+sits at `r .iso("MSV000084008", "pct_sulfide_313")` per cent pooled, which on its
+own says little; split by retention cluster it is
+`r .iso("MSV000084008", "pct_sulfide_integrated")` per cent in the cluster the
+extraction integrates against
+`r .iso("MSV000084008", "pct_sulfide_rejected")` per cent in the one it rejects.
+That contrast is the whole case for `resolve_isobars()`: the rule is not
+discarding signal, it is discarding a different molecule. MSV000088255, a urine
+cohort, does not reach this step: step 4 sets it aside, because there the peak at
+omeprazole's mass is in most files the isomer itself (`04-confirmation`). One
+deposit is worth naming, and the rule stands down in it, which is why its row has no
+split. MTBLS1866 runs at
+`r .iso("MTBLS1866_LC-MS_positive_reverse-phase_metabolite_profiling", "pct_sulfide_313")`
+per cent and is **not** gated, because its two anchors sit
+`r sprintf("%.1f", .sep("MTBLS1866_LC-MS_positive_reverse-phase_metabolite_profiling"))` s
+apart, under the `r CHAN_SEP` s the rule needs to tell the channels apart. Its
+parent contrast should be read with that attached.
+
+A methodological warning that applies to all of this: **do not choose a
+parameter by maximising agreement with the thing you then cite as validation.**
+That is circular.
+Where a parameter must be tuned, tune it against something structurally
+independent of the validation target. The parent compound is useful here
+precisely because it has no isobaric twin, so its retention-time drift can be
+measured without reference to any downstream result.
+
+**7. What each choice is actually worth.** The warning above is a rule for
+choosing parameters; this is the audit of the ones already chosen. Every
+decision in the extraction is defensible in prose, which is exactly the problem:
+a reader has no way to tell a defensible choice from a convenient one. So each
+is turned off in turn, one at a time with everything else left alone, and the
+genotype model is refitted from the peaks that survive. MSV000084008 is the only
+deposit carrying genotypes, so it is the only place the coefficient can be
+recomputed; MSV000082493 supplies the counter-check, its skin samples taken
+before the first dose being the one known-negative the intensity floor is
+answerable to.
+
+```{r ablation-helpers}
+#| echo: false
+# ---- ablations: re-run the extraction with one choice changed ---------------
+# Re-run role_metrics() from the cached EICs; with defaults they must match the cache.
+
+ablation_setup <- function(ds, bio_files) {
+  if (!identical(compound_spec$role, c("parent", "metabolite")))
+    stop("ablation_setup(", ds, "): the ablations need exactly two targets, ",
+         "the parent and the metabolite")
+  r  <- readRDS(sprintf("artifacts/per_dataset/%s.rds", ds))
+  fb <- basename(as.character(bio_files))
+  ch <- list(par = r$chr_par_narrow, met = r$chr_met_narrow)
+  list(ds = ds, cfg = r$cfg, ch = ch,
+       metrics = list(par = r$metrics_par, met = r$metrics_met),
+       tr = lapply(ch, function(c0) lapply(Chromatograms::peaksData(c0),
+              function(pd) list(rt = pd[, "rtime"], it = pd[, "intensity"]))),
+       fl = lapply(ch, function(c0) basename(dataOrigin(c0))),
+       bare = function(x) norm_file_key(to_bare_name(basename(as.character(x)), fb)))
+}
+
+# The consensus the pipeline does not use: every confirmed hit votes, so a file
+# fragmented fifteen times outweighs one fragmented five.
+ablation_window_per_hit <- function(e, role, conf, old_win) {
+  hh <- conf[conf$dataset_id == e$ds & conf$role == role_of_prefix(role), ]
+  a  <- suppressWarnings(as.numeric(hh$rt)); a <- a[is.finite(a)]
+  if (!length(a)) return(old_win)
+  nbrs <- vapply(a, function(z) sum(abs(a - z) <= CLUST_TOL), integer(1))
+  top  <- a[nbrs == max(nbrs)]
+  inl  <- a[abs(a - stats::median(top)) <= CLUST_TOL]
+  w <- c(min(inl) - APEX_PAD, max(inl) + APEX_PAD)
+  attr(w, "uncertain") <- diff(range(top)) > CLUST_TOL
+  w
+}
+
+# Stops where role_metrics() stops, before the isobar rule; ablation_isobars()
+# is that step, kept separate so the baseline can be checked against the cache.
+ablation_variant <- function(e, conf, floor_val = MIN_INT, per_hit = FALSE,
+                             ov, drop_all, accept = curation_inputs()$accept) {
+  anchor <- list(); mets <- list()
+  for (role in c("par", "met")) {
+    old_win <- e$cfg[[paste0("rt_", role, "_win")]]
+    win <- if (per_hit) ablation_window_per_hit(e, role, conf, old_win) else
+      acceptance_window(e$ds, role_of_prefix(role),
+                        list(files = e$fl[[role]], traces = e$tr[[role]]),
+                        e$bare, old_win, conf, ov, FALSE)
+    anchor[[role]] <- list(win = as.numeric(win),
+                           uncertain = isTRUE(attr(win, "uncertain")))
+    picks <- lapply(e$tr[[role]], function(t) pick(t$rt, t$it, win[1], win[2], FALSE))
+    acc   <- accept[accept$dataset == e$ds & accept$role == role_of_prefix(role), , drop = FALSE]
+    hand  <- match(norm_file_key(e$fl[[role]]), norm_file_key(acc$file))
+    for (i in which(!is.na(hand)))
+      picks[[i]] <- pick(e$tr[[role]][[i]]$rt, e$tr[[role]][[i]]$it,
+                         acc$apex_rt[hand[i]] - APEX_PAD, acc$apex_rt[hand[i]] + APEX_PAD, FALSE)
+    picks <- add_msquality(e$ch[[role]], picks)
+    keep  <- which(!vapply(picks, is.null, logical(1)))
+    pk <- picks[keep]; fl <- e$fl[[role]][keep]
+    old_floor <- MIN_INT; MIN_INT <<- floor_val
+    det <- vapply(seq_along(pk), function(i) accept_peak(pk[[i]], FALSE) &&
+                    !is_dropped(e$ds, role_of_prefix(role), fl[i], drop_all), logical(1))
+    MIN_INT <<- old_floor
+    mets[[role]] <- stats::setNames(
+      data.frame(file = fl,
+                 auc = vapply(pk, function(p) p$auc, numeric(1)),
+                 apex_rt = vapply(pk, function(p) p$apex_rt, numeric(1)),
+                 detected = det, stringsAsFactors = FALSE),
+      c("file", paste0(role, c("_auc", "_apex_rt", "_detected"))))
+  }
+  list(ds = e$ds, win = anchor, par = mets$par, met = mets$met)
+}
+
+ablation_isobars <- function(v, conf) {
+  mr <- resolve_isobars(v[c("par", "met")], conf, v$ds, v$win)
+  modifyList(v, list(par = as.data.frame(mr$par), met = as.data.frame(mr$met)))
+}
+```
+
+```{r ablations}
+#| echo: false
+rt_ov   <- read.csv("curation/rt_apex_overrides.csv", stringsAsFactors = FALSE)
+drop_all <- read.csv("curation/ms1_drop_list.csv", stringsAsFactors = FALSE)
+hits_curated <- read.csv("artifacts/hits_curated.csv", check.names = FALSE,
+                         stringsAsFactors = FALSE)
+
+E84 <- ablation_setup("MSV000084008", bio_files_per_ds[["MSV000084008"]])
+E82 <- ablation_setup("MSV000082493", bio_files_per_ds[["MSV000082493"]])
+vary <- function(e, conf = conf_final, ...)
+  ablation_variant(e, conf = conf, ov = rt_ov, drop_all = drop_all, ...)
+
+# The genotype refit: one trapezoidal AUC per subject per day, averaged over
+# days, regressed on the phenotype rank. The same path 06-analysis takes.
+ta84 <- read.delim("dataset_metadata/MSV000084008_metadata.tsv",
+                   check.names = FALSE, stringsAsFactors = FALSE)
+ta84$k <- norm_file_key(ta84$filename)
+ta84$tmin <- as_num(ta84$ATTRIBUTE_Time_Point_Mins)
+ta84 <- ta84[ta84$MS_SampleType == "sample" & !is.na(ta84$tmin), ]
+
+trap <- function(x, y) {
+  o <- order(x); x <- x[o]; y <- y[o]; y[is.na(y)] <- 0
+  if (length(unique(x)) < 4) NA_real_ else
+    sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+refit <- function(v) {
+  d <- ta84
+  mp <- v$par; mm <- v$met
+  mp$k <- norm_file_key(mp$file); mm$k <- norm_file_key(mm$file)
+  i <- match(d$k, mp$k); j <- match(d$k, mm$k)
+  d$par_auc <- ifelse(mp$par_detected[i] %in% TRUE, mp$par_auc[i], NA_real_)
+  d$met_auc <- ifelse(mm$met_detected[j] %in% TRUE, mm$met_auc[j], NA_real_)
+  auc <- do.call(rbind, lapply(
+    split(d, list(d$ATTRIBUTE_Subject, d$ATTRIBUTE_Study_Day), drop = TRUE),
+    function(z) data.frame(
+      subject = z$ATTRIBUTE_Subject[1],
+      rank = match(z$PharmGeno_Phenotype_2C19[1], PHENO),
+      log2_ratio = log2(trap(z$tmin, z$par_auc) / trap(z$tmin, z$met_auc)))))
+  auc <- auc[is.finite(auc$log2_ratio) & !is.na(auc$rank), ]
+  s <- aggregate(log2_ratio ~ subject + rank, data = auc, FUN = mean)
+  co <- summary(lm(log2_ratio ~ rank, data = s))$coefficients
+  c(beta = co[2, 1], se = co[2, 2], p = co[2, 4], n = nrow(s))
+}
+
+# Skin sampled before the first dose: the drug had not been taken and skin has
+# no route to it, so anything called here is a false positive.
+sk <- read.delim("dataset_metadata/MSV000082493_metadata.tsv",
+                 check.names = FALSE, stringsAsFactors = FALSE)
+sk <- sk[sk$MS_SampleType == "sample" & sk$ATTRIBUTE_Body_Site == "L.forehead" &
+           (sk$ATTRIBUTE_Study_Day %in% "0" |
+            (sk$ATTRIBUTE_Study_Day %in% "1" &
+             sk$ATTRIBUTE_Time_Point_Mins %in% "0")), ]
+sk$k <- norm_file_key(sk$filename)
+skin_fp <- function(v) {
+  mp <- v$par; mp$k <- norm_file_key(mp$file)
+  sum(mp$par_detected[match(sk$k, mp$k)] %in% TRUE)
+}
+
+# The second known negative: the dosed cohort's pre-dose and five-minute plasma
+# draws, taken before absorption. A detection of either compound is a false positive.
+pre84 <- ta84[ta84$tmin %in% c(0, 5), ]
+predose_fp <- function(v) {
+  mp <- v$par; mm <- v$met
+  mp$k <- norm_file_key(mp$file); mm$k <- norm_file_key(mm$file)
+  sum((mp$par_detected[match(pre84$k, mp$k)] %in% TRUE) |
+      (mm$met_detected[match(pre84$k, mm$k)] %in% TRUE))
+}
+
+rows <- list()
+add <- function(choice, alternative, note, v84, v82) {
+  b <- refit(v84)
+  rows[[length(rows) + 1]] <<- data.frame(
+    choice = choice, alternative = alternative,
+    detections = as.integer(sum(v84$par$par_detected) + sum(v84$met$met_detected)),
+    note = note, skin_fp = as.integer(skin_fp(v82)),
+    predose_fp = as.integer(predose_fp(v84)),
+    beta = round(unname(b["beta"]), 3), se = round(unname(b["se"]), 3),
+    p = signif(unname(b["p"]), 2), subjects = as.integer(b["n"]),
+    stringsAsFactors = FALSE)
+}
+
+R84 <- vary(E84); R82 <- vary(E82)
+stopifnot(identical(R84$par$par_detected, E84$metrics$par$par_detected),
+          identical(R84$met$met_detected, E84$metrics$met$met_detected),
+          identical(R82$par$par_detected, E82$metrics$par$par_detected))
+V0 <- ablation_isobars(R84, conf_final); W0 <- ablation_isobars(R82, conf_final)
+# Pre-dose denominator: the draws extracted, not those the submitter table declares
+# nor the rows a variant's metrics carry (only where the picker found a peak).
+n_pre <- sum(pre84$k %in%
+             norm_file_key(basename(as.character(bio_files_per_ds[["MSV000084008"]]))))
+add("pipeline as reported", "--", "", V0, W0)
+
+for (f in c(1, 100, 250, 1000))
+  add(sprintf("apex floor %d counts", MIN_INT), sprintf("floor %d counts", f), "",
+      ablation_isobars(vary(E84, floor_val = f), conf_final),
+      ablation_isobars(vary(E82, floor_val = f), conf_final))
+
+for (tiers in list("strict", c("strict", "standard"))) {
+  cf <- conf_final[conf_final$confidence %in% tiers, ]
+  add("anchors at any confidence tier", sprintf("%s only", paste(tiers, collapse = "+")),
+      sprintf("%d of %d anchors", nrow(cf), nrow(conf_final)),
+      ablation_isobars(vary(E84, conf = cf), cf),
+      ablation_isobars(vary(E82, conf = cf), cf))
+}
+
+.vp <- ablation_isobars(vary(E84, per_hit = TRUE), conf_final)
+add("one RT anchor per file", "one anchor per confirmed hit",
+    sprintf("parent window %.0f-%.0f s, not %.0f-%.0f",
+            .vp$win$par$win[1], .vp$win$par$win[2],
+            V0$win$par$win[1], V0$win$par$win[2]),
+    .vp, ablation_isobars(vary(E82, per_hit = TRUE), conf_final))
+
+add("reject cross-channel isobars", "keep every in-window peak", "", R84, R82)
+
+# Adduct policy acts upstream of the window, on which MASST hits exist at all,
+# so it has no separate slope: this deposit's own hits are protonated either way.
+.ok <- hits_curated$adduct_inferred %in% "[M+H]+"
+rows[[length(rows) + 1]] <- data.frame(
+  choice = "any plausible adduct", alternative = "protonated only",
+  detections = NA_integer_,
+  note = sprintf("%d of %d curated hits, %d of %d entities", sum(.ok),
+                 nrow(hits_curated), length(unique(hits_curated$dataset_id[.ok])),
+                 length(unique(hits_curated$dataset_id))),
+  skin_fp = NA_integer_, predose_fp = NA_integer_,
+  beta = NA_real_, se = NA_real_, p = NA_real_,
+  subjects = NA_integer_, stringsAsFactors = FALSE)
+
+.a <- do.call(rbind, rows)
+
+# Pull one cell out for the prose below, so no number here is typed twice.
+.ab <- function(alt, col) .a[[col]][.a$alternative == alt]
+.bmax <- sprintf("%.3f", max(abs(.a$beta - .a$beta[1]), na.rm = TRUE))
+.pmax <- sprintf("%.5f", max(.a$p, na.rm = TRUE))
+.se0  <- sprintf("%.3f", .a$se[1])
+.nsk  <- nrow(sk)
+
+.tbl <- .a
+# p is formatted here rather than left to kable: `digits` would round every one
+# of them to 0.001 and the column would say nothing.
+.tbl$p <- ifelse(is.na(.tbl$p), "", sprintf("%.5f", .tbl$p))
+knitr::kable(.tbl, row.names = FALSE, digits = 3,
+  col.names = c("choice", "alternative", "detections", "note",
+                "pre-dose skin", "pre-dose plasma", "slope", "SE", "p", "subjects"),
+  caption = paste("Each row changes one decision and refits. Detections are",
+                  "MSV000084008's; pre-dose skin counts false positives among",
+                  .nsk, "known negatives in MSV000082493, and pre-dose plasma",
+                  "among the", n_pre, "draws taken before absorption in",
+                  "MSV000084008."))
+```
+
+```{r ablation-subjects}
+#| echo: false
+# Subjects in the refit: the most any variant keeps, and whether every variant
+# keeps that many.
+.nsub     <- max(.a$subjects, na.rm = TRUE)
+.nsub_all <- all(.a$subjects == .nsub, na.rm = TRUE)
+```
+
+The first row is the pipeline as reported, and it reproduces the cached
+detection flags exactly: the chunk asserts that before it computes anything
+else, so a variant that differs does so because of the change and not because
+the re-run drifted from the pipeline. Across every other row the slope stays
+within `r .bmax` of it, against a standard error on that slope of `r .se0`; the
+p-value never rises above `r .pmax`, and `r if (.nsub_all) "all" else "not all"`
+`r .nsub` subjects survive every variant. None of these choices carries the
+validation: the correlation is not an artefact of the
+processing, because the processing can be varied and it does not go away.
+
+The intensity floor is the one row that is not symmetric. Raising it costs
+plasma detections and buys nothing, while lowering it admits files that cannot
+contain the drug at all: at $100$ counts it accepts
+`r .ab("floor 100 counts", "skin_fp")` of the `r .nsk` pre-dose skin samples and
+`r .ab("floor 100 counts", "predose_fp")` of the `r n_pre` pre-dose plasma
+draws, and a floor of $1$ accepts exactly the same files, so nothing sits
+between the two. At $250$ both controls are empty again, which is where the
+sweep stops being free. That asymmetry, not a tuned optimum, is why the floor
+sits where it does, and the per-matrix breakdown says where its cost falls.
+
+```{r floor-by-matrix}
+#| echo: false
+mb <- read.delim("dataset_metadata/MSV000082493_metadata.tsv",
+                 check.names = FALSE, stringsAsFactors = FALSE)
+mb <- mb[mb$MS_SampleType == "sample", ]
+mb$k <- norm_file_key(mb$filename)
+.mp <- R82$par; .mp$k <- norm_file_key(.mp$file)
+.lo <- vary(E82, floor_val = 100)$par
+.fb <- do.call(rbind, lapply(split(mb, mb$ATTRIBUTE_Body_Site), function(g) {
+  i <- match(g$k, .mp$k); i <- i[!is.na(i)]
+  data.frame(body_site = g$ATTRIBUTE_Body_Site[1], files = nrow(g),
+             with_peak_in_window = length(i),
+             accepted_at_500 = sum(.mp$par_detected[i]),
+             accepted_at_100 = sum(.lo$par_detected[i]),
+             stringsAsFactors = FALSE)
+}))
+.fb$rejected_at_500 <- .fb$with_peak_in_window - .fb$accepted_at_500
+.fb$floor_only <- .fb$accepted_at_100 - .fb$accepted_at_500
+.fm <- function(site, col) .fb[[col]][.fb$body_site == site]
+knitr::kable(.fb, row.names = FALSE,
+  col.names = c("body site", "files", "peak in window", "accepted at 500",
+                "accepted at 100", "rejected at 500", "floor-only"),
+  caption = paste("MSV000082493, parent channel, before the isobar rule.",
+                  "Floor-only rejections are those a lower threshold would",
+                  "rescue; the rest fail another criterion and cannot be."))
+```
+
+The gate is a conjunction, so a peak failing any criterion other than the apex
+height cannot be rescued by a lower threshold, and the split matters. In faeces
+only `r .fm("fecal", "floor_only")` of `r .fm("fecal", "rejected_at_500")`
+rejections are the floor's doing: most of that matrix's shortfall is peaks that
+do not have the shape of a peak, and lowering the threshold would not recover
+them. In skin the proportions invert, `r .fm("L.forehead", "floor_only")` of
+`r .fm("L.forehead", "rejected_at_500")`, so the same change admits that many
+detections in the one matrix with no plausible route of exposure. The prevalence
+figures downstream are lower bounds, most conspicuously in faeces and on skin;
+no known-negative exists for those matrices to justify a lower floor, and the
+one that does exist argues against it.
+
+# The retention-time window and the sulfone
+
+Each assay's window is set on the MS1 apexes of its confirmed spectra and padded
+by `APEX_PAD` = `r APEX_PAD` s on each side (*The retention-time window* above).
+How wide that pad may be is set by the metabolite's isobar.
+
+*Why the isomer matters.* 5-hydroxyomeprazole is not the only thing at its mass.
+Omeprazole sulfone, the compound CYP3A4 makes from omeprazole, has the identical
+formula (`C17H19N3O4S`) and therefore the identical m/z (362.1169). MS1 cannot
+tell the two apart. Only chromatography separates them, and the consequences of
+losing that separation are severe: the sulfone reports CYP3A4 activity, not the
+CYP2C19 activity we are trying to measure, and in a poor CYP2C19 metaboliser the
+drug shunts to CYP3A4, so the sulfone is *larger* than the real 5-OH peak. The
+proximity-weighted selection described above is the primary defence; the window
+is a second, softer one, kept modest so the sulfone rarely even enters it.
+
+```{r sulfone-margin}
+#| echo: false
+SULFONE_RT  <- 181   # s, sulfone RT in MSV000084008, read off its EICs
+SWEEP_PAR_W <- 5     # s, parent half-window held fixed in the pad sweep below
+# The metabolite's window in MSV000084008, as this step set it (ms1_windows above).
+.w5 <- unlist(ms1_windows[ms1_windows$dataset_id == "MSV000084008" &
+                          ms1_windows$role == "metabolite", c("rt_lo", "rt_hi")])
+```
+
+The margin is narrower than it looks. In MSV000084008 the metabolite's window,
+the MS1 apexes of its confirmed spectra padded by `r APEX_PAD` s, is
+[`r round(.w5[1])`, `r round(.w5[2])`] s and is safe, since the sulfone sits at
+~`r SULFONE_RT` s. But its upper edge is only `r round(SULFONE_RT - .w5[2])` s
+short of the sulfone, so a pad that much wider reaches it.
+
+*This is measured, not assumed.* That deposit's metadata records each subject's
+genotyped CYP2C19 phenotype (`PharmGeno_Phenotype_2C19`), which the pipeline
+never uses during extraction, so it is an independent target. Re-integrating the
+same cached chromatograms of MSV000084008 at a range of metabolite
+acceptance-window half-widths (parent fixed at ±`r SWEEP_PAR_W` s; metabolite
+centre ~`r round(mean(.w5))` s, sulfone ~`r SULFONE_RT` s) and correlating the
+subject-level AUC ratio against that genotyped phenotype gives:
+
+```{r}
+#| echo: false
+#| output: asis
+#| label: tbl-pad-sweep
+# From the cached wide EICs of MSV000084008: widen the metabolite window toward the
+# sulfone, re-pick with and without proximity weighting, correlate with genotype.
+sweep_cache <- "peaks_review_v2/_cache/MSV000084008.rds"
+sweep_meta  <- "dataset_metadata/MSV000084008_metadata.tsv"
+if (!"MSV000084008" %in% names(bio_files_per_ds)) {
+  cat("_Pad sweep not applicable: it needs the genotyped probe cohort ",
+      "MSV000084008, which this application does not contain._\n", sep = "")
+} else if (file.exists(sweep_cache) && file.exists(sweep_meta)) {
+  # PHENO (CYP2C19 activity order) comes from R/masst.R.
+  cache <- readRDS(sweep_cache)
+  ta <- read.delim(sweep_meta, check.names = FALSE, stringsAsFactors = FALSE)
+  ta$tmin <- as.numeric(ta$ATTRIBUTE_Time_Point_Mins)
+  ta <- ta[ta$MS_SampleType == "sample" & !is.na(ta$tmin), ]
+  ta$k <- norm_file_key(ta$filename)
+  fb   <- basename(as.character(bio_files_per_ds[["MSV000084008"]]))
+  bare <- function(x) norm_file_key(to_bare_name(basename(as.character(x)), fb))
+  ov_sweep <- if (file.exists("curation/rt_apex_overrides.csv"))
+    read.csv("curation/rt_apex_overrides.csv", stringsAsFactors = FALSE) else
+    data.frame(dataset_id = character(), role = character(),
+               ms2_rt = numeric(), apex_rt = numeric())
+  ctr  <- function(role, cr) mean(acceptance_window("MSV000084008", role, cr, bare,
+                                                    cr$win, conf_final, ov_sweep))
+  par_ctr <- ctr("parent", cache$par); met_ctr <- ctr("metabolite", cache$met)
+  # hilic = TRUE gives pure area-select, so it doubles as the "no proximity"
+  # control.
+  auc_of <- function(cr, centre, W, proximity) {
+    data.frame(k = norm_file_key(cr$files),
+               auc = vapply(cr$traces, function(tr) {
+                 p <- pick(tr$rt, tr$it, centre - W, centre + W, hilic = !proximity)
+                 if (is.null(p) || !accept_peak(p, FALSE)) NA_real_ else p$auc
+               }, numeric(1)))
+  }
+  trap <- function(x, y) { o <- order(x); x <- x[o]; y <- y[o]; y[is.na(y)] <- 0
+    if (length(unique(x)) < 4) NA_real_ else sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2) }
+  rho_of <- function(pa, ma) {
+    t2 <- ta
+    t2$par_auc <- pa$auc[match(t2$k, pa$k)]; t2$met_auc <- ma$auc[match(t2$k, ma$k)]
+    a <- do.call(rbind, lapply(
+      split(t2, list(t2$ATTRIBUTE_Subject, t2$ATTRIBUTE_Study_Day), drop = TRUE),
+      function(d) data.frame(rank = match(d$PharmGeno_Phenotype_2C19[1], PHENO),
+                             lr = log2(trap(d$tmin, d$par_auc) / trap(d$tmin, d$met_auc)),
+                             subject = d$ATTRIBUTE_Subject[1])))
+    a <- a[is.finite(a$lr), ]; s <- aggregate(lr ~ subject + rank, a, mean)
+    cor.test(s$rank, s$lr, method = "spearman", exact = FALSE)$estimate
+  }
+  pa <- auc_of(cache$par, par_ctr, SWEEP_PAR_W, TRUE)   # parent fixed throughout
+  sweep <- do.call(rbind, lapply(c(5, 10, 15, 20, 30), function(W) data.frame(
+    `metabolite window` = sprintf("[%.0f, %.0f] (+/-%d s)", met_ctr - W, met_ctr + W, W),
+    `reaches sulfone?`  = if ((met_ctr + W) >= SULFONE_RT) "yes" else "no",
+    `with proximity`    = sprintf("%+.3f", rho_of(pa, auc_of(cache$met, met_ctr, W, TRUE))),
+    `without proximity` = sprintf("%+.3f", rho_of(pa, auc_of(cache$met, met_ctr, W, FALSE))),
+    check.names = FALSE)))
+  cat(knitr::kable(sweep, align = "lccc", row.names = FALSE), sep = "\n")
+} else {
+  cat("_Pad sweep skipped: needs `", sweep_cache, "` (git-ignored). Run ",
+      "`Rscript R/peak_review_panels.R omeprazole MSV000084008` to rebuild it._\n", sep = "")
+}
+```
+
+With the proximity weighting the correlation is unchanged at every width;
+without it, the ratio collapses once the window admits the sulfone. So the
+isomer defence is the on-RT selection, not a tight window; the ±`r APEX_PAD` s
+pad only buys drift tolerance.

@@ -1,0 +1,956 @@
+---
+title: "04 - Confirmation"
+subtitle: "Step 4: every hit re-scored with SIRIUS and CSI:FingerID"
+author: "Philippine Louail"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    df-print: paged
+params:
+  run_confirmations: false
+---
+
+# Overview
+
+Every curated hit is re-scored with SIRIUS and CSI:FingerID and graded by how
+well the target ranks, and only assays in which every target confirms are
+kept. An assay that confirms can still be set aside by hand, with its reason,
+where its spectra show the rules were not enough (*Assays set aside by hand*).
+From the confirmed spectra this step also sets, per assay and target, the
+ion step 5 extracts, its m/z, and the retention-time range of the confirmed
+spectra, around which step 5 reads the trace and places its window. From the
+headers of the raw files with a confirmed spectrum it reads the instrument of
+each assay, which sets the m/z tolerance step 5 extracts at.
+
+The SIRIUS runs are done by the notebooks in `confirmation/`, one per
+repository, because each repository serves its spectra differently. They are
+slow and use one SIRIUS instance, so a normal render of this notebook reads their
+cached results. Render with `-P run_confirmations:true` to run them first, one
+after the other, each in its own process.
+
+**Input:** `artifacts/hits_curated.csv` and `artifacts/dataset_metadata_table.csv`
+(step 3), `artifacts/assay_metadata.csv` (step 2), and the raw files with a
+confirmed spectrum, on disk once the confirmation notebooks have run.
+
+**Output:** `artifacts/hits-confirmed-all.csv` (every confirmed spectrum, with its
+grade), `artifacts/datasets-confirmed.csv` (one row per assay),
+`artifacts/extraction_windows.csv` (one row per assay and target),
+`artifacts/file_instruments.csv` (one row per file with a confirmed spectrum: the
+instrument and polarity its header records) and `artifacts/assay_instruments.csv`
+(one row per assay: its instrument, class and m/z tolerance), read by step 5.
+
+```{r setup}
+source("../../R/setup.R")
+source("../../R/masst.R")
+source("../../R/metadata.R")
+source("../../R/ms1.R")   # extraction config and instrument helpers
+```
+
+# SIRIUS runs (opt-in)
+
+```{r run-confirmations, eval=params$run_confirmations}
+for (q in c("confirmation/massIVE-hit-confirmation.qmd",
+            "confirmation/metaboLights-confirmation.qmd",
+            "confirmation/metabolomics-workbench-confirmation.qmd")) {
+  message("Rendering ", q, " ...")
+  system2("quarto", c("render", shQuote(q)))
+}
+```
+
+# Load confirmed features
+
+Each confirmation notebook writes a self-contained CSV (`dataset_id`
+deposit-level, `assay`, `role`, `rt`, `mz`, `adduct_inferred`, `source_file`,
+`confidence`, plus SIRIUS scoring columns). We bind them, rename the
+deposit-level key to `deposit_id`, and attach the combined `dataset_id` and
+chromatography from `dataset_metadata_table.csv` via a `(deposit_id, assay)`
+join.
+
+Fewer assays can arrive here than `03` curated. A MASST hit is a spectral
+similarity, so a deposit can carry features at every target's mass whose best
+molecular formula is not the target's at all, and such a deposit confirms
+nothing and is simply absent below. The chunk after the summary lists every curated
+assay that confirmed no feature together with the formula SIRIUS ranked first
+for each role, which is what separates a correct rejection from something to
+investigate. A deposit that confirms some roles but not all does arrive, and
+drops at the every-target filter further down, where it is reported separately.
+
+```{r load-confirmed}
+# One confirmation artifact per repository. A missing one adds no hits instead of
+# stopping the render, and is reported: its deposits are absent from everything below.
+conf_files <- c(
+  MassIVE                  = "artifacts/hits-confirmed-massive.csv",
+  MetaboLights             = "artifacts/hits-confirmed-metaboLights.csv",
+  `Metabolomics Workbench` = "artifacts/hits-confirmed-metabolomics-workbench.csv")
+conf_present <- file.exists(conf_files)
+if (!any(conf_present))
+  stop("no confirmation artifact found; render the confirmation notebooks first")
+if (!all(conf_present))
+  message("confirmation artifact absent for ",
+          paste(names(conf_files)[!conf_present], collapse = ", "),
+          ": their deposits are missing from everything below")
+conf_all <- do.call(rbind, lapply(conf_files[conf_present], read.csv,
+                                  check.names = FALSE))
+# A target no longer in compound.csv can still have rows here, from confirmations
+# run before a change of targets: they are dropped, and named.
+old_roles <- setdiff(unique(conf_all$role), compound_spec$role)
+if (length(old_roles)) {
+  message("confirmed spectra of roles not in compound.csv, dropped: ",
+          paste(old_roles, collapse = ", "))
+  conf_all <- conf_all[conf_all$role %in% compound_spec$role, ]
+}
+rownames(conf_all) <- NULL
+
+names(conf_all)[names(conf_all) == "dataset_id"] <- "deposit_id"
+# A study deposited twice keeps the spectra of its shared files once, under the
+# deposit step 3 kept them in (is_copy() in R/metadata.R).
+.hits <- read.csv("artifacts/hits_curated.csv", stringsAsFactors = FALSE)
+copy <- is_copy(conf_all$source_file, conf_all$deposit_id,
+                function(d) .hits$file_path[.hits$deposit_id == d])
+if (any(copy)) message("confirmed spectra on copies dropped: ", sum(copy))
+conf_all <- conf_all[!copy, ]
+rownames(conf_all) <- NULL
+
+ds_meta_tbl <- read.csv("artifacts/dataset_metadata_table.csv",
+                        check.names = FALSE)
+
+conf_all <- dplyr::left_join(
+  conf_all,
+  ds_meta_tbl[, c("dataset_id", "deposit_id", "assay", "chromatography")],
+  by = c("deposit_id", "assay"))
+
+conf_all <- conf_all[!is.na(conf_all$dataset_id), ]
+conf_all$confidence <- factor(conf_all$confidence,
+                              levels = c("strict", "standard",
+                                         "liberal", "not_confirmed"))
+# A scan matched by several library spectra can come back once per match: keep
+# one row per spectrum and target, at its best tier.
+o    <- order(conf_all$confidence)
+dup  <- duplicated(conf_all[o, c("dataset_id", "role", "source_file", "rt", "mz",
+                                 "adduct_inferred")])
+if (any(dup)) message("copies of one spectrum dropped: ", sum(dup))
+conf_all <- conf_all[sort(o[!dup]), ]
+rownames(conf_all) <- NULL
+```
+
+```{r load-confirmed-summary}
+#| echo: false
+cat("Confirmed features loaded :", nrow(conf_all), "\n")
+cat("Assays (combined key)     :", length(unique(conf_all$dataset_id)), "\n")
+cat("\nChromatography across confirmed assays:\n")
+print(table(unique(conf_all[, c("dataset_id", "chromatography")])$chromatography,
+            useNA = "ifany"))
+```
+
+
+# Filter cascade
+
+A hit for every target per assay was already required upstream, so the
+remaining filter narrows to what is *interpretable* after SIRIUS: every target
+still present after annotation. That is the only condition applied here. Two
+conditions deliberately are not: the targets need not share an adduct
+(a compound detected as its sodium adduct is still present in the file), and
+each (assay, role) is not collapsed to its best tier (see below).
+
+## Every confirmed tier is kept
+
+SIRIUS returns a formula rank and a structure rank per feature, and the
+confirmation notebooks bin them into tiers. Their rank limits are set there, and
+listed in the table under *Evaluate SIRIUS matches* in
+`confirmation/massIVE-hit-confirmation.qmd`:
+
+- **strict**: the target's formula and structure both ranked first;
+- **standard**: both within the tighter rank limits;
+- **liberal**: both within the looser rank limits;
+- **not_confirmed**: beyond liberal; dropped before the confirmed CSVs.
+
+Every confirmed feature is kept, at whatever tier it reached. Collapsing each
+(assay, role) to its best tier would mean one `strict` parent feature in an
+assay discarding every `standard` parent feature in that same assay,
+including rank-1 identifications on other files. That is the right rule for
+choosing what step 5 extracts (the ion, its m/z and the stretch of trace it
+reads), where the most confident evidence should decide, and the wrong rule for
+everything else, where a confirmed feature is a confirmed feature. The tier
+restriction lives in `best_tier()`, used by
+`derive_extraction_config()` and `extraction_window()`; the
+`confidence` column flows through here unchanged so any downstream analysis can
+still stratify or weight by tier.
+
+```{r keep-confidence-tier}
+CONF_ORDER <- c(strict = 1, standard = 2, liberal = 3, not_confirmed = 4)
+conf_best  <- conf_all
+```
+
+## `r if (nrow(compound_spec) == 2) "Both roles" else "Every target"` confirmed (any tier above not_confirmed)
+
+A `dataset_id` is kept only if every target in `compound.csv` has at least one
+feature at `strict`, `standard`, or `liberal`. The `confidence` column flows
+through unchanged so downstream code can stratify or weight by tier in step 6.
+
+```{r filter-every-target}
+# A hit confirmed in a QC injection, blank, pooled QC or calibration standard is not
+# evidence about a sample, and must not anchor an extraction window either.
+n_nonbio_hits <- sum(is_nonbio_file(conf_best$source_file), na.rm = TRUE)
+conf_samples <- conf_best |>
+  dplyr::filter(confidence %in% c("strict", "standard", "liberal")) |>
+  dplyr::filter(!is_nonbio_file(source_file))
+conf_final <- conf_samples |>
+  dplyr::group_by(dataset_id) |>
+  dplyr::filter(all(compound_spec$role %in% role)) |>
+  dplyr::ungroup() |>
+  as.data.frame()
+
+dropped_ds <- setdiff(unique(conf_all$dataset_id),
+                      unique(conf_final$dataset_id))
+```
+
+```{r filter-summary}
+#| echo: false
+cat("Confirmed hits in QC, blank or standard files, dropped:", n_nonbio_hits, "\n")
+cat("Surviving assays   :", length(unique(conf_final$dataset_id)), "\n")
+cat("Surviving features :", nrow(conf_final), "\n")
+if (length(dropped_ds))
+  cat(if (nrow(compound_spec) == 2) "Dropped (one role not confirmed at any tier):\n  " else
+        "Dropped (not every target confirmed at any tier):\n  ",
+      paste(dropped_ds, collapse = "\n  "), "\n", sep = "")
+```
+
+A curated assay can leave that surviving set in one of two ways: it confirms
+nothing at all, or it confirms some roles and not every one. The discriminating
+fact in both cases is the formula SIRIUS ranked first at the target mass: a
+different element composition there means the MASST hit was a spectral
+look-alike and the re-scoring is doing its job, while the target's own formula
+means the deposit really carries that role and fails only for want of the
+other targets.
+
+```{r confirmation-attrition}
+#| echo: false
+.cur <- read.csv("artifacts/hits_curated.csv", stringsAsFactors = FALSE)
+.dep_of <- stats::setNames(as.character(.cur$deposit_id), as.character(.cur$dataset_id))
+.curated <- unique(as.character(.cur$dataset_id))
+.absent  <- setdiff(.curated, unique(as.character(conf_all$dataset_id)))
+best_formula <- function(ds, role) {
+  f <- file.path(results_dir_for(ds, .dep_of[[ds]]), paste0(role, "_results.csv"))
+  if (!file.exists(f)) return("no SIRIUS output")
+  d <- read.csv(f, stringsAsFactors = FALSE)
+  d <- unique(d[d$rank.x %in% 1, c("xcms_fts", "molecularFormula")])
+  if (!nrow(d)) return("no formula ranked")
+  tb <- sort(table(d$molecularFormula), decreasing = TRUE)
+  sprintf("%s (%d of %d features)", names(tb)[1], tb[1], sum(tb))
+}
+cat("Curated in 03:", length(.curated),
+    "| confirming at least one feature:", length(.curated) - length(.absent),
+    if (nrow(compound_spec) == 2) "| surviving both-roles:" else "| confirming every target:",
+    length(unique(conf_final$dataset_id)), "\n")
+.gone <- c(.absent, setdiff(dropped_ds, .absent))
+if (length(.gone)) {
+  cat("\nTarget formulas:",
+      paste(sprintf("%s %s", compound_spec$role, compound_spec$formula),
+            collapse = ", "), "\n")
+  for (.d in .gone) {
+    cat(" ", .d, if (.d %in% .absent) "(confirmed nothing)" else
+          if (nrow(compound_spec) == 2) "(one role only)" else "(not every target)", "\n")
+    for (.r in compound_spec$role)
+      cat("      ", format(.r, width = max(nchar(compound_spec$role))), "best formula:",
+          best_formula(.d, .r), "\n")
+  }
+}
+```
+
+# Assays set aside by hand
+
+The rules above decide which assays confirm, and they are the same for every
+assay. Some things only show when an assay's spectra are looked at. An assay
+can confirm every target while most of the signal at a target's mass is another
+compound of the same formula: the MS2 spectra tell the two apart, but the MS1
+trace step 5 measures does not, and no rule here looks for it. Such an assay is
+set aside by hand after confirmation, and its reason is written beside it in the
+list below. It counts as rejected in the step summary,
+and it is left out of everything that follows: the artifacts this step writes,
+and therefore steps 5 and 6, do not see it.
+
+```{r set-aside}
+# MANUAL WORK: assays set aside by hand after confirmation, each with its reason.
+# Each listed assay confirmed every target by the rules above.
+SET_ASIDE <- c(
+  MSV000088255 = paste(
+    "most MS2 at omeprazole's mass are of an isomer, a hydroxylated omeprazole",
+    "sulfide, not of omeprazole (see the check below); the deposit is urine,",
+    "which step 6 does not use"))
+
+# Applied once, here: a set-aside assay leaves conf_final, from which everything
+# below and every artifact step 5 reads is built.
+ds_set_aside <- intersect(names(SET_ASIDE), unique(conf_final$dataset_id))
+if (length(setdiff(names(SET_ASIDE), ds_set_aside)))
+  warning("set aside by hand but not confirmed, so nothing to set aside: ",
+          paste(setdiff(names(SET_ASIDE), ds_set_aside), collapse = ", "))
+conf_final <- conf_final[!conf_final$dataset_id %in% ds_set_aside, ]
+```
+
+```{r set-aside-table}
+#| echo: false
+if (length(ds_set_aside))
+  knitr::kable(data.frame(assay = short_ds(ds_set_aside),
+                          reason = unname(SET_ASIDE[ds_set_aside])),
+               caption = "Assays set aside by hand after confirmation.")
+```
+
+Set aside by hand:
+`r if (length(ds_set_aside)) paste(short_ds(ds_set_aside), collapse = ", ") else "none"`.
+`r length(unique(conf_final$dataset_id))` confirmed assays go on to step 5.
+
+## The MS2 at omeprazole's mass in MSV000088255
+
+```{r msv88255-settings}
+CHECK_DEPOSIT <- "MSV000088255"
+# The check is written for omeprazole as the role "parent": without that role in
+# compound.csv it is skipped, and its text hidden.
+CHECK_RUN <- "parent" %in% compound_spec$role
+if (!CHECK_RUN)
+  message("compound.csv has no role \"parent\": the check of ", CHECK_DEPOSIT,
+          " is skipped")
+PREC_PPM   <- 10     # precursor m/z tolerance around omeprazole's [M+H]+ (ppm)
+FRAG_TOL   <- 0.01   # fragment m/z tolerance (Da)
+MARKER_MIN <- 5      # a marker is present at >= this % of the base peak
+MARKERS <- c(ome_151 = 151.0992, ome_180 = 180.0478,   # omeprazole
+             iso_152 = 152.0706, iso_313 = 313.1422)   # the hydroxylated sulfide
+mk <- function(k) sprintf("%.3f", MARKERS[[k]])         # a marker's m/z, for the text
+# The files holding the deposit's confirmed omeprazole spectra (conf_all still has them).
+conf_par_files <- sort(unique(sub(paste0("^", CHECK_DEPOSIT, "_"), "", basename(as.character(
+  conf_all$source_file[conf_all$dataset_id == CHECK_DEPOSIT & conf_all$role == "parent"])))))
+```
+
+<!-- Shown only where the check runs. -->
+::: {.content-`r if (CHECK_RUN) "visible" else "hidden"`}
+The deposit's confirmed omeprazole spectra are in `r length(conf_par_files)`
+files, `r knitr::combine_words(conf_par_files)`. Step 5 would measure omeprazole
+in all of the assay's files, on the MS1 trace at its m/z, and that trace cannot
+tell it from `r compound_spec$isobar[compound_spec$role == "parent"]`, the isomer
+`compound.csv` names beside it, which has the same formula. Their fragments
+differ. Omeprazole gives
+`r mk("ome_151")` and `r mk("ome_180")`. The sulfide, hydroxylated on its
+pyridine ring, gives `r mk("iso_152")`, and loses SH to `r mk("iso_313")`,
+which a sulfoxide such as omeprazole cannot do. Every MS2 scan on omeprazole's
+[M+H]+ (within `r PREC_PPM` ppm) in the deposit's sample files is read through
+the MassIVE backend, as step 5 reads MS1, and classed by these four ions:
+
+- **omeprazole-like**: `r mk("ome_151")` and `r mk("ome_180")` present,
+  `r mk("iso_152")` and `r mk("iso_313")` absent;
+- **isomer-like**: `r mk("iso_152")` or `r mk("iso_313")` present,
+  `r mk("ome_151")` absent;
+- **mixed**: `r mk("ome_151")` present together with `r mk("iso_152")` or
+  `r mk("iso_313")`;
+- **neither**: none of these patterns.
+
+An ion is present when a peak within `r FRAG_TOL` Da of it reaches
+`r MARKER_MIN`% of the spectrum's most intense peak.
+
+```{r msv88255-ms2, eval=CHECK_RUN}
+#| message: false
+# The MS2 scans of `files`.
+load_spectra_ms2 <- function(deposit_id, files, assay = character())
+  filterMsLevel(load_spectra(deposit_id, files, assay), 2L)
+
+# The deposit's sample files, as its metadata lists them, and every MS2 scan in
+# them whose precursor is omeprazole's [M+H]+.
+nat   <- msv_native_sample_table(CHECK_DEPOSIT)
+files <- basename(nat[[intersect(MSV_FILENAME_COLS, names(nat))[1]]])
+files <- files[!is_nonbio_file(files)]
+
+# Classes are cached in artifacts/: reading the scans queries MassIVE even for cached
+# files. Delete the csv after a change of PREC_PPM, FRAG_TOL, MARKERS or MARKER_MIN.
+CHECK_CSV <- "artifacts/msv88255_ms2_check.csv"
+if (file.exists(CHECK_CSV)) {
+  ms2_check <- read.csv(CHECK_CSV, stringsAsFactors = FALSE)
+} else {
+  ms2   <- load_spectra_ms2(CHECK_DEPOSIT, files)
+  ms2   <- filterPrecursorMzValues(
+    ms2, compound_spec$mz_pos[compound_spec$role == "parent"], ppm = PREC_PPM)
+
+  # A marker's intensity in % of the spectrum's most intense peak, 0 where absent.
+  marker_pct <- function(pk, mz) {
+    hit <- abs(pk[, "mz"] - mz) <= FRAG_TOL
+    if (any(hit)) 100 * max(pk[hit, "intensity"]) / max(pk[, "intensity"]) else 0
+  }
+  pct <- t(vapply(peaksData(ms2), function(pk)
+    vapply(MARKERS, function(m) marker_pct(pk, m), numeric(1)),
+    numeric(length(MARKERS))))
+  has <- pct >= MARKER_MIN
+  ms2_check <- data.frame(
+    file = sub(paste0("^", CHECK_DEPOSIT, "_"), "", basename(dataOrigin(ms2))),
+    rt   = round(rtime(ms2), 1),
+    type = ifelse(has[, "iso_152"] | has[, "iso_313"],
+                  ifelse(has[, "ome_151"], "mixed", "isomer-like"),
+                  ifelse(has[, "ome_151"] & has[, "ome_180"], "omeprazole-like",
+                         "neither")))
+  ms2_check <- ms2_check[order(ms2_check$file, ms2_check$rt), ]
+  rownames(ms2_check) <- NULL
+  write.csv(ms2_check, CHECK_CSV, row.names = FALSE)
+}
+# Whether a scan is one of the deposit's confirmed omeprazole spectra: same file,
+# retention time within 0.5 s.
+conf_par <- conf_all[conf_all$dataset_id == CHECK_DEPOSIT & conf_all$role == "parent", ]
+conf_par$file <- sub(paste0("^", CHECK_DEPOSIT, "_"), "",
+                     basename(as.character(conf_par$source_file)))
+ms2_check$confirmed <- mapply(function(f, r)
+  any(conf_par$file == f & abs(conf_par$rt - r) <= 0.5), ms2_check$file, ms2_check$rt)
+
+# Per type: how many scans, in how many files, and which files.
+n_of     <- function(t) sum(ms2_check$type == t)
+nfiles   <- function(t) length(unique(ms2_check$file[ms2_check$type == t]))
+files_of <- function(t) knitr::combine_words(unique(ms2_check$file[ms2_check$type == t]))
+```
+
+```{r msv88255-ms2-table, eval=CHECK_RUN}
+#| echo: false
+knitr::kable(ms2_check, col.names = c("file", "rt (s)", "type", "confirmed"),
+             caption = paste("Every MS2 scan on omeprazole's [M+H]+ in",
+                             CHECK_DEPOSIT, "classed by its marker ions."))
+```
+
+```{r msv88255-ms2-text}
+#| echo: false
+#| results: asis
+# The result, knitted only where the check ran: its inline code needs the scans.
+if (CHECK_RUN) cat(knitr::knit_child(quiet = TRUE, text = r"[
+The deposit's `r length(files)` sample files are all
+`r paste(unique(nat$UBERONBodyPartName), collapse = ", ")`, and
+`r length(unique(ms2_check$file))` of them hold an MS2 scan on omeprazole's
+[M+H]+, `r nrow(ms2_check)` scans in all. `r n_of("isomer-like")` scans, in
+`r nfiles("isomer-like")` files, are isomer-like; `r n_of("omeprazole-like")`
+are omeprazole-like, all in `r files_of("omeprazole-like")`;
+`r n_of("mixed")` are mixed, in `r files_of("mixed")`; and `r n_of("neither")`
+show neither pattern. `r sum(ms2_check$confirmed)` of these scans are among the
+deposit's confirmed omeprazole spectra,
+`r sum(ms2_check$confirmed & ms2_check$type == "isomer-like")` of them isomer-like.
+]"))
+```
+:::
+
+# RT diagnostics
+
+Median and range of the confirmed retention time per role and assay, a check
+that each target elutes where step 5 will look for it.
+
+## Per-assay RT ranges
+
+Coloured line is the min-to-max range; point is the median.
+
+```{r plot-rt-windows-raw, fig.width = 9, fig.height = 5}
+# One colour per target, in compound.csv order; beyond the second, from a
+# qualitative palette.
+role_colours <- c("#2166AC", "#D6604D",
+                  grDevices::hcl.colors(max(nrow(compound_spec) - 2, 0), "Dark 3"))
+role_colours <- setNames(role_colours[seq_len(nrow(compound_spec))], compound_spec$role)
+
+plot_rt_windows <- function(df, title) {
+  df |>
+    dplyr::filter(!is.na(rt)) |>
+    dplyr::group_by(dataset_id, role, chromatography) |>
+    dplyr::summarise(rt_lo  = min(rt),
+                     rt_hi  = max(rt),
+                     rt_med = median(rt),
+                     .groups = "drop") |>
+    ggplot(aes(y = dataset_id, colour = role)) +
+    geom_linerange(aes(xmin = rt_lo, xmax = rt_hi),
+                   linewidth = 2, alpha = 0.4,
+                   position = position_dodge(width = 0.5)) +
+    geom_point(aes(x = rt_med),
+               size = 3, position = position_dodge(width = 0.5)) +
+    facet_grid(chromatography ~ ., scales = "free_y", space = "free_y") +
+    scale_colour_manual(values = role_colours) +
+    labs(x = "Retention time (s)", y = NULL, colour = "Role",
+         title = title) +
+    theme_bw() +
+    theme(legend.position  = "bottom",
+          strip.background = element_rect(fill = "grey92"))
+}
+
+.p_rt <- plot_rt_windows(conf_final, "Per-assay RT ranges - all confirmed features")
+# Diagnostic only. Step 5's windows figure (fig-step5-windows) draws these times
+# with the windows it sets on the MS1 trace.
+.p_rt
+```
+
+```{r rt-outliers}
+#| echo: false
+# Flag an assay whose median confirmed RT is beyond RT_FOLD times (either way)
+# the median of all assays of its phase; a phase with one assay flags nothing.
+RT_FOLD <- 2
+rt_med <- conf_final |>
+  dplyr::filter(!is.na(rt)) |>
+  dplyr::group_by(dataset_id, chromatography) |>
+  dplyr::summarise(rt = stats::median(rt), .groups = "drop") |>
+  dplyr::group_by(chromatography) |>
+  dplyr::mutate(phase_rt = stats::median(rt)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(odd = rt > RT_FOLD * phase_rt | rt < phase_rt / RT_FOLD)
+rt_odd <- rt_med[rt_med$odd, ]
+# Each flagged assay with its median RT, and where the unflagged assays of its
+# phase sit.
+rt_odd_text <- if (!nrow(rt_odd)) "none" else
+  paste(vapply(seq_len(nrow(rt_odd)), function(i) {
+    ph   <- rt_odd$chromatography[i]
+    rest <- round(rt_med$rt[rt_med$chromatography %in% ph & !rt_med$odd])
+    sprintf("%s (%s) at %.0f s, the unflagged %s assays at %s s",
+            rt_odd$dataset_id[i], ph, rt_odd$rt[i], ph,
+            if (min(rest) == max(rest)) min(rest)
+            else paste(min(rest), "to", max(rest)))
+  }, character(1)), collapse = "; ")
+```
+
+Chromatography labels come from the deposit / ReDU metadata and paper constants
+(`02`), not from RT. Absolute RT is not comparable across assays (it depends on
+each method's gradient), so the spread within a phase facet is expected, not
+evidence of mislabelling. An assay is worth checking against its source method
+when its median confirmed RT is more than `r RT_FOLD` times, or less than
+1/`r RT_FOLD` of, the median over all assays of its phase. Flagged this way:
+`r rt_odd_text`.
+
+## MS2 trigger RT versus MS1 chromatographic apex
+
+The retention time recorded above is that of the MS2 scan that matched, not of
+the compound. Data-dependent acquisition fires as soon as a precursor is intense
+enough and can re-fire while it stays intense, so the scans that confirm one
+feature scatter across its chromatographic peak and well down its tail. The RT
+`05` must centre an extraction window on is the MS1 apex, which is stable where
+the trigger time is not.
+
+That is measured rather than assumed, and it is measured in `05`, which is where
+the MS1 chromatograms exist. Its *Extraction windows* figure draws, for every
+assay it extracts, the confirmed spectra against the window it sets on the MS1
+peak they point to. In an application with probe checks
+(`_05-probe-checks.qmd`), *Checks that can catch us being wrong* also plots every
+confirmed MS2 scan of one assay against the apex of the peak it fired on.
+
+# m/z deviation
+
+The observed precursor m/z should match the inferred adduct's theoretical m/z
+within the instrument's mass accuracy; deviation in ppm is `(observed -
+theoretical) / theoretical * 1e6`.
+
+```{r mz-deviation, fig.width = 9, fig.height = 4}
+PPM_OK   <- 5    # a well-calibrated Orbitrap stays within +/- this
+PPM_WARN <- 10   # beyond: miscalibration or a wrong adduct
+
+conf_final$mz_theo <- mapply(
+  function(f, a) {
+    if (is.na(f) || is.na(a)) return(NA_real_)
+    mass2mz(calculateMass(f), adduct = a)[[1]]
+  },
+  role_formula[conf_final$role],
+  conf_final$adduct_inferred,
+  USE.NAMES = FALSE)
+
+conf_final$mz_ppm_dev <- (conf_final$mz - conf_final$mz_theo) /
+                         conf_final$mz_theo * 1e6
+
+conf_final |>
+  dplyr::filter(!is.na(mz_ppm_dev)) |>
+  ggplot(aes(y = dataset_id, x = mz_ppm_dev, colour = adduct_inferred)) +
+  geom_vline(xintercept = 0,        linetype = 2, colour = "grey40") +
+  geom_vline(xintercept = c(-PPM_OK, PPM_OK), linetype = 3, colour = "grey70") +
+  geom_jitter(size = 2.5, height = 0.15, alpha = 0.85) +
+  facet_grid(. ~ role) +
+  labs(y = NULL, x = "m/z deviation (ppm)", colour = "Adduct",
+       title = "Precursor m/z deviation vs theoretical adduct mass",
+       caption = paste0("Dashed: 0 ppm  ·  Dotted: +/- ", PPM_OK, " ppm")) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+```{r mz-deviation-share}
+#| echo: false
+dev_ok <- conf_final$mz_ppm_dev[is.finite(conf_final$mz_ppm_dev)]
+pct_ok   <- round(100 * mean(abs(dev_ok) <= PPM_OK), 1)
+pct_warn <- round(100 * mean(abs(dev_ok) <= PPM_WARN), 1)
+```
+
+Of the `r format(length(dev_ok), big.mark = ",")` confirmed spectra with a known ion,
+`r pct_ok`% have a precursor m/z within `r PPM_OK` ppm of the ion's exact mass,
+where a well-calibrated Orbitrap stays, and `r pct_warn`% within `r PPM_WARN` ppm,
+beyond which a calibration issue or a mis-assigned adduct is likely.
+
+# Per-assay summary
+
+```{r dataset-summary-table}
+# Per target, in compound.csv order: its confirmed spectra in the assay (n_<role>),
+# then their median retention time (rt_<role>_s). One row, as summarise() takes it.
+per_target_summary <- function(role, rt) {
+  roles   <- compound_spec$role
+  n_cols  <- lapply(roles, function(r) sum(role == r))
+  rt_cols <- lapply(roles, function(r) round(median(rt[role == r], na.rm = TRUE), 1))
+  as.data.frame(c(setNames(n_cols,  paste0("n_", roles)),
+                  setNames(rt_cols, paste0("rt_", roles, "_s"))))
+}
+
+ds_summary <- conf_final |>
+  dplyr::group_by(dataset_id, deposit_id, assay, chromatography) |>
+  dplyr::summarise(
+    repository      = dplyr::case_when(
+      startsWith(deposit_id[1], "MSV")   ~ "MassIVE",
+      startsWith(deposit_id[1], "MTBLS") ~ "MetaboLights",
+      startsWith(deposit_id[1], "ST")    ~ "Metabolomics Workbench"),
+    best_confidence = levels(conf_final$confidence)[
+      min(CONF_ORDER[as.character(confidence)])],
+    per_target_summary(role, rt),
+    .groups         = "drop") |>
+  dplyr::left_join(
+    ds_meta_tbl[, intersect(c("dataset_id", "const_body_site", "const_country",
+                              "const_location_type"),
+                            names(ds_meta_tbl))],
+    by = "dataset_id")
+
+ds_summary
+```
+
+# What the structure ranking prefers
+
+Confirmation places the target among the structures CSI:FingerID retrieves for
+its formula. It does not say the fingerprint prefers it, and where the formula
+has a near neighbour that fragmentation cannot separate, a role can confirm at a
+tier and still be outranked in every spectrum of the corpus. The candidate lists
+the confirmation notebooks already wrote answer that directly, so it costs
+nothing to look: for each confirmed spectrum, where the target sits among the
+structures of its own formula, and the score gap to whatever sits above it.
+Scores compare within a spectrum rather than across spectra, so both gaps are
+within-spectrum differences summarised over spectra.
+
+A role the ranking never prefers is not thereby refuted: positional isomers of
+one formula are the case fingerprint prediction is weakest on, and a small
+deficit is a tie rather than a verdict. Its identity then rests on something
+other than fragmentation, retention time most often, and that has to be stated
+rather than assumed.
+
+```{r structure-ranking}
+#| echo: false
+SR <- structure_ranks(conf_final)
+sr_role <- if (is.null(SR)) data.frame() else
+  SR |>
+    dplyr::group_by(role) |>
+    dplyr::summarise(
+      spectra        = dplyr::n(),
+      target_first   = sum(rank == 1),
+      median_lead    = round(stats::median(lead, na.rm = TRUE), 1),
+      min_lead       = if (all(is.na(lead))) NA_real_ else round(min(lead, na.rm = TRUE), 1),
+      median_deficit = round(stats::median(deficit, na.rm = TRUE), 1),
+      .groups = "drop")
+sr_top <- if (is.null(SR)) data.frame() else
+  SR |>
+    dplyr::filter(rank > 1) |>
+    dplyr::count(role, top_name, top_key, name = "spectra") |>
+    dplyr::arrange(role, dplyr::desc(spectra))
+```
+
+```{r structure-ranking-role}
+#| echo: false
+knitr::kable(sr_role, caption = paste(
+  "Where the target sits among the structures of its own formula, over every",
+  "confirmed spectrum. Lead is its CSI:FingerID score ahead of the next",
+  "candidate where it ranks first; deficit is how far behind the first it sits",
+  "where it does not."))
+```
+
+```{r structure-ranking-top}
+#| echo: false
+knitr::kable(sr_top, caption = paste(
+  "What outranks the target where something does, by the structure database's",
+  "name and by InChIKey skeleton. A database entry may be an isotope-labelled",
+  "standard, which shares the skeleton of the unlabelled compound."))
+```
+
+# Write artifacts
+
+Step 5 reads the confirmed features and the per-assay summary.
+
+```{r write-artifacts}
+write.csv(conf_final, "artifacts/hits-confirmed-all.csv", row.names = FALSE)
+write.csv(ds_summary, "artifacts/datasets-confirmed.csv", row.names = FALSE)
+```
+
+# What step 5 extracts
+
+Step 5 measures each target in every file of an assay at one ion and one m/z,
+and reads its trace over one stretch of retention time. The three are set here,
+per assay and target, from the confirmed spectra (`derive_extraction_config()`
+in `R/ms1.R`):
+
+- **ion**: the molecular ion if it was confirmed, otherwise the most frequent
+  confirmed adduct;
+- **m/z**: the median observed precursor m/z of that ion, which absorbs the
+  instrument's own calibration offset;
+- **range**: from the earliest to the latest confirmed retention time of that
+  ion, at the best tier the target reached in the assay, with `RT_PAD_S` seconds
+  added on each side.
+
+The range is where step 5 reads the trace, not the window in which it looks for
+the peak. The confirmed spectra were triggered along the whole peak and down its
+tail, and can include a second peak of the same m/z (see *MS2 trigger RT versus
+MS1 chromatographic apex* above), so the range can be several times wider than
+the peak. Step 5 reads the trace over the range, and a margin beyond it, and
+places the window there, on the MS1 peak the confirmed spectra point to; its
+notebook draws that window. It reads these rows from
+`artifacts/extraction_windows.csv` and checks that each target has a
+confirmation on one of the files it extracts. If a spectrum that set a range
+lies on a file step 5 does not extract, step 5 sets that range again from the
+files it does extract, and its log says so.
+
+```{r extraction-windows}
+RT_PAD_S <- 5   # s added on each side of the confirmed span
+
+target_name <- setNames(compound_spec$name, compound_spec$role)
+ids <- sort(unique(conf_final$dataset_id), method = "radix")
+# One row per target of the assay, in compound.csv order. The cfg names a target's
+# fields by its prefix (adduct_par, mz_met, rt_par_win).
+window_rows <- function(ds) {
+  cfg <- derive_extraction_config(ds, conf_final, rt_pad_s = RT_PAD_S)
+  do.call(rbind, lapply(compound_spec$role, function(r) {
+    p <- target_prefix(r)
+    data.frame(dataset_id = ds, assay = cfg$assay, role = r,
+               target    = target_name[[r]],
+               ion       = cfg[[paste0("adduct_", p)]],
+               mz        = cfg[[paste0("mz_", p)]],
+               rt_lo     = cfg[[paste0("rt_", p, "_win")]][1],
+               rt_hi     = cfg[[paste0("rt_", p, "_win")]][2],
+               rt_pad_s  = RT_PAD_S,
+               n_spectra = sum(conf_final$dataset_id == ds & conf_final$role == r),
+               row.names = NULL)
+  }))
+}
+ext_windows <- do.call(rbind, lapply(ids, window_rows))
+# No assay has confirmed every target yet: the same table, empty.
+if (is.null(ext_windows))
+  ext_windows <- data.frame(dataset_id = character(), assay = character(), role = character(),
+                            target = character(), ion = character(), mz = numeric(),
+                            rt_lo = numeric(), rt_hi = numeric(), rt_pad_s = numeric(),
+                            n_spectra = integer())
+write.csv(ext_windows, "artifacts/extraction_windows.csv", row.names = FALSE)
+ext_windows
+```
+
+# The instrument of each assay
+
+Step 5 reads each target's trace within an m/z tolerance, and how wide it must be
+depends on the mass analyser. On an Orbitrap the scans across a true peak sit
+within a few ppm of its mass; on a time-of-flight instrument the scans on a
+peak's edges scatter much further. Step 5 therefore extracts an assay at
+`r PPM_BY_CLASS[["orbitrap"]]` ppm on an Orbitrap, at `r PPM_BY_CLASS[["tof"]]`
+ppm on a time-of-flight instrument, and at `r PPM_DEFAULT` ppm where the
+instrument cannot be told (`PPM_BY_CLASS`, `PPM_DEFAULT` and
+`instrument_class()` in `R/ms1.R`).
+
+```{r header-sample-size}
+N_HEADER <- 5   # files whose header is read per assay, when they agree
+```
+
+The deposit metadata often does not record the instrument, so it is read from
+the raw files. Every file with a confirmed spectrum is on disk once the
+confirmation notebooks have run, and its header records the manufacturer, the
+model, the mass analyser and the ion source; a few of its scans give its
+polarity (`read_instrument()`). An assay's files come from one instrument, so
+`r N_HEADER` files per assay are read, spread over its file list; when they do
+not agree on the instrument class or the polarity, all of the assay's files are
+read. Each file read is kept in `artifacts/file_instruments.csv`, so a later
+render reads only the files not yet in it. An assay takes the class its files
+record, and is `unknown` where they record none or more than one.
+
+```{r file-instruments}
+# Read the headers of N_HEADER files per assay, or all its files when those disagree
+# on class or polarity. A file already read is skipped; one not on disk waits.
+hit_files <- unique(data.frame(dataset_id = conf_final$dataset_id,
+                               deposit_id = conf_final$deposit_id,
+                               file       = basename(as.character(conf_final$source_file))))
+hit_files <- hit_files[!is.na(hit_files$file), ]
+hit_files <- hit_files[order(hit_files$dataset_id, hit_files$file), ]
+INST_CSV  <- "artifacts/file_instruments.csv"
+file_inst <- if (file.exists(INST_CSV)) read.csv(INST_CSV, colClasses = "character") else
+  data.frame(dataset_id = character(), file = character(), manufacturer = character(),
+             model = character(), analyzer = character(), ion_source = character(),
+             polarity = character())
+key <- function(d) paste(d$dataset_id, d$file)
+read_headers <- function(want) {
+  todo <- want[!key(want) %in% key(file_inst), ]
+  if (!nrow(todo)) return(file_inst)
+  todo$path <- cached_raw_paths(todo$file)
+  todo <- todo[!is.na(todo$path), ]
+  new  <- lapply(split(todo, todo$deposit_id), function(d) {
+    message("[", d$deposit_id[1], "] reading the header of ", nrow(d), " file(s)")
+    cbind(d[, c("dataset_id", "file")], do.call(rbind, lapply(d$path, read_instrument)))
+  })
+  rbind(file_inst, do.call(rbind, new))
+}
+spread <- function(f) f[unique(round(seq(1, length(f), length.out = min(N_HEADER, length(f)))))]
+first_pick <- do.call(rbind, lapply(split(hit_files, hit_files$dataset_id),
+                                    function(d) d[d$file %in% spread(d$file), ]))
+n_before  <- nrow(file_inst)
+file_inst <- read_headers(first_pick)
+# An assay whose files read so far disagree is read in full.
+agree <- vapply(split(file_inst, file_inst$dataset_id), function(d)
+  length(unique(instrument_class(d$model, d$analyzer, d$manufacturer))) <= 1 &&
+    length(unique(d$polarity[!is.na(d$polarity)])) <= 1, logical(1))
+disagree  <- names(agree)[!agree]
+file_inst <- read_headers(hit_files[hit_files$dataset_id %in% disagree, ])
+n_read    <- nrow(file_inst) - n_before
+# Only the current hit files: a new confirmation can drop one.
+file_inst <- file_inst[key(file_inst) %in% key(hit_files), ]
+write.csv(file_inst, INST_CSV, row.names = FALSE)
+n_not_on_disk <- sum(!key(first_pick) %in% key(file_inst))
+```
+
+```{r assay-instruments}
+# One row per confirmed assay: instrument, class and step-5 m/z tolerance from the
+# file headers, majority polarity, and what the deposit metadata records.
+tech <- read.csv("artifacts/assay_metadata.csv", stringsAsFactors = FALSE)
+collapse <- function(x) {
+  x <- unique(x[!is.na(x) & nzchar(x)])
+  if (length(x)) paste(x, collapse = "; ") else NA_character_
+}
+one_class <- function(cls) {
+  cls <- setdiff(unique(cls), "unknown")
+  if (length(cls) == 1) cls else "unknown"
+}
+assay_row <- function(ds) {
+  d   <- file_inst[file_inst$dataset_id == ds, ]
+  cls <- one_class(instrument_class(d$model, d$analyzer, d$manufacturer))
+  pol <- if (any(!is.na(d$polarity))) names(which.max(table(d$polarity))) else NA_character_
+  # The metadata of the assay: every row of a MassIVE deposit, which is one assay,
+  # and the assay's own row elsewhere.
+  s <- ds_summary[ds_summary$dataset_id == ds, ]
+  m <- tech[tech$dataset_id == s$deposit_id & (is.na(s$assay) | tech$assay %in% s$assay), ]
+  data.frame(dataset_id          = ds,
+             instrument          = collapse(paste(d$manufacturer, d$model)),
+             analyzer            = collapse(d$analyzer),
+             class               = cls,
+             ppm                 = if (cls %in% names(PPM_BY_CLASS)) PPM_BY_CLASS[[cls]] else PPM_DEFAULT,
+             polarity            = pol,
+             n_files             = nrow(d),
+             n_other_polarity    = sum(!is.na(d$polarity) & d$polarity != pol),
+             metadata_instrument = collapse(c(m$instrument, m$mass_analyzer)),
+             metadata_class      = one_class(instrument_class(m$instrument, m$mass_analyzer)),
+             metadata_polarity   = collapse(m$polarity))
+}
+assay_inst <- do.call(rbind, lapply(ids, assay_row))
+# No assay has confirmed every target yet: the same table, empty.
+if (is.null(assay_inst))
+  assay_inst <- data.frame(dataset_id = character(), instrument = character(),
+                           analyzer = character(), class = character(), ppm = numeric(),
+                           polarity = character(), n_files = integer(),
+                           n_other_polarity = integer(), metadata_instrument = character(),
+                           metadata_class = character(), metadata_polarity = character())
+write.csv(assay_inst, "artifacts/assay_instruments.csv", row.names = FALSE)
+
+# Where the metadata does not tell the instrument or the polarity, or tells another.
+meta_check <- with(assay_inst, data.frame(
+  assay      = short_ds(dataset_id),
+  header     = ifelse(n_files == 0, "no file read",
+                      paste0(instrument, " (", class, "), ", polarity)),
+  metadata   = paste0(ifelse(is.na(metadata_instrument), "no instrument", metadata_instrument),
+                      " (", metadata_class, "), ",
+                      ifelse(is.na(metadata_polarity), "no polarity", metadata_polarity)),
+  instrument = ifelse(metadata_class == "unknown", "not told",
+               ifelse(n_files == 0, "not read",
+               ifelse(metadata_class == class, "agrees", "differs"))),
+  polarity   = ifelse(is.na(metadata_polarity), "not told",
+               ifelse(n_files == 0, "not read",
+               ifelse(is.na(polarity), "not in headers",
+               ifelse(metadata_polarity == polarity, "agrees", "differs"))))))
+meta_off <- meta_check[meta_check$instrument != "agrees" | meta_check$polarity != "agrees", ]
+# Assays whose files do not all share one polarity.
+mixed <- assay_inst[assay_inst$n_other_polarity > 0, ]
+mixed_text <- if (!nrow(mixed)) "none" else
+  paste(sprintf("%s (%d of %d files not %s)", short_ds(mixed$dataset_id),
+                mixed$n_other_polarity, mixed$n_files, mixed$polarity), collapse = "; ")
+```
+
+The headers of `r format(nrow(file_inst), big.mark = ",")` files were read for the
+`r nrow(assay_inst)` confirmed assays. Assays whose first files disagreed, and were
+read in full: `r if (length(disagree)) paste(short_ds(disagree), collapse = ", ") else "none"`.
+Files chosen but not on disk: `r n_not_on_disk`. `r sum(assay_inst$class == "orbitrap")` assays were
+recorded on an Orbitrap and are extracted at `r PPM_BY_CLASS[["orbitrap"]]` ppm,
+`r sum(assay_inst$class == "tof")` on a time-of-flight instrument at
+`r PPM_BY_CLASS[["tof"]]` ppm, and `r sum(assay_inst$class == "unknown")` on an
+instrument their headers do not tell, at `r PPM_DEFAULT` ppm.
+
+```{r assay-instruments-table}
+#| echo: false
+knitr::kable(data.frame(assay = short_ds(assay_inst$dataset_id),
+                        instrument = assay_inst$instrument, class = assay_inst$class,
+                        ppm = assay_inst$ppm, files = assay_inst$n_files),
+             caption = "The instrument of each confirmed assay, read from its files' headers, and the m/z tolerance step 5 extracts it at.")
+```
+
+The metadata does not tell the instrument of
+`r sum(meta_check$instrument == "not told")` assays and records another class
+than the headers for `r sum(meta_check$instrument == "differs")`; it does not
+tell the polarity of `r sum(meta_check$polarity == "not told")` and records
+another for `r sum(meta_check$polarity == "differs")`. Those assays:
+
+```{r assay-instruments-metadata}
+#| echo: false
+knitr::kable(meta_off, row.names = FALSE,
+             caption = "Assays whose metadata does not tell, or tells another, instrument or polarity than their files' headers.")
+```
+
+Step 5 extracts one ion of each target, of one charge, so a file recorded in the
+other polarity cannot show it. Assays whose files do not all share one polarity:
+`r mixed_text`.
+
+# Step summary
+
+The results of this step, as the chapter's table shows them.
+
+Confirmed spectra of the assays that go on to step 5: `r knitr::combine_words(paste(vapply(compound_spec$role, function(r) format(sum(conf_final$role == r), big.mark = ","), character(1)), "of the", compound_spec$role))`.
+
+```{r step-summary}
+# A curated assay without a SIRIUS results file for every target with a hit is
+# neither confirmed nor rejected: it is left out of both and named.
+.roles_of  <- split(.cur$role, .cur$dataset_id)
+sirius_ran <- vapply(.curated, function(ds) all(file.exists(file.path(
+  results_dir_for(ds, .dep_of[[ds]]), paste0(unique(.roles_of[[ds]]), "_results.csv")))),
+  logical(1))
+# The confirmed assays that go on to step 5: an assay set aside by hand
+# (ds_set_aside) has already left conf_final, and is counted as rejected.
+ds_confirmed    <- unique(conf_final$dataset_id)
+ds_not_run      <- setdiff(.curated[!sirius_ran], c(ds_confirmed, ds_set_aside))
+# An assay whose confirmed spectra are all in QC, blank or standard files confirms
+# no target in a sample, so it counts with those that confirm nothing.
+ds_no_target    <- setdiff(.curated, c(conf_samples$dataset_id, ds_not_run))
+ds_some_targets <- setdiff(dropped_ds, c(ds_no_target, ds_not_run))
+if (length(ds_not_run))
+  message("no SIRIUS results yet, neither confirmed nor rejected: ",
+          paste(ds_not_run, collapse = ", "))
+
+# One unit per table: assays. The confirmed spectra are given in the text above.
+n_targets <- nrow(compound_spec)
+summary_step <- data.frame(
+  item  = c("assays entering",
+            paste0("assays confirmed (", targets_phrase(n_targets), ")"),
+            "assays removed",
+            "... no target confirmed",
+            paste("...", some_targets_phrase(n_targets), "confirmed"),
+            "... set aside by hand"),
+  value = c(length(.curated),
+            length(ds_confirmed),
+            length(ds_no_target) + length(ds_some_targets) + length(ds_set_aside),
+            length(ds_no_target),
+            length(ds_some_targets),
+            length(ds_set_aside)))
+# For the discussion's recap only: the deposits behind the confirmed assays that go
+# on, and their files with a confirmed spectrum.
+summary_step <- rbind(summary_step, data.frame(
+  item  = c("recap: deposits", "recap: files"),
+  value = c(length(unique(conf_final$deposit_id[conf_final$dataset_id %in% ds_confirmed])),
+            length(unique(paste(conf_final$deposit_id, basename(as.character(conf_final$source_file))))))))
+write.csv(summary_step, "artifacts/summary_step4.csv", row.names = FALSE)
+summary_step
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
